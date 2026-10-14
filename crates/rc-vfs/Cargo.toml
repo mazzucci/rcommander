@@ -1,0 +1,18 @@
+[package]
+name = "rc-vfs"
+description = "Native back end: local filesystem access and file operations"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+rc-core.workspace = true
+anyhow.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+trash = "5"
+open = "5"
+dirs = "6"
+
+[dev-dependencies]
+tempfile = "3"
