@@ -1,0 +1,5 @@
+{
+  "name": "rcommander",
+  "owner": { "name": "mazzucci" },
+  "plugins": [{ "name": "rcommander", "source": "./integrations/claude-code" }]
+}

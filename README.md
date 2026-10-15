@@ -56,6 +56,34 @@ Both UIs share the key bindings below. In the browser, F4 opens the file with it
 | `1`..`9` | same as F1..F9, so Mac laptops don't need the fn key |
 | `q` F10 Ctrl+C | quit |
 
+## Remote control and Claude Code
+
+A running `rcmd` (terminal or web) can be driven from scripts:
+
+```sh
+rcmd ctl goto src/main.rs --side right   # show a file in its directory
+rcmd ctl diff old.txt new.txt            # open the side-by-side diff
+rcmd ctl view README.md
+rcmd ctl select '*.rs'
+rcmd ctl message "build finished"
+```
+
+Each instance listens on a Unix socket only your user can open (`$XDG_RUNTIME_DIR/rcommander/`, or a per-user folder in the temp dir).
+
+The **rcommander Claude Code plugin** (`integrations/claude-code`) builds on this. It adds:
+
+- a `/rc` command (`/rc goto <path>`, `/rc diff <a> <b>`, …);
+- a tool Claude can call to show you a file, directory or diff;
+- optionally following Claude's edits: after it edits a file, rcommander shows it in the other panel (`goto`, the default) or opens a diff of the change (`diff`).
+
+Install it from a Claude Code terminal session:
+
+```
+/plugin install rcommander --marketplace mazzucci/rcommander
+```
+
+or from a shell: `claude plugin install rcommander --marketplace mazzucci/rcommander`. Change *Follow Claude's edits* and the `rcmd` path in the plugin's settings.
+
 ## Development
 
 ```sh

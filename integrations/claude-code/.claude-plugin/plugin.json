@@ -1,0 +1,21 @@
+{
+  "name": "rcommander",
+  "version": "0.1.0",
+  "description": "Let Claude show you files, directories and diffs in a running rcommander (rcmd), and follow its edits there.",
+  "author": { "name": "mazzucci" },
+  "userConfig": {
+    "follow": {
+      "type": "string",
+      "title": "Follow Claude's edits",
+      "description": "After Claude edits or writes a file: off, show it in the other panel (goto), or open a diff of the change (diff).",
+      "default": "goto",
+      "options": ["off", "goto", "diff"]
+    },
+    "rcmd_path": {
+      "type": "string",
+      "title": "rcmd executable",
+      "description": "Path to the rcmd binary, if it is not on PATH.",
+      "default": "rcmd"
+    }
+  }
+}
