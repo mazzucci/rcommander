@@ -20,7 +20,7 @@ use axum::routing::get;
 use axum::routing::post;
 use axum::{Json, Router};
 use rc_core::api::{ApiError, DiffRequest, FileOp, InitResponse, ListRequest, OpenRequest, ReadRequest};
-use rc_core::api::{BrowserEvent, ChangesDirs, ForgetRequest, JobRequest, JobStatus, Progress};
+use rc_core::api::{BrowserEvent, ChangesDirs, FindRequest, ForgetRequest, JobRequest, JobStatus, Progress};
 use rc_core::control::{Command, Reply};
 use rc_core::{Location, Settings};
 use rc_vfs::Vfs;
@@ -342,6 +342,7 @@ fn router(state: AppState, port: u16) -> Router {
         .route("/diff", post(diff))
         .route("/diff_head", post(diff_head))
         .route("/op", post(op))
+        .route("/find", post(find))
         .route("/job", post(job_status))
         .route("/cancel", post(cancel_job))
         .route("/conflicts", post(conflicts))
@@ -508,22 +509,49 @@ struct OpQuery {
     job: Option<String>,
 }
 
+/// The job named by `?job=ID`, registered for the length of the request.
+fn job_from_query(
+    s: &AppState,
+    q: Result<Query<OpQuery>, QueryRejection>,
+) -> Result<Option<JobEntry>, (StatusCode, String)> {
+    let q = q.map_err(|e| (StatusCode::BAD_REQUEST, e.body_text()))?;
+    q.0.job.map(|id| s.jobs.start(id)).transpose()
+}
+
+/// The progress callback for an operation, reporting to its job if it has one.
+fn reporter(entry: &Option<JobEntry>) -> impl FnMut(&Progress) -> ControlFlow<()> + '_ {
+    move |p| match entry {
+        Some(entry) => entry.job.report(p),
+        None => ControlFlow::Continue(()),
+    }
+}
+
 /// Run an operation; with `?job=ID` its progress can be followed and it can be cancelled.
 async fn op(State(s): State<AppState>, q: Result<Query<OpQuery>, QueryRejection>, Json(op): Json<FileOp>) -> Response {
-    let q = match q {
-        Ok(Query(q)) => q,
-        Err(e) => return api_error(StatusCode::BAD_REQUEST, e.body_text()),
-    };
-    let entry = match q.job.map(|id| s.jobs.start(id)).transpose() {
+    let entry = match job_from_query(&s, q) {
         Ok(entry) => entry,
         Err((status, msg)) => return api_error(status, msg),
     };
     blocking(move || {
         let op = normalize_op(&s.vfs, op);
-        Ok(s.vfs.op(&op, &mut |p| match &entry {
-            Some(entry) => entry.job.report(p),
-            None => ControlFlow::Continue(()),
-        }))
+        Ok(s.vfs.op(&op, &mut reporter(&entry)))
+    })
+    .await
+}
+
+/// Find files under a folder; with `?job=ID` it can be followed and cancelled.
+async fn find(
+    State(s): State<AppState>,
+    q: Result<Query<OpQuery>, QueryRejection>,
+    Json(mut req): Json<FindRequest>,
+) -> Response {
+    let entry = match job_from_query(&s, q) {
+        Ok(entry) => entry,
+        Err((status, msg)) => return api_error(status, msg),
+    };
+    blocking(move || {
+        req.root = s.vfs.normalize(req.root, None);
+        rc_vfs::find::find(&req, &mut reporter(&entry))
     })
     .await
 }
@@ -832,6 +860,38 @@ mod tests {
         let (status, body) = call(app(tmp.path()), post("/api/op?job=a%20b", mkdir, Some("secret"), &host)).await;
         assert_eq!(status, StatusCode::BAD_REQUEST);
         assert!(body["error"].as_str().unwrap().contains("job"));
+    }
+
+    #[tokio::test]
+    async fn find_searches_under_a_job() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::create_dir(tmp.path().join("sub")).unwrap();
+        std::fs::write(tmp.path().join("sub/notes.txt"), "one\ntwo needle\n").unwrap();
+        std::fs::write(tmp.path().join("other.txt"), "nothing\n").unwrap();
+        let dir = tmp.path().to_string_lossy().to_string();
+        let host = format!("localhost:{PORT}");
+        let req = serde_json::json!({
+            "root": { "kind": "local", "path": format!("{dir}/sub/..") },
+            "name": "*.txt",
+            "contains": "needle",
+        });
+        let (status, body) = call(
+            app(tmp.path()),
+            post("/api/find?job=f1", req.clone(), Some("secret"), &host),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(
+            body["hits"],
+            serde_json::json!([{ "path": format!("{dir}/sub/notes.txt"), "is_dir": false, "line": 2, "text": "two needle" }])
+        );
+        assert_eq!(body["cancelled"], false);
+        let (status, _) = call(app(tmp.path()), post("/api/find", req, None, &host)).await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+        let req = serde_json::json!({ "root": { "kind": "local", "path": format!("{dir}/other.txt") } });
+        let (status, body) = call(app(tmp.path()), post("/api/find", req, Some("secret"), &host)).await;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+        assert!(body["error"].as_str().unwrap().contains("not a folder"));
     }
 
     #[tokio::test]

@@ -2,8 +2,8 @@
 
 use gloo_net::http::Request;
 use rc_core::api::{
-    ApiError, Conflicts, DiffRequest, DiffResponse, FileContent, FileOp, ForgetRequest, InitResponse, JobRequest,
-    JobStatus, ListRequest, OpResult, OpenRequest, ReadRequest,
+    ApiError, Conflicts, DiffRequest, DiffResponse, FileContent, FileOp, FindRequest, FindResult, ForgetRequest,
+    InitResponse, JobRequest, JobStatus, ListRequest, OpResult, OpenRequest, ReadRequest,
 };
 use rc_core::{Listing, Location, Settings};
 use serde::Serialize;
@@ -127,6 +127,11 @@ pub async fn op(op: FileOp, job: Option<String>) -> Result<OpResult, String> {
         Some(job) => call(&format!("op?job={job}"), &op).await,
         None => call("op", &op).await,
     }
+}
+
+/// Find files; `job` lets [`job`] follow it and [`cancel`] stop it.
+pub async fn find(req: FindRequest, job: String) -> Result<FindResult, String> {
+    call(&format!("find?job={job}"), &req).await
 }
 
 /// Progress of a running operation.

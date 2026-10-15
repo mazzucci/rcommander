@@ -3,6 +3,7 @@
 //! New sources (archives, SFTP, GitHub) plug in by matching on new `Location` variants.
 
 pub mod changes;
+pub mod find;
 pub mod git;
 pub mod local;
 pub mod settings;

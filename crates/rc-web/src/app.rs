@@ -1,6 +1,7 @@
 //! Application state, the actions behind every key and button, and the top-level layout.
 
 use crate::diff_view::DiffView;
+use crate::find::{FindForm, FindView};
 use crate::help::HelpView;
 use crate::hotlist::HotlistView;
 use crate::modal::{Modal, ModalKind, ModalView};
@@ -86,6 +87,11 @@ pub struct App {
     pub modal: RwSignal<Option<Modal>>,
     pub options_open: RwSignal<bool>,
     pub hotlist_open: RwSignal<bool>,
+    /// Find files (Alt+F7) is open, and its form and last results.
+    pub find_open: RwSignal<bool>,
+    pub find: FindForm,
+    /// A hit is being viewed from Find files: closing the viewer goes back to it.
+    find_return: StoredValue<bool>,
     /// Saved preferences, from `init` and the options dialog.
     pub settings: RwSignal<Settings>,
     /// Where "Claude's changes" lives, from `init`.
@@ -139,6 +145,9 @@ impl App {
             modal: RwSignal::new(None),
             options_open: RwSignal::new(false),
             hotlist_open: RwSignal::new(false),
+            find_open: RwSignal::new(false),
+            find: FindForm::new(),
+            find_return: StoredValue::new(false),
             settings: RwSignal::new(Settings::default()),
             changes: RwSignal::new(None),
             overlay: RwSignal::new(None),
@@ -166,6 +175,7 @@ impl App {
         self.modal.with(Option::is_some)
             || self.options_open.get()
             || self.hotlist_open.get()
+            || self.find_open.get()
             || self.overlay.with(Option::is_some)
     }
 
@@ -236,7 +246,8 @@ impl App {
         // browser can't report that back to `rcmd ctl`, so say it here).
         let dialog_open = self.modal.with_untracked(Option::is_some)
             || self.options_open.get_untracked()
-            || self.hotlist_open.get_untracked();
+            || self.hotlist_open.get_untracked()
+            || self.find_open.get_untracked();
         let acts = matches!(
             event,
             BrowserEvent::Navigate { .. }
@@ -455,6 +466,39 @@ impl App {
     }
 
     // ---- file actions -----------------------------------------------------------
+
+    /// Alt+F7: find files under the active panel's folder.
+    fn open_find(self) {
+        let (location, hidden) =
+            self.panels[self.active_side()].with_untracked(|p| (p.location.clone(), p.show_hidden));
+        self.find.open(location, hidden);
+        self.find_open.set(true);
+    }
+
+    /// Show `name` in `folder` in the active panel, as Find's "go to" does. Hidden files
+    /// are switched on if the target is one.
+    pub fn go_to(self, folder: Location, name: String) {
+        let side = self.active_side();
+        if name.starts_with('.') && !self.panels[side].with_untracked(|p| p.show_hidden) {
+            self.panels[side].update(Panel::toggle_hidden);
+        }
+        self.load(side, folder, Some(name));
+    }
+
+    /// View a hit from Find files; closing the viewer reopens the dialog.
+    pub fn view_from_find(self, location: Location, line: Option<usize>) {
+        self.request_then(api::read(location), move |result| match result {
+            Ok(content) => {
+                self.find_return.set_value(true);
+                dom::blur_active();
+                self.overlay.set(Some(Overlay::View(Arc::new(content), line)));
+            }
+            Err(e) => {
+                self.error(e);
+                self.find_open.set(true);
+            }
+        });
+    }
 
     fn view(self, location: Location) {
         self.view_at(location, None);
@@ -959,6 +1003,7 @@ impl App {
             match key.as_str() {
                 "ArrowLeft" => self.history_step(false),
                 "ArrowRight" => self.history_step(true),
+                "F7" => self.open_find(),
                 _ => return,
             }
             ev.prevent_default();
@@ -1012,6 +1057,7 @@ impl App {
             (false, "Delete") if self.in_changes() => self.ask_forget(),
             (false, "Delete") => self.ask_delete(shift),
             (false, "c") => self.show_changes(),
+            (false, "F") => self.open_find(),
             (false, "Escape") => {
                 let idle = panel.with_untracked(|p| p.filter.is_empty() && p.selected.is_empty());
                 if !(idle && self.cancel_running_job()) {
@@ -1078,6 +1124,13 @@ pub fn Root() -> impl IntoView {
         document().set_title(if path.is_empty() { "rcommander" } else { &path });
     });
     app.start();
+    // Closing a viewer opened from Find files goes back to the results.
+    Effect::new(move |_| {
+        if app.overlay.with(Option::is_none) && app.find_return.get_value() {
+            app.find_return.set_value(false);
+            app.find_open.set(true);
+        }
+    });
 
     // Footer buttons must not take focus, or Enter/Space would click them again.
     let key_button = move |key: String, label: &'static str, action: Box<dyn Fn(bool)>| {
@@ -1129,6 +1182,9 @@ pub fn Root() -> impl IntoView {
         </Show>
         <Show when=move || app.hotlist_open.get()>
             <HotlistView app/>
+        </Show>
+        <Show when=move || app.find_open.get()>
+            <FindView app/>
         </Show>
         {move || {
             app.overlay
