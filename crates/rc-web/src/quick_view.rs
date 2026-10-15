@@ -29,6 +29,8 @@ pub fn QuickView(app: App, side: usize) -> impl IntoView {
 
     Effect::new(move |_| {
         let Some(key) = target.get() else {
+            // Also drops a request still in flight for the previous entry.
+            seq.update_value(|n| *n += 1);
             preview.set(None);
             return;
         };
@@ -61,11 +63,20 @@ pub fn QuickView(app: App, side: usize) -> impl IntoView {
                 .unwrap_or_else(|| "Quick view".into())
         })
     };
+    // While the next entry loads, the previous preview stays, dimmed (no flicker on
+    // every cursor move), and its size is not shown under the new name.
+    let stale = Memo::new(move |_| target.with(|t| preview.with(|p| p.as_ref().map(|(k, _)| k) != t.as_ref())));
     let body = move || {
+        if target.with(Option::is_none) {
+            return view! { <div class="qv-msg">"Nothing to preview" <span class="qv-sub">"Ctrl+Q closes Quick View"</span></div> }
+                .into_any();
+        }
         preview.with(|p| match p.as_ref().map(|(_, r)| r) {
-            None => view! { <div class="qv-msg">"Nothing to preview" <span class="qv-sub">"Ctrl+Q closes Quick View"</span></div> }
-                .into_any(),
+            None => view! { <div class="qv-msg"></div> }.into_any(),
             Some(Err(e)) => view! { <div class="qv-msg error">{e.clone()}</div> }.into_any(),
+            Some(Ok(Preview::Special { what, .. })) => {
+                view! { <div class="qv-msg">{format!("A {what}: nothing to show")}</div> }.into_any()
+            }
             Some(Ok(Preview::Folder(sum))) => {
                 let plural = |n: usize, w: &str| format!("{n} {w}{}", if n == 1 { "" } else { "s" });
                 view! {
@@ -108,6 +119,9 @@ pub fn QuickView(app: App, side: usize) -> impl IntoView {
         })
     };
     let footer = move || {
+        if stale.get() {
+            return String::new();
+        }
         preview.with(|p| match p.as_ref().map(|(_, r)| r) {
             Some(Ok(Preview::File(c))) if c.text.is_some() => {
                 let cut = c.truncated || c.text.as_ref().is_some_and(|t| t.lines().nth(MAX_LINES).is_some());
@@ -128,7 +142,7 @@ pub fn QuickView(app: App, side: usize) -> impl IntoView {
     view! {
         <div class="panel quick-view" aria-label="Quick view">
             <div class="pathbar"><span class="path">{name}</span></div>
-            <div class="qv-body">{body}</div>
+            <div class="qv-body" class:stale=stale>{body}</div>
             <div class="status">{footer}</div>
         </div>
     }

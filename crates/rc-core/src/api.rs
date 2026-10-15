@@ -62,6 +62,11 @@ pub enum Preview {
     /// The beginning of a file.
     File(FileContent),
     Folder(FolderSummary),
+    /// Not something to read: a named pipe, socket or device (`what` says which).
+    Special {
+        location: Location,
+        what: String,
+    },
 }
 
 /// What a folder holds directly (subfolders are not entered).

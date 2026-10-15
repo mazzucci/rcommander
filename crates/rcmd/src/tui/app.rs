@@ -825,6 +825,10 @@ impl App {
             // Shows the place in the requested panel without moving the user's focus.
             Command::Goto { path, side } => {
                 let side = side.index(self.active);
+                // The panel is hidden behind Quick View: show it.
+                if side != self.active {
+                    self.quick_view = false;
+                }
                 let target = loc(&path);
                 let Location::Local { path: p } = &target;
                 let p = std::path::Path::new(p);
@@ -864,6 +868,9 @@ impl App {
             },
             Command::Select { mask, side } => {
                 reveal(&mut self.mode);
+                if side.index(self.active) != self.active {
+                    self.quick_view = false;
+                }
                 let n = self.panels[side.index(self.active)].select_mask(&mask, true);
                 self.info(format!("Selected {n} entries matching {mask}"));
             }
@@ -1043,7 +1050,8 @@ impl App {
         let marks = &mut self.settings.bookmarks;
         let here = self.panels[self.active].location.to_string();
         match key.code {
-            KeyCode::Esc | KeyCode::Char('q') => return,
+            KeyCode::Esc => return,
+            KeyCode::Char('q') if !has_command_modifier(key) => return,
             KeyCode::Up => cursor = cursor.saturating_sub(1),
             KeyCode::Down => cursor = (cursor + 1).min(marks.len().saturating_sub(1)),
             KeyCode::Char('a') if !marks.contains(&here) => {
@@ -1310,9 +1318,9 @@ impl App {
             }
             KeyCode::F(5) => self.start_copy_move(false),
             KeyCode::F(6) => self.start_copy_move(true),
-            KeyCode::Char('q') if ctrl => {
-                self.quick_view = !self.quick_view;
-            }
+            // Shift+Q too, as in the browser (where Ctrl+Q can quit Firefox).
+            KeyCode::Char('q') if ctrl => self.quick_view = !self.quick_view,
+            KeyCode::Char('Q') => self.quick_view = !self.quick_view,
             KeyCode::F(7) if alt => self.open_find(),
             KeyCode::Char('F') => self.open_find(),
             KeyCode::F(7) => self.prompt("New directory".into(), String::new(), PromptAction::Mkdir),

@@ -1,6 +1,6 @@
 //! Rendering. Colors use the 256-color palette because macOS Terminal.app has no truecolor.
 
-use super::app::{App, EDITOR_ROW, HIDDEN_ROW, LEFT, Mode, Options};
+use super::app::{App, EDITOR_ROW, HIDDEN_ROW, LEFT, Mode, Options, RIGHT};
 use super::find::{Field, Find};
 use super::views::{DiffView, Viewer, sanitize};
 use chrono::{Local, Offset, TimeZone};
@@ -45,7 +45,7 @@ pub fn draw(f: &mut Frame, app: &mut App) {
         _ => {
             let [l, r] = Layout::horizontal([Constraint::Percentage(50); 2]).areas(main);
             draw_side(f, l, app, LEFT);
-            draw_side(f, r, app, 1);
+            draw_side(f, r, app, RIGHT);
         }
     }
 
@@ -215,6 +215,7 @@ fn draw_preview(f: &mut Frame, area: Rect, app: &App) {
     let (lines, center) = match app.preview.as_ref().map(|(_, p)| p) {
         None => centered("Nothing to preview · Ctrl+Q close".into(), DIM),
         Some(Err(e)) => centered(e.clone(), ERR),
+        Some(Ok(Preview::Special { what, .. })) => centered(format!("A {what}: nothing to show"), DIM),
         Some(Ok(Preview::Folder(sum))) => {
             let plural = |n: usize, w: &str| format!("{n} {w}{}", if n == 1 { "" } else { "s" });
             let mut lines = vec![
@@ -870,7 +871,10 @@ fn draw_help(f: &mut Frame, area: Rect) {
         ("F5  F6", "copy / move or rename"),
         ("F7  F8", "new directory / delete to Trash (Shift: permanent)"),
         ("F9", "compare directories (toggle)"),
-        ("Ctrl+Q", "quick view: the other panel previews the cursor's file"),
+        (
+            "Ctrl+Q  Shift+Q",
+            "quick view: the other panel previews the file or folder",
+        ),
         ("Alt+F7  Shift+F", "find files (name mask, text inside)"),
         ("1..9", "same as F1..F9 (Mac: no fn needed)"),
         ("q  F10  Ctrl+C", "quit"),
@@ -999,6 +1003,16 @@ mod tests {
         assert!(screen(&mut app).contains("Quick view"));
         app.handle_key(ctrl_q);
         assert!(!screen(&mut app).contains("Quick view") && app.preview.is_none());
+
+        // A named pipe is described, never opened for reading (that would hang).
+        let fifo = tmp.path().join("pipe");
+        let c = std::ffi::CString::new(fifo.to_string_lossy().as_bytes()).unwrap();
+        assert_eq!(unsafe { libc::mkfifo(c.as_ptr(), 0o600) }, 0);
+        app.handle_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
+        app.handle_key(KeyEvent::new(KeyCode::Char('r'), KeyModifiers::CONTROL));
+        app.panels[app.active].focus_name("pipe");
+        app.handle_key(KeyEvent::new(KeyCode::Char('Q'), KeyModifiers::SHIFT));
+        assert!(screen(&mut app).contains("named pipe"));
     }
 
     #[test]

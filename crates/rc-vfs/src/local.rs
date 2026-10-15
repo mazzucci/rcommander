@@ -138,9 +138,39 @@ mod owners {
     }
 }
 
+/// What a file that is not a regular file is, in words.
+pub fn special_kind(kind: &fs::FileType) -> &'static str {
+    use std::os::unix::fs::FileTypeExt;
+    if kind.is_dir() {
+        "folder"
+    } else if kind.is_fifo() {
+        "named pipe"
+    } else if kind.is_socket() {
+        "socket"
+    } else if kind.is_char_device() || kind.is_block_device() {
+        "device"
+    } else {
+        "special file"
+    }
+}
+
+/// Read up to `limit` bytes of a regular file. Anything else (a named pipe, a device,
+/// a socket) is refused without reading: opening or reading it could block forever.
 pub fn read(path: &str, limit: u64) -> Result<(Vec<u8>, u64)> {
-    let file = fs::File::open(path).with_context(|| format!("cannot open {path}"))?;
-    let size = file.metadata()?.len();
+    use std::os::unix::fs::OpenOptionsExt;
+    // Non-blocking, so opening a pipe with no writer returns at once; the check below
+    // then looks at what was actually opened.
+    let file = fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NONBLOCK)
+        .open(path)
+        .with_context(|| format!("cannot open {path}"))?;
+    let meta = file.metadata()?;
+    let kind = meta.file_type();
+    if !kind.is_file() {
+        bail!("{path} is a {}; it cannot be shown", special_kind(&kind));
+    }
+    let size = meta.len();
     let mut buf = Vec::new();
     file.take(limit).read_to_end(&mut buf)?;
     Ok((buf, size))
@@ -171,6 +201,8 @@ pub type ProgressFn<'a> = dyn FnMut(&Progress) -> ControlFlow<()> + 'a;
 /// Entries counted for a folder summary before giving up (a huge folder must not
 /// stall every cursor move).
 const SUMMARY_LIMIT: usize = 100_000;
+/// Time spent counting before giving up.
+const SUMMARY_TIME: std::time::Duration = std::time::Duration::from_millis(150);
 
 /// What `path` holds directly: folders, files, hidden ones, total file size.
 pub fn summarize(path: &str) -> Result<FolderSummary> {
@@ -183,8 +215,10 @@ pub fn summarize(path: &str) -> Result<FolderSummary> {
         partial: false,
     };
     let read = fs::read_dir(path).with_context(|| format!("cannot read {path}"))?;
+    let start = std::time::Instant::now();
     for (i, entry) in read.enumerate() {
-        if i == SUMMARY_LIMIT {
+        // Every cursor move may ask: stop counting on huge or slow (network) folders.
+        if i == SUMMARY_LIMIT || (i % 256 == 255 && start.elapsed() > SUMMARY_TIME) {
             sum.partial = true;
             break;
         }
@@ -192,8 +226,18 @@ pub fn summarize(path: &str) -> Result<FolderSummary> {
         if entry.file_name().to_string_lossy().starts_with('.') {
             sum.hidden += 1;
         }
-        // Links count as what they point to, as the panels show them.
-        match fs::metadata(entry.path()) {
+        // The type comes with the listing; only links (counted as what they point to,
+        // as the panels show them) and files (for their size) need a stat.
+        let kind = entry.file_type().ok();
+        if kind.is_some_and(|k| k.is_dir()) {
+            sum.folders += 1;
+            continue;
+        }
+        let meta = match kind {
+            Some(k) if k.is_symlink() => fs::metadata(entry.path()),
+            _ => entry.metadata(),
+        };
+        match meta {
             Ok(m) if m.is_dir() => sum.folders += 1,
             Ok(m) => {
                 sum.files += 1;

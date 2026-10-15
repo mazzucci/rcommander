@@ -294,6 +294,11 @@ button.primary kbd {
     overflow: auto;
 }
 
+.qv-body.stale {
+    opacity: 0.45;
+    transition: opacity 0.1s 0.15s;
+}
+
 .qv-body .qv-text {
     display: flex;
     min-width: max-content;

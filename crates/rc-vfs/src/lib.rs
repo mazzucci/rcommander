@@ -9,7 +9,7 @@ pub mod local;
 pub mod settings;
 pub mod watch;
 
-use anyhow::{Result, bail};
+use anyhow::{Context, Result, bail};
 use local::Copied;
 use rc_core::api::{Conflicts, DiffResponse, FileContent, FileOp, OpResult, Preview, Progress};
 use rc_core::{Listing, Location, diff};
@@ -106,10 +106,16 @@ impl Vfs {
     /// Quick View: the beginning of a file, or what a folder holds.
     pub fn preview(&self, loc: &Location) -> Result<Preview> {
         let Location::Local { path } = loc;
-        if Path::new(path).is_dir() {
+        let meta = std::fs::metadata(path).with_context(|| format!("cannot open {path}"))?;
+        if meta.is_dir() {
             local::summarize(path).map(Preview::Folder)
-        } else {
+        } else if meta.is_file() {
             self.read_limited(loc, PREVIEW_LIMIT).map(Preview::File)
+        } else {
+            Ok(Preview::Special {
+                location: loc.clone(),
+                what: local::special_kind(&meta.file_type()).into(),
+            })
         }
     }
 
@@ -437,6 +443,15 @@ mod tests {
         );
         assert_eq!(sum.size, 6 + 1 + PREVIEW_LIMIT + 10);
         assert!(vfs.preview(&loc("missing")).is_err());
+        // A named pipe is refused at once instead of blocking on open.
+        let fifo = p.join("pipe");
+        let c = std::ffi::CString::new(fifo.to_string_lossy().as_bytes()).unwrap();
+        assert_eq!(unsafe { libc::mkfifo(c.as_ptr(), 0o600) }, 0);
+        let Preview::Special { what, .. } = vfs.preview(&loc("pipe")).unwrap() else {
+            panic!()
+        };
+        assert_eq!(what, "named pipe");
+        assert!(vfs.read_content(&loc("pipe")).is_err());
     }
 
     #[cfg(unix)]

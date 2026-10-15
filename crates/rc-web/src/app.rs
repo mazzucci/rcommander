@@ -179,6 +179,13 @@ impl App {
         self.quick_view.get() && self.active.get() != side
     }
 
+    /// Remote control acting on a panel hidden behind Quick View: show it.
+    fn show_panel(self, side: usize) {
+        if side != self.active_side() {
+            self.quick_view.set(false);
+        }
+    }
+
     /// A dialog or overlay has the keyboard (tracked, for the view).
     pub fn covered(self) -> bool {
         self.modal.with(Option::is_some)
@@ -274,12 +281,14 @@ impl App {
             // Shows the place without moving the user's focus, as in the terminal UI.
             BrowserEvent::Navigate { side, location, focus } => {
                 reveal();
+                self.show_panel(side.index(active));
                 self.show(side.index(active), location, focus, Nav::Visit, |_| {});
             }
             BrowserEvent::Diff { left, right } => self.open_diff(api::diff(left, right)),
             BrowserEvent::View { location, line } => self.view_at(location, line),
             BrowserEvent::Select { side, mask } => {
                 reveal();
+                self.show_panel(side.index(active));
                 let n = self.panels[side.index(active)]
                     .try_update(|p| p.select_mask(&mask, true))
                     .unwrap_or(0);
@@ -1090,7 +1099,8 @@ impl App {
             (false, "o") => self.options_open.set(true),
             (false, "?") => self.overlay.set(Some(Overlay::Help)),
             (true, "d") => self.hotlist_open.set(true),
-            (true, "q") => self.quick_view.update(|on| *on = !*on),
+            // Shift+Q too: Firefox on Linux quits on Ctrl+Q.
+            (true, "q") | (false, "Q") => self.quick_view.update(|on| *on = !*on),
             (true, "r") => self.refresh_both(),
             (true, "u") => self.swap_panels(),
             _ => return,
