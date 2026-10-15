@@ -1,6 +1,7 @@
 //! Request/response types of the HTTP API between the web front end and `rcmd web`.
 //! All endpoints are `POST /api/<name>` with JSON bodies; errors are `{"error": "..."}`.
 
+use crate::control::Side;
 use crate::{DiffResult, Location, Settings};
 use serde::{Deserialize, Serialize};
 
@@ -124,6 +125,34 @@ impl OpResult {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct OpenRequest {
     pub location: Location,
+}
+
+/// `GET /api/events?token=…`: server-sent events, each one JSON [`BrowserEvent`]. They
+/// carry remote-control commands (`rcmd ctl`) to the browser, paths already resolved.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "event", rename_all = "snake_case")]
+pub enum BrowserEvent {
+    /// Show `location` in a panel, with the cursor on `focus` if given.
+    Navigate {
+        side: Side,
+        location: Location,
+        focus: Option<String>,
+    },
+    Diff {
+        left: Location,
+        right: Location,
+    },
+    View {
+        location: Location,
+    },
+    Select {
+        side: Side,
+        mask: String,
+    },
+    Refresh,
+    Message {
+        text: String,
+    },
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]

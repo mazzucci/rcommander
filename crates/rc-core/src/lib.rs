@@ -1,6 +1,7 @@
 //! Shared model for rcommander. No I/O here, so it compiles for both native and wasm32.
 
 pub mod api;
+pub mod control;
 pub mod diff;
 pub mod dircmp;
 mod entry;

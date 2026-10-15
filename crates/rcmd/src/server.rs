@@ -9,21 +9,29 @@
 //! and run the configured editor command. Treat it like a shell session.
 
 use anyhow::{Context, Result};
+use axum::extract::Query;
 use axum::extract::{Request, State};
 use axum::http::{HeaderMap, StatusCode, Uri, header};
 use axum::middleware::{self, Next};
+use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::response::{Html, IntoResponse, Response};
+use axum::routing::get;
 use axum::routing::post;
 use axum::{Json, Router};
+use rc_core::api::BrowserEvent;
 use rc_core::api::{ApiError, DiffRequest, FileOp, InitResponse, ListRequest, OpenRequest, ReadRequest};
+use rc_core::control::{Command, Reply};
 use rc_core::{Location, Settings};
 use rc_vfs::Vfs;
 use rust_embed::RustEmbed;
 use serde::Serialize;
+use std::collections::HashMap;
+use std::convert::Infallible;
 use std::io::Read;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::RwLock;
+use tokio::sync::broadcast;
 
 /// Built front end (`trunk build` in crates/rc-web). Embedded in release builds, read from
 /// disk in debug builds; missing entirely if the front end was never built.
@@ -51,6 +59,8 @@ struct AppState {
     settings: Arc<RwLock<Settings>>,
     /// Where settings are saved; `None` keeps them in memory (tests).
     settings_path: Option<Arc<PathBuf>>,
+    /// Remote-control commands on their way to connected browsers.
+    events: broadcast::Sender<BrowserEvent>,
 }
 
 pub fn run(vfs: Arc<Vfs>, config: Config) -> Result<()> {
@@ -75,6 +85,28 @@ async fn serve(vfs: Arc<Vfs>, config: Config) -> Result<()> {
         home: Vfs::home(),
         settings: Settings::default(),
     };
+    let (events, _) = broadcast::channel(64);
+    // `rcmd ctl` commands are resolved here and pushed to the browsers.
+    let _control = match crate::control::listen() {
+        Ok((listener, rx)) => {
+            let (vfs, events) = (Arc::clone(&vfs), events.clone());
+            std::thread::spawn(move || {
+                for req in rx {
+                    let reply = match browser_event(&vfs, req.command).map(|ev| events.send(ev)) {
+                        Err(e) => Reply::error(e),
+                        Ok(Ok(_)) => Reply::ok(),
+                        Ok(Err(_)) => Reply::error("no browser is connected to rcmd web"),
+                    };
+                    let _ = req.reply.send(reply);
+                }
+            });
+            Some(listener)
+        }
+        Err(e) => {
+            eprintln!("warning: remote control unavailable: {e:#}");
+            None
+        }
+    };
     let app = router(
         AppState {
             vfs,
@@ -82,6 +114,7 @@ async fn serve(vfs: Arc<Vfs>, config: Config) -> Result<()> {
             init: Arc::new(init),
             settings: Arc::new(RwLock::new(config.settings)),
             settings_path: config.settings_path.map(Arc::new),
+            events,
         },
         addr.port(),
     );
@@ -118,17 +151,8 @@ async fn serve(vfs: Arc<Vfs>, config: Config) -> Result<()> {
 
 /// Write a page that redirects to `url` into a directory only this user can read.
 fn launcher_page(url: &str) -> Result<std::path::PathBuf> {
-    use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
-    let base = dirs::runtime_dir().unwrap_or_else(std::env::temp_dir);
-    // SAFETY: getuid has no preconditions and cannot fail.
-    let uid = unsafe { libc::getuid() };
-    let dir = base.join(format!("rcommander-{uid}"));
-    std::fs::create_dir_all(&dir)?;
-    let meta = std::fs::symlink_metadata(&dir)?;
-    if !meta.is_dir() || meta.uid() != uid {
-        anyhow::bail!("{} is not a directory owned by you", dir.display());
-    }
-    std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700))?;
+    use std::os::unix::fs::OpenOptionsExt;
+    let dir = crate::control::private_dir()?;
     let page = dir.join(format!("open-{}.html", std::process::id()));
     let _ = std::fs::remove_file(&page);
     let html = format!(
@@ -144,8 +168,19 @@ fn launcher_page(url: &str) -> Result<std::path::PathBuf> {
     Ok(page)
 }
 
+/// Ctrl+C, `kill` or a closed terminal: stop cleanly so the control socket and the
+/// launcher page are removed.
 async fn shutdown_signal() {
-    let _ = tokio::signal::ctrl_c().await;
+    use tokio::signal::unix::{SignalKind, signal};
+    let (Ok(mut term), Ok(mut hup)) = (signal(SignalKind::terminate()), signal(SignalKind::hangup())) else {
+        let _ = tokio::signal::ctrl_c().await;
+        return;
+    };
+    tokio::select! {
+        _ = tokio::signal::ctrl_c() => {}
+        _ = term.recv() => {}
+        _ = hup.recv() => {}
+    }
 }
 
 fn router(state: AppState, port: u16) -> Router {
@@ -160,6 +195,7 @@ fn router(state: AppState, port: u16) -> Router {
         .route("/settings", post(save_settings))
         .route_layer(middleware::from_fn_with_state(state.clone(), require_token));
     Router::new()
+        .route("/api/events", get(events))
         .nest("/api", api)
         .fallback(static_file)
         .layer(middleware::from_fn(move |req, next| {
@@ -323,6 +359,71 @@ async fn open_external(State(s): State<AppState>, Json(req): Json<OpenRequest>) 
     .await
 }
 
+/// Turn a remote-control command into what the browser should do, checking paths here
+/// so `rcmd ctl` gets a useful error.
+fn browser_event(vfs: &Vfs, command: Command) -> Result<BrowserEvent, String> {
+    let resolve = |p: &str| vfs.normalize(Location::local(p), None);
+    let existing = |p: &str| {
+        let loc = resolve(p);
+        let Location::Local { path } = &loc;
+        if std::path::Path::new(path).exists() {
+            Ok(loc)
+        } else {
+            Err(format!("{path}: no such file or directory"))
+        }
+    };
+    Ok(match command {
+        Command::Goto { path, side } => {
+            let loc = existing(&path)?;
+            let Location::Local { path: p } = &loc;
+            match (std::path::Path::new(p).is_dir(), loc.parent(), loc.file_name()) {
+                (false, Some(dir), Some(name)) => BrowserEvent::Navigate {
+                    side,
+                    focus: Some(name.to_string()),
+                    location: dir,
+                },
+                _ => BrowserEvent::Navigate {
+                    side,
+                    location: loc,
+                    focus: None,
+                },
+            }
+        }
+        Command::Diff { left, right } => BrowserEvent::Diff {
+            left: existing(&left)?,
+            right: existing(&right)?,
+        },
+        Command::View { path } => BrowserEvent::View {
+            location: existing(&path)?,
+        },
+        Command::Select { mask, side } => BrowserEvent::Select { side, mask },
+        Command::Refresh => BrowserEvent::Refresh,
+        Command::Message { text } => BrowserEvent::Message { text },
+    })
+}
+
+/// Server-sent events for the browser. EventSource cannot send headers, so the token
+/// comes as a query parameter here (same origin, never leaves the machine).
+async fn events(State(s): State<AppState>, Query(q): Query<HashMap<String, String>>) -> Response {
+    if !q
+        .get("token")
+        .is_some_and(|t| same_token(t.as_bytes(), s.token.as_bytes()))
+    {
+        return api_error(StatusCode::UNAUTHORIZED, "missing or invalid token");
+    }
+    let stream = futures_util::stream::unfold(s.events.subscribe(), |mut rx| async move {
+        let ev = match rx.recv().await {
+            Ok(ev) => ev,
+            // Missed some events: have the browser re-read everything instead.
+            Err(broadcast::error::RecvError::Lagged(_)) => BrowserEvent::Refresh,
+            Err(broadcast::error::RecvError::Closed) => return None,
+        };
+        let event = Event::default().json_data(&ev).unwrap_or_default();
+        Some((Ok::<_, Infallible>(event), rx))
+    });
+    Sse::new(stream).keep_alive(KeepAlive::default()).into_response()
+}
+
 async fn static_file(uri: Uri) -> Response {
     let path = uri.path().trim_start_matches('/');
     let path = if path.is_empty() { "index.html" } else { path };
@@ -372,6 +473,7 @@ mod tests {
             }),
             settings: Arc::new(RwLock::new(Settings::default())),
             settings_path: None,
+            events: broadcast::channel(8).0,
         };
         router(state, PORT)
     }
@@ -546,6 +648,91 @@ mod tests {
         let (_, init) = call(router, post("/api/init", serde_json::json!({}), Some("secret"), &host)).await;
         assert_eq!(init["settings"]["columns"], serde_json::json!(["permissions"]));
         assert_eq!(init["settings"]["show_hidden"], false);
+    }
+
+    #[test]
+    fn control_commands_become_browser_events() {
+        use rc_core::control::Side;
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(tmp.path().join("f.txt"), "x").unwrap();
+        let dir = tmp.path().to_string_lossy().to_string();
+        let vfs = Vfs::new();
+        let ev = browser_event(
+            &vfs,
+            Command::Goto {
+                path: format!("{dir}/f.txt"),
+                side: Side::Right,
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            ev,
+            BrowserEvent::Navigate {
+                side: Side::Right,
+                location: Location::local(&dir),
+                focus: Some("f.txt".into())
+            }
+        );
+        let ev = browser_event(
+            &vfs,
+            Command::Goto {
+                path: dir.clone(),
+                side: Side::Active,
+            },
+        )
+        .unwrap();
+        assert!(matches!(ev, BrowserEvent::Navigate { focus: None, .. }));
+        let err = browser_event(
+            &vfs,
+            Command::View {
+                path: format!("{dir}/missing"),
+            },
+        )
+        .unwrap_err();
+        assert!(err.contains("no such file"));
+    }
+
+    #[tokio::test]
+    async fn event_stream_requires_token_and_delivers_events() {
+        let tmp = tempfile::tempdir().unwrap();
+        let host = format!("127.0.0.1:{PORT}");
+        let get = |uri: &str| {
+            Request::get(uri)
+                .header(header::HOST, &host)
+                .body(Body::empty())
+                .unwrap()
+        };
+        let router = app(tmp.path());
+        let resp = router.clone().oneshot(get("/api/events?token=wrong")).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+
+        // Build the state by hand to keep the sender.
+        let loc = Location::local(tmp.path().to_string_lossy());
+        let (events, _) = broadcast::channel(8);
+        let state = AppState {
+            vfs: Arc::new(Vfs::new()),
+            token: "secret".into(),
+            init: Arc::new(InitResponse {
+                left: loc.clone(),
+                right: loc,
+                home: "/".into(),
+                settings: Settings::default(),
+            }),
+            settings: Arc::new(RwLock::new(Settings::default())),
+            settings_path: None,
+            events: events.clone(),
+        };
+        let resp = super::router(state, PORT)
+            .oneshot(get("/api/events?token=secret"))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        events.send(BrowserEvent::Message { text: "hi".into() }).unwrap();
+        let mut body = resp.into_body().into_data_stream();
+        use futures_util::StreamExt;
+        let chunk = body.next().await.unwrap().unwrap();
+        let text = String::from_utf8_lossy(&chunk);
+        assert!(text.contains(r#""event":"message""#) && text.contains("hi"), "{text}");
     }
 
     #[tokio::test]

@@ -68,3 +68,15 @@ jobs:
           ./target/release/rcmd web --no-open --port 7999 > server.log 2>&1 &
           sleep 2
           curl -sf -H 'Host: 127.0.0.1:7999' http://127.0.0.1:7999/ | grep -q 'rc-web'
+
+  claude-code-plugin:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - run: npm install -g @anthropic-ai/claude-code
+      - run: claude plugin validate .
+      - run: claude plugin validate integrations/claude-code
+      - run: claude plugin test integrations/claude-code

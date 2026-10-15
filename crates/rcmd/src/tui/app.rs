@@ -2,8 +2,10 @@
 //! terminal I/O so it can be unit-tested with plain key events.
 
 use super::views::{DiffView, Viewer};
+use crate::control::Request;
 use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use rc_core::api::{FileOp, OpResult};
+use rc_core::control::{Command, Reply};
 use rc_core::panel::SortKey;
 use rc_core::{Column, Location, Panel, Row, Settings, dircmp};
 use rc_vfs::Vfs;
@@ -103,6 +105,8 @@ pub struct App {
     pub settings: Settings,
     /// Where settings are saved; `None` keeps them in memory (tests).
     settings_path: Option<PathBuf>,
+    /// Remote-control requests from `rcmd ctl` (see `control.rs`).
+    pub control: Option<Receiver<Request>>,
 }
 
 impl App {
@@ -135,6 +139,7 @@ impl App {
             page: 20,
             settings,
             settings_path,
+            control: None,
         };
         app.load(LEFT, left, None);
         app.load(RIGHT, right, None);
@@ -385,8 +390,83 @@ impl App {
         });
     }
 
-    /// Poll the running job. Returns true if something changed and a redraw is due.
+    /// Apply pending remote-control commands and poll the running job. Returns true if
+    /// something changed and a redraw is due.
     pub fn tick(&mut self) -> bool {
+        let mut changed = false;
+        while let Some(req) = self.control.as_ref().and_then(|rx| rx.try_recv().ok()) {
+            let reply = self.apply(req.command);
+            let _ = req.reply.send(reply);
+            changed = true;
+        }
+        self.tick_job() || changed
+    }
+
+    /// Carry out a remote-control command.
+    pub fn apply(&mut self, command: Command) -> Reply {
+        // Never act behind a dialog the user is answering; harmless commands still go through.
+        let busy = matches!(
+            self.mode,
+            Mode::Prompt(_) | Mode::Confirm(_) | Mode::Filter | Mode::Options(_)
+        );
+        if busy && !matches!(command, Command::Message { .. } | Command::Refresh) {
+            return Reply::error("rcmd is busy: a dialog is open");
+        }
+        // Views that cover the panels get out of the way.
+        let reveal = |mode: &mut Mode| {
+            if matches!(mode, Mode::Viewer(_) | Mode::Diff(_) | Mode::Help) {
+                *mode = Mode::Normal;
+            }
+        };
+        let base = self.active_panel().location.clone();
+        let loc = |p: &str| self.vfs.normalize(Location::local(p), Some(&base));
+        match command {
+            // Shows the place in the requested panel without moving the user's focus.
+            Command::Goto { path, side } => {
+                let side = side.index(self.active);
+                let target = loc(&path);
+                let Location::Local { path: p } = &target;
+                let p = std::path::Path::new(p);
+                if p.symlink_metadata().is_err() {
+                    return Reply::error(format!("{}: no such file or directory", p.display()));
+                }
+                reveal(&mut self.mode);
+                let ok = if p.is_dir() {
+                    self.load(side, target, None)
+                } else {
+                    let (Some(dir), Some(name)) = (target.parent(), target.file_name().map(str::to_string)) else {
+                        return Reply::error(format!("cannot show {path}"));
+                    };
+                    // A dot-file can only get the cursor if hidden files are shown.
+                    if name.starts_with('.') && !self.panels[side].show_hidden {
+                        self.panels[side].toggle_hidden();
+                    }
+                    self.load(side, dir, Some(&name))
+                };
+                if !ok {
+                    return Reply::error(self.message.clone().map_or_else(|| "failed".into(), |m| m.0));
+                }
+            }
+            Command::Diff { left, right } => match self.vfs.diff(Some(&loc(&left)), Some(&loc(&right))) {
+                Ok(resp) => self.mode = Mode::Diff(DiffView::new(resp)),
+                Err(e) => return Reply::error(format!("{e:#}")),
+            },
+            Command::View { path } => match self.vfs.read_content(&loc(&path)) {
+                Ok(content) => self.mode = Mode::Viewer(Viewer::new(content)),
+                Err(e) => return Reply::error(format!("{e:#}")),
+            },
+            Command::Select { mask, side } => {
+                reveal(&mut self.mode);
+                let n = self.panels[side.index(self.active)].select_mask(&mask, true);
+                self.info(format!("Selected {n} entries matching {mask}"));
+            }
+            Command::Refresh => self.refresh_all(),
+            Command::Message { text } => self.info(text),
+        }
+        Reply::ok()
+    }
+
+    fn tick_job(&mut self) -> bool {
         let Some(job) = &mut self.job else { return false };
         let mut changed = false;
         loop {
@@ -694,6 +774,7 @@ fn has_command_modifier(key: KeyEvent) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rc_core::control::Side;
     use std::fs;
     use std::time::{Duration, Instant};
 
@@ -945,6 +1026,67 @@ mod tests {
             panic!("expected edit")
         };
         assert_eq!(editor, "nano1");
+    }
+
+    #[test]
+    fn remote_commands() {
+        let (tmp, mut app) = setup();
+        let p = |s: &str| tmp.path().join(s).to_string_lossy().into_owned();
+        // A file path shows its directory with the cursor on it, in the requested panel.
+        let r = app.apply(Command::Goto {
+            path: p("right/a.txt"),
+            side: Side::Left,
+        });
+        assert!(r.ok);
+        assert_eq!(app.panels[LEFT].location, Location::local(p("right")));
+        assert_eq!(app.panels[LEFT].current().unwrap().name, "a.txt");
+        assert!(
+            app.apply(Command::Diff {
+                left: p("left/a.txt"),
+                right: p("right/a.txt")
+            })
+            .ok
+        );
+        assert!(matches!(app.mode, Mode::Diff(_)));
+        // Goto closes the diff so the panels are visible.
+        assert!(
+            app.apply(Command::Goto {
+                path: p("left"),
+                side: Side::Right
+            })
+            .ok
+        );
+        assert!(matches!(app.mode, Mode::Normal));
+        assert_eq!(app.active, LEFT, "remote navigation doesn't move the user's focus");
+        assert!(
+            app.apply(Command::Select {
+                mask: "*.txt".into(),
+                side: Side::Right
+            })
+            .ok
+        );
+        assert_eq!(app.panels[RIGHT].selected.len(), 2);
+        assert!(
+            !app.apply(Command::Goto {
+                path: p("missing/x"),
+                side: Side::Active
+            })
+            .ok
+        );
+        assert!(!app.apply(Command::View { path: p("nope") }).ok);
+        assert!(
+            !app.apply(Command::Goto {
+                path: p("left/missing.txt"),
+                side: Side::Active
+            })
+            .ok
+        );
+        // A dialog the user is answering is never replaced.
+        app.handle_key(key(KeyCode::F(7)));
+        assert!(!app.apply(Command::View { path: p("left/a.txt") }).ok);
+        assert!(matches!(app.mode, Mode::Prompt(_)));
+        assert!(app.apply(Command::Message { text: "hi".into() }).ok);
+        assert_eq!(app.message.as_ref().unwrap().0, "hi");
     }
 
     #[test]
