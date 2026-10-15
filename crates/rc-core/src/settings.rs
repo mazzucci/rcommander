@@ -1,8 +1,8 @@
 //! User preferences shared by both front ends. The native side persists them as TOML;
 //! the browser gets and saves them through the API.
 
-use crate::Entry;
 use crate::format::{format_time, human_size, permissions};
+use crate::{Entry, SortKey};
 use serde::{Deserialize, Serialize};
 
 /// Optional columns. The name column is always shown.
@@ -64,6 +64,16 @@ impl Column {
 
     pub fn right_aligned(self) -> bool {
         matches!(self, Column::Size)
+    }
+
+    /// The panel sort order this column's header selects, if the panel can sort by it.
+    pub fn sort_key(self) -> Option<SortKey> {
+        match self {
+            Column::Ext => Some(SortKey::Ext),
+            Column::Size => Some(SortKey::Size),
+            Column::Modified => Some(SortKey::Modified),
+            Column::Created | Column::Permissions | Column::Owner | Column::Group => None,
+        }
     }
 
     /// Cell text for an entry. `utc_offset` converts timestamps to local time.
@@ -155,6 +165,13 @@ mod tests {
         for c in Column::ALL {
             assert!(c.title().len() <= c.width() as usize, "{c:?}");
         }
+    }
+
+    #[test]
+    fn sortable_columns() {
+        assert_eq!(Column::Size.sort_key(), Some(SortKey::Size));
+        assert_eq!(Column::Modified.sort_key(), Some(SortKey::Modified));
+        assert_eq!(Column::Owner.sort_key(), None);
     }
 
     #[test]

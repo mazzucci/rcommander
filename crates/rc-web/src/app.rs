@@ -2,6 +2,7 @@
 
 use crate::diff_view::DiffView;
 use crate::modal::{Modal, ModalKind, ModalView};
+use crate::options::OptionsView;
 use crate::panel_view::PanelView;
 use crate::viewer::Viewer;
 use crate::{api, dom};
@@ -10,7 +11,7 @@ use leptos::prelude::*;
 use leptos::task::spawn_local;
 use rc_core::api::{DiffResponse, FileContent, FileOp, OpResult};
 use rc_core::dircmp::{self, CmpMark};
-use rc_core::{Location, Panel, Row, SortKey};
+use rc_core::{Location, Panel, Row, Settings, SortKey};
 use std::collections::HashMap;
 use std::future::Future;
 use std::sync::Arc;
@@ -45,6 +46,10 @@ pub struct App {
     /// Panel whose quick-filter input is open.
     pub filtering: RwSignal<Option<usize>>,
     pub modal: RwSignal<Option<Modal>>,
+    /// The options dialog is open.
+    pub options_open: RwSignal<bool>,
+    /// Saved preferences, from `init` and the options dialog.
+    pub settings: RwSignal<Settings>,
     pub overlay: RwSignal<Option<Overlay>>,
     pub message: RwSignal<Option<Message>>,
     /// Number of API requests in flight.
@@ -52,8 +57,6 @@ pub struct App {
     /// Per panel: id of the latest listing request, so a slow, older reply can't
     /// overwrite a newer one.
     load_seq: [StoredValue<u64>; 2],
-    /// Local UTC offset in seconds, for `format_time`.
-    pub tz_offset: i64,
 }
 
 /// Increments the busy counter for as long as it lives.
@@ -81,12 +84,12 @@ impl App {
             editing_path: RwSignal::new(None),
             filtering: RwSignal::new(None),
             modal: RwSignal::new(None),
+            options_open: RwSignal::new(false),
+            settings: RwSignal::new(Settings::default()),
             overlay: RwSignal::new(None),
             message: RwSignal::new(None),
             busy: RwSignal::new(0),
             load_seq: [StoredValue::new(0), StoredValue::new(0)],
-            // getTimezoneOffset() is "UTC minus local" in minutes.
-            tz_offset: -(js_sys::Date::new_0().get_timezone_offset() as i64) * 60,
         }
     }
 
@@ -132,6 +135,10 @@ impl App {
             return;
         }
         self.request(api::init(), move |init| {
+            for panel in self.panels {
+                panel.update(|p| p.show_hidden = init.settings.show_hidden);
+            }
+            self.settings.set(init.settings);
             self.load(LEFT, init.left, None);
             self.load(RIGHT, init.right, None);
         });
@@ -198,8 +205,8 @@ impl App {
         right.set(l);
     }
 
-    fn set_hidden_everywhere(self) {
-        let show = !self.panels[self.active_side()].with_untracked(|p| p.show_hidden);
+    /// Show or hide dot-files in both panels.
+    pub fn show_hidden(self, show: bool) {
         for panel in self.panels {
             if panel.with_untracked(|p| p.show_hidden) != show {
                 panel.update(Panel::toggle_hidden);
@@ -216,12 +223,25 @@ impl App {
         });
     }
 
-    /// F4: open the entry under the cursor with the system default application.
-    fn open_external(self) {
-        let target = self.panels[self.active_side()]
-            .with_untracked(|p| p.current().map(|e| (p.location.join(&e.name), e.name.clone())));
+    /// Persist the options dialog's settings and apply them once the server confirms.
+    pub fn save_settings(self, settings: Settings) {
+        self.request(api::save_settings(settings), move |saved| {
+            self.settings.set(saved);
+            self.options_open.set(false);
+            self.info("Options saved");
+        });
+    }
+
+    /// F4: open the file under the cursor in the configured editor (server side), or
+    /// the system default application if none is set. Directories are ignored.
+    fn edit(self) {
+        let target = self.panels[self.active_side()].with_untracked(|p| {
+            p.current()
+                .filter(|e| !e.is_dir)
+                .map(|e| (p.location.join(&e.name), e.name.clone()))
+        });
         let Some((location, name)) = target else { return };
-        self.request(api::open(location), move |()| self.info(format!("Opened {name}")));
+        self.request(api::edit(location), move |()| self.info(format!("Editing {name}")));
     }
 
     /// F2: diff two selected files, or the cursor file against its counterpart in the
@@ -393,7 +413,7 @@ impl App {
         match n {
             2 => self.diff(),
             3 => self.enter(self.active_side()),
-            4 => self.open_external(),
+            4 => self.edit(),
             5 => self.ask_transfer(false),
             6 => self.ask_transfer(true),
             7 => self.ask_mkdir(),
@@ -409,6 +429,7 @@ impl App {
     /// own keys, so this backs off while any of them has the keyboard.
     fn handle_key(self, ev: &KeyboardEvent) {
         if self.modal.with_untracked(Option::is_some)
+            || self.options_open.get_untracked()
             || self.overlay.with_untracked(Option::is_some)
             || dom::is_text_field(ev.target())
             || ev.alt_key()
@@ -476,8 +497,9 @@ impl App {
                 }
             }),
             (false, "/") | (true, "f") => self.filtering.set(Some(side)),
-            (false, ".") => self.set_hidden_everywhere(),
+            (false, ".") => panel.update(Panel::toggle_hidden),
             (false, "g") | (true, "l") => self.editing_path.set(Some(side)),
+            (false, "o") => self.options_open.set(true),
             (true, "r") => self.refresh_both(),
             (true, "u") => self.swap_panels(),
             _ => return,
@@ -495,7 +517,7 @@ fn page_rows(side: usize) -> isize {
 const FKEYS: [(u8, &str); 8] = [
     (2, "Diff"),
     (3, "View"),
-    (4, "Open"),
+    (4, "Edit"),
     (5, "Copy"),
     (6, "Move"),
     (7, "MkDir"),
@@ -543,8 +565,15 @@ pub fn Root() -> impl IntoView {
                     }
                 })
                 .collect_view()}
+            <button on:mousedown=|ev| ev.prevent_default() on:click=move |_| app.options_open.set(true)>
+                <b>"o"</b>
+                " Options"
+            </button>
         </div>
         {move || app.modal.get().map(|modal| view! { <ModalView app modal/> })}
+        <Show when=move || app.options_open.get()>
+            <OptionsView app/>
+        </Show>
         {move || {
             app.overlay
                 .get()

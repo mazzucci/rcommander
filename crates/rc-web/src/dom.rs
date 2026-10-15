@@ -22,6 +22,32 @@ pub fn is_text_field(target: Option<EventTarget>) -> bool {
         .is_some_and(|el| matches!(el.tag_name().as_str(), "INPUT" | "TEXTAREA" | "SELECT") || el.is_content_editable())
 }
 
+pub fn is_button(target: Option<EventTarget>) -> bool {
+    target
+        .and_then(|t| t.dyn_into::<HtmlElement>().ok())
+        .is_some_and(|el| el.tag_name() == "BUTTON")
+}
+
+/// Move keyboard focus among the elements in `container` matching `selector`: `delta`
+/// steps from the focused one (clamped), or to the first if none of them has focus.
+pub fn move_focus(container: &Element, selector: &str, delta: isize) {
+    let Ok(list) = container.query_selector_all(selector) else {
+        return;
+    };
+    let items: Vec<HtmlElement> = (0..list.length())
+        .filter_map(|i| list.item(i)?.dyn_into().ok())
+        .collect();
+    let Some(last) = items.len().checked_sub(1) else { return };
+    let active = web_sys::window()
+        .and_then(|w| w.document())
+        .and_then(|d| d.active_element());
+    let next = items
+        .iter()
+        .position(|el| el.is_same_node(active.as_ref().map(|a| a.as_ref())))
+        .map_or(0, |i| i.saturating_add_signed(delta).min(last));
+    let _ = items[next].focus();
+}
+
 /// Take focus away from whatever has it (e.g. a text field under a new overlay, which
 /// would otherwise keep receiving keys).
 pub fn blur_active() {

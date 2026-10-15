@@ -5,7 +5,7 @@ use rc_core::api::{
     ApiError, DiffRequest, DiffResponse, FileContent, FileOp, InitResponse, ListRequest, OpResult, OpenRequest,
     ReadRequest,
 };
-use rc_core::{Listing, Location};
+use rc_core::{Listing, Location, Settings};
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 use std::sync::OnceLock;
@@ -97,8 +97,14 @@ pub async fn op(op: FileOp) -> Result<OpResult, String> {
     call("op", &op).await
 }
 
-pub async fn open(location: Location) -> Result<(), String> {
-    call::<_, serde_json::Value>("open", &OpenRequest { location })
+/// Open a file in the configured editor (or the system default application).
+pub async fn edit(location: Location) -> Result<(), String> {
+    call::<_, serde_json::Value>("edit", &OpenRequest { location })
         .await
         .map(drop)
+}
+
+/// Persist the options; the server replies with what it saved.
+pub async fn save_settings(settings: Settings) -> Result<Settings, String> {
+    call("settings", &settings).await
 }

@@ -124,7 +124,8 @@ kbd {
 .colhdr,
 .row {
     display: grid;
-    grid-template-columns: 14px minmax(0, 1fr) 52px 64px 132px;
+    /* Set per panel from the visible columns (see grid_columns in panel_view.rs). */
+    grid-template-columns: var(--cols);
     padding: 0 4px;
 }
 
@@ -140,10 +141,15 @@ kbd {
 
 .colhdr > span {
     padding: 0 4px;
+    overflow: hidden;
+    white-space: nowrap;
+}
+
+.colhdr > .sortable {
     cursor: pointer;
 }
 
-.colhdr > span:hover {
+.colhdr > .sortable:hover {
     color: var(--text);
 }
 
@@ -186,24 +192,27 @@ kbd {
     color: var(--dim);
 }
 
-.c-size,
-.c-date {
+.right {
     text-align: right;
+}
+
+.row > span:not(.c-name, .c-mark, .c-ext) {
+    color: #9aa0aa;
     font-variant-numeric: tabular-nums;
 }
 
-.row .c-size,
-.row .c-date {
-    color: #9aa0aa;
+.row > .c-perms {
+    font: 12px/22px var(--mono);
+}
+
+.link-target {
+    color: var(--dim);
+    font-weight: 400;
 }
 
 .row.dir .c-name {
     font-weight: 600;
     color: var(--dir);
-}
-
-.row.link .c-name {
-    font-style: italic;
 }
 
 .row.hidden {
@@ -625,4 +634,58 @@ button.primary {
 .danger button.primary {
     background: #a8261f;
     border-color: var(--del);
+}
+
+/* ---- options dialog ---------------------------------------------------------- */
+
+.opt-columns {
+    display: grid;
+    grid-template-columns: repeat(auto-fill, minmax(120px, 1fr));
+    gap: 4px 12px;
+    margin: 0 0 12px;
+    padding: 8px 10px 10px;
+    border: 1px solid var(--border);
+    border-radius: 4px;
+}
+
+.opt-columns legend {
+    padding: 0 4px;
+    color: var(--dim);
+    font-size: 12px;
+}
+
+.opt-check {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    cursor: pointer;
+}
+
+.opt-check input {
+    margin: 0;
+    accent-color: var(--accent);
+}
+
+.opt-field {
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+    margin-top: 12px;
+}
+
+.opt-note {
+    margin-top: 6px;
+    color: var(--dim);
+    font-size: 12px;
+}
+
+.opt-note code {
+    font: 12px var(--mono);
+    color: var(--text);
+}
+
+.opt-check:focus-within {
+    color: #fff;
+    background: rgba(76, 141, 255, 0.15);
+    border-radius: 3px;
 }
