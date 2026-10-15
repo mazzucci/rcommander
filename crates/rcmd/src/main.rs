@@ -72,6 +72,8 @@ fn main() -> anyhow::Result<()> {
             browser,
         }) => {
             let (left, right) = dirs.locations();
+            let settings = rc_vfs::settings::load()?;
+            let settings_path = Some(rc_vfs::settings::path());
             server::run(
                 vfs,
                 server::Config {
@@ -80,6 +82,8 @@ fn main() -> anyhow::Result<()> {
                     browser,
                     left,
                     right,
+                    settings,
+                    settings_path,
                 },
             )
         }

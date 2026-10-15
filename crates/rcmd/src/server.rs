@@ -12,13 +12,15 @@ use axum::middleware::{self, Next};
 use axum::response::{Html, IntoResponse, Response};
 use axum::routing::post;
 use axum::{Json, Router};
-use rc_core::Location;
 use rc_core::api::{ApiError, DiffRequest, FileOp, InitResponse, ListRequest, OpenRequest, ReadRequest};
+use rc_core::{Location, Settings};
 use rc_vfs::Vfs;
 use rust_embed::RustEmbed;
 use serde::Serialize;
 use std::io::Read;
+use std::path::PathBuf;
 use std::sync::Arc;
+use std::sync::RwLock;
 
 /// Built front end (`trunk build` in crates/rc-web). Embedded in release builds, read from
 /// disk in debug builds; missing entirely if the front end was never built.
@@ -34,6 +36,8 @@ pub struct Config {
     pub browser: Option<String>,
     pub left: Location,
     pub right: Location,
+    pub settings: Settings,
+    pub settings_path: Option<PathBuf>,
 }
 
 #[derive(Clone)]
@@ -41,6 +45,9 @@ struct AppState {
     vfs: Arc<Vfs>,
     token: Arc<str>,
     init: Arc<InitResponse>,
+    settings: Arc<RwLock<Settings>>,
+    /// Where settings are saved; `None` keeps them in memory (tests).
+    settings_path: Option<Arc<PathBuf>>,
 }
 
 pub fn run(vfs: Arc<Vfs>, config: Config) -> Result<()> {
@@ -63,12 +70,15 @@ async fn serve(vfs: Arc<Vfs>, config: Config) -> Result<()> {
         left: vfs.normalize(config.left, None),
         right: vfs.normalize(config.right, None),
         home: Vfs::home(),
+        settings: Settings::default(),
     };
     let app = router(
         AppState {
             vfs,
             token: token.as_str().into(),
             init: Arc::new(init),
+            settings: Arc::new(RwLock::new(config.settings)),
+            settings_path: config.settings_path.map(Arc::new),
         },
         addr.port(),
     );
@@ -143,6 +153,8 @@ fn router(state: AppState, port: u16) -> Router {
         .route("/diff", post(diff))
         .route("/op", post(op))
         .route("/open", post(open_external))
+        .route("/edit", post(edit_external))
+        .route("/settings", post(save_settings))
         .route_layer(middleware::from_fn_with_state(state.clone(), require_token));
     Router::new()
         .nest("/api", api)
@@ -216,7 +228,29 @@ where
 }
 
 async fn init(State(s): State<AppState>) -> Json<InitResponse> {
-    Json((*s.init).clone())
+    let mut init = (*s.init).clone();
+    init.settings = s.settings.read().expect("settings lock").clone();
+    Json(init)
+}
+
+async fn save_settings(State(s): State<AppState>, Json(settings): Json<Settings>) -> Response {
+    blocking(move || {
+        if let Some(path) = &s.settings_path {
+            rc_vfs::settings::save_to(path, &settings)?;
+        }
+        *s.settings.write().expect("settings lock") = settings.clone();
+        Ok(settings)
+    })
+    .await
+}
+
+async fn edit_external(State(s): State<AppState>, Json(req): Json<OpenRequest>) -> Response {
+    blocking(move || {
+        let editor = s.settings.read().expect("settings lock").editor.clone();
+        s.vfs.edit_external(&s.vfs.normalize(req.location, None), &editor)?;
+        Ok(serde_json::json!({}))
+    })
+    .await
 }
 
 async fn list(State(s): State<AppState>, Json(req): Json<ListRequest>) -> Response {
@@ -327,7 +361,10 @@ mod tests {
                 left: loc.clone(),
                 right: loc,
                 home: "/".into(),
+                settings: Settings::default(),
             }),
+            settings: Arc::new(RwLock::new(Settings::default())),
+            settings_path: None,
         };
         router(state, PORT)
     }
@@ -473,6 +510,20 @@ mod tests {
         let resp = app(tmp.path()).oneshot(req).await.unwrap();
         assert_eq!(resp.headers()[header::X_FRAME_OPTIONS], "DENY");
         assert_eq!(resp.headers()[header::CACHE_CONTROL], "no-store");
+    }
+
+    #[tokio::test]
+    async fn settings_round_trip_through_init() {
+        let tmp = tempfile::tempdir().unwrap();
+        let host = format!("127.0.0.1:{PORT}");
+        let router = app(tmp.path());
+        let body = serde_json::json!({ "columns": ["permissions"], "show_hidden": false, "editor": "code" });
+        let (status, saved) = call(router.clone(), post("/api/settings", body, Some("secret"), &host)).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(saved["editor"], "code");
+        let (_, init) = call(router, post("/api/init", serde_json::json!({}), Some("secret"), &host)).await;
+        assert_eq!(init["settings"]["columns"], serde_json::json!(["permissions"]));
+        assert_eq!(init["settings"]["show_hidden"], false);
     }
 
     #[tokio::test]

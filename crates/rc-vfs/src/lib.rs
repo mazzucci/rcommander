@@ -219,6 +219,24 @@ impl Vfs {
         let Location::Local { path } = loc;
         Ok(open::that_detached(path)?)
     }
+
+    /// Open in `editor` (a command line such as `code` or `subl -n`) without waiting for
+    /// it; an empty editor falls back to the system default application. Meant for GUI
+    /// editors: there is no terminal to run `vim` in.
+    pub fn edit_external(&self, loc: &Location, editor: &str) -> Result<()> {
+        let mut parts = editor.split_whitespace();
+        let Some(program) = parts.next() else {
+            return self.open_external(loc);
+        };
+        let Location::Local { path } = loc;
+        std::process::Command::new(program)
+            .args(parts)
+            .arg(path)
+            .stdin(std::process::Stdio::null())
+            .spawn()
+            .map_err(|e| anyhow::anyhow!("cannot run `{editor}`: {e}"))?;
+        Ok(())
+    }
 }
 
 fn trash_context() -> trash::TrashContext {
