@@ -299,11 +299,12 @@ impl Panel {
 }
 
 /// Case-insensitive `*` / `?` wildcard match. Several masks may be separated by `;` or spaces.
+/// As in Total Commander, `*.*` matches every name, including ones without an extension.
 pub fn wildcard_match(mask: &str, name: &str) -> bool {
     let name: Vec<char> = name.to_lowercase().chars().collect();
     mask.split([';', ' '])
         .filter(|p| !p.is_empty())
-        .any(|p| glob(&p.to_lowercase().chars().collect::<Vec<_>>(), &name))
+        .any(|p| p == "*.*" || glob(&p.to_lowercase().chars().collect::<Vec<_>>(), &name))
 }
 
 /// Iterative glob with single-star backtracking: O(pattern × name), no exponential blowup.
@@ -507,6 +508,7 @@ mod tests {
         assert!(wildcard_match("*", ""));
         assert!(wildcard_match("a*", "a"));
         assert!(!wildcard_match("a?", "a"));
+        assert!(wildcard_match("*.*", "Makefile"));
     }
 
     #[test]

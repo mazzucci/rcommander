@@ -91,7 +91,12 @@ impl DiffResult {
                 while i < n && !keep[i] {
                     i += 1;
                 }
-                out.push(Visible::Fold { start, n: i - start });
+                // Folding a single line saves nothing; show it instead.
+                if i - start == 1 {
+                    out.push(Visible::Row(start));
+                } else {
+                    out.push(Visible::Fold { start, n: i - start });
+                }
             }
         }
         out
@@ -272,5 +277,9 @@ mod tests {
         let v = diff_text(&left, &right).visible(2);
         assert_eq!(v[0], Visible::Fold { start: 0, n: 8 });
         assert_eq!(v.len(), 1 + 5 + 1);
+        // A one-line gap is shown, not folded.
+        let right = left.replace("3\n", "three\n").replace("11\n", "eleven\n");
+        let v = diff_text(&left, &right).visible(3);
+        assert!(v.iter().all(|x| !matches!(x, Visible::Fold { n: 1, .. })));
     }
 }
