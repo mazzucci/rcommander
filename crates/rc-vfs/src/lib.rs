@@ -65,9 +65,11 @@ impl Vfs {
         Location::local(p.to_string_lossy().into_owned())
     }
 
+    /// List a directory. The returned listing carries the normalized location, so
+    /// `/a/b/` and `/a/b` are recognized as the same place by the panel.
     pub fn list(&self, loc: &Location) -> Result<Listing> {
-        match loc {
-            Location::Local { path } => local::list(path),
+        match self.normalize(loc.clone(), None) {
+            Location::Local { path } => local::list(&path),
         }
     }
 
@@ -90,25 +92,39 @@ impl Vfs {
         })
     }
 
+    /// Diff two files. Only the first [`VIEW_LIMIT`] bytes are compared; if either file is
+    /// longer the note says so and the files are never reported as identical.
     pub fn diff(&self, left: Option<&Location>, right: Option<&Location>) -> Result<DiffResponse> {
-        let load = |loc: Option<&Location>| -> Result<Vec<u8>> {
-            match loc {
-                Some(l) => Ok(self.read(l, VIEW_LIMIT)?.0),
-                None => Ok(Vec::new()),
-            }
+        let load = |loc: Option<&Location>| -> Result<(Vec<u8>, bool)> {
+            let Some(l) = loc else { return Ok((Vec::new(), false)) };
+            let (mut bytes, _) = self.read(l, VIEW_LIMIT + 1)?;
+            let truncated = bytes.len() as u64 > VIEW_LIMIT;
+            bytes.truncate(VIEW_LIMIT as usize);
+            Ok((bytes, truncated))
         };
-        let (a, b) = (load(left)?, load(right)?);
+        let ((a, a_cut), (b, b_cut)) = (load(left)?, load(right)?);
+        let truncated = a_cut || b_cut;
         let title = |l: Option<&Location>| l.map_or("(does not exist)".to_string(), |l| l.to_string());
+        let limit_note = format!(
+            "Files are larger than {} MiB; only the beginning was compared",
+            VIEW_LIMIT >> 20
+        );
         let (result, note) = if diff::looks_binary(&a) || diff::looks_binary(&b) {
-            let note = if a == b {
-                "Binary files are identical"
-            } else {
-                "Binary files differ"
+            let note = match (a == b, truncated) {
+                (true, false) => "Binary files are identical".to_string(),
+                (true, true) => format!("Binary files: {limit_note}, no difference found there"),
+                (false, _) => "Binary files differ".to_string(),
             };
-            (None, Some(note.to_string()))
+            (None, Some(note))
         } else {
             let r = rc_core::diff_text(&String::from_utf8_lossy(&a), &String::from_utf8_lossy(&b));
-            let note = r.identical().then(|| "Files are identical".to_string());
+            let note = if truncated {
+                Some(limit_note)
+            } else if r.identical() && a != b {
+                Some("Files differ only in line endings or the final newline".to_string())
+            } else {
+                r.identical().then(|| "Files are identical".to_string())
+            };
             (Some(r), note)
         };
         Ok(DiffResponse {
@@ -146,7 +162,10 @@ impl Vfs {
                     return res;
                 }
                 for src in sources {
-                    let Some(name) = src.file_name() else { continue };
+                    let Some(name) = src.file_name() else {
+                        res.errors.push(format!("cannot {} {src}", op.verb().to_lowercase()));
+                        continue;
+                    };
                     let dest = if into_dir {
                         Path::new(dest_path).join(name)
                     } else {
@@ -168,7 +187,9 @@ impl Vfs {
                     let r = if *permanent {
                         local::remove(Path::new(path))
                     } else {
-                        trash::delete(path).map_err(|e| anyhow::anyhow!("cannot move {path} to trash: {e}"))
+                        trash_context()
+                            .delete(path)
+                            .map_err(|e| anyhow::anyhow!("cannot move {path} to trash: {e}"))
                     };
                     record(&mut res, path, r.map(|_| Copied::Done));
                 }
@@ -180,7 +201,8 @@ impl Vfs {
             }
             FileOp::Rename { from, to } => {
                 let (Location::Local { path: a }, Location::Local { path: b }) = (from, to);
-                let r = if Path::new(b).exists() {
+                // Same file under another name = case-only rename on case-insensitive APFS.
+                let r = if Path::new(b).symlink_metadata().is_ok() && !local::same_file(Path::new(a), Path::new(b)) {
                     Err(anyhow::anyhow!("{b} already exists"))
                 } else {
                     std::fs::rename(a, b).map_err(Into::into)
@@ -198,6 +220,19 @@ impl Vfs {
     }
 }
 
+fn trash_context() -> trash::TrashContext {
+    #[allow(unused_mut)]
+    let mut ctx = trash::TrashContext::default();
+    // The default on macOS drives Finder via AppleScript: slow, asks for automation
+    // permission, and fails over ssh. NSFileManager trashes directly.
+    #[cfg(target_os = "macos")]
+    {
+        use trash::macos::{DeleteMethod, TrashContextExtMacos};
+        ctx.set_delete_method(DeleteMethod::NsFileManager);
+    }
+    ctx
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -213,6 +248,12 @@ mod tests {
         assert_eq!(vfs.normalize(Location::local("/x/./y/"), None), Location::local("/x/y"));
         let home = vfs.normalize(Location::local("~"), None);
         assert_eq!(home, Location::local(Vfs::home()));
+        assert_eq!(vfs.normalize(Location::local("/../.."), None), Location::local("/"));
+        let sub = vfs.normalize(Location::local("~/x"), None);
+        assert_eq!(
+            sub,
+            Location::local(Path::new(&Vfs::home()).join("x").to_string_lossy())
+        );
     }
 
     #[test]

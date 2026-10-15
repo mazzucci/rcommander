@@ -15,7 +15,8 @@ pub fn human_size(bytes: u64) -> String {
             break;
         }
     }
-    if v < 10.0 {
+    // Decide on decimals after rounding, so 9.99K prints as "10K", not "10.0K".
+    if (v * 10.0).round() < 100.0 {
         format!("{v:.1}{unit}")
     } else {
         format!("{v:.0}{unit}")
@@ -52,6 +53,8 @@ mod tests {
         assert_eq!(human_size(999), "999");
         assert_eq!(human_size(1536), "1.5K");
         assert_eq!(human_size(5_000_000), "4.8M");
+        assert_eq!(human_size(1024), "1.0K");
+        assert_eq!(human_size(10239), "10K");
     }
 
     #[test]
@@ -59,5 +62,7 @@ mod tests {
         assert_eq!(format_time(0, 0), "1970-01-01 00:00");
         assert_eq!(format_time(1_791_979_500, 0), "2026-10-14 12:05");
         assert_eq!(format_time(1_791_979_500, 3600), "2026-10-14 13:05");
+        assert_eq!(format_time(1_791_979_500, -13 * 3600), "2026-10-13 23:05");
+        assert_eq!(format_time(951_782_400, 0), "2000-02-29 00:00", "leap day");
     }
 }

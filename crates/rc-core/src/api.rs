@@ -124,3 +124,30 @@ pub struct OpenRequest {
 pub struct ApiError {
     pub error: String,
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The JSON shapes are the contract with the web front end.
+    #[test]
+    fn wire_format() {
+        let op = FileOp::Copy {
+            sources: vec![Location::local("/a")],
+            dest: Location::local("/b"),
+            overwrite: false,
+        };
+        let json = serde_json::to_value(&op).unwrap();
+        assert_eq!(
+            json,
+            serde_json::json!({
+                "op": "copy",
+                "sources": [{ "kind": "local", "path": "/a" }],
+                "dest": { "kind": "local", "path": "/b" },
+                "overwrite": false
+            })
+        );
+        let back: FileOp = serde_json::from_value(json).unwrap();
+        assert!(matches!(back, FileOp::Copy { .. }));
+    }
+}

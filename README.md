@@ -2,6 +2,8 @@
 
 A Total Commander-style dual-pane file manager written in Rust, with a terminal UI and a browser UI (Rust compiled to WebAssembly).
 
+Runs on **Linux and macOS** (both are built and tested in CI). Deleting moves files to the system Trash (freedesktop trash on Linux, NSFileManager on macOS).
+
 ## Layout
 
 | Crate | Purpose |
@@ -20,3 +22,5 @@ cargo fmt --all
 ## Process
 
 Every change goes through a feature branch → code review → pull request → CI (fmt, clippy and tests on Linux and macOS, plus a wasm32 build of `rc-core`) → merge.
+
+Building from source needs a Rust toolchain (`rustup`) and a C linker (Xcode Command Line Tools on macOS, `build-essential` or equivalent on Linux).

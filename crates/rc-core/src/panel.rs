@@ -185,11 +185,7 @@ impl Panel {
     }
 
     pub fn invert_selection(&mut self) {
-        let names: Vec<String> = self
-            .visible_entries()
-            .filter(|e| !e.is_dir)
-            .map(|e| e.name.clone())
-            .collect();
+        let names: Vec<String> = self.visible_entries().map(|e| e.name.clone()).collect();
         for n in names {
             if !self.selected.remove(&n) {
                 self.selected.insert(n);
@@ -201,22 +197,22 @@ impl Panel {
         self.selected.clear();
     }
 
-    /// The entries an operation applies to: the selection, or else the entry under the cursor.
+    /// The entries an operation applies to: the visible selection, or else the entry under
+    /// the cursor. Selected entries hidden by the filter or the hidden-files toggle are
+    /// never included, so an operation only touches what the user can see.
     pub fn targets(&self) -> Vec<&Entry> {
-        if self.selected.is_empty() {
+        let selected: Vec<&Entry> = self.visible_entries().filter(|e| self.is_selected(e)).collect();
+        if selected.is_empty() {
             self.current().into_iter().collect()
         } else {
-            self.entries
-                .iter()
-                .filter(|e| self.selected.contains(&e.name))
-                .collect()
+            selected
         }
     }
 
+    /// Count and total size of the visible selection.
     pub fn selection_summary(&self) -> (usize, u64) {
-        self.entries
-            .iter()
-            .filter(|e| self.selected.contains(&e.name))
+        self.visible_entries()
+            .filter(|e| self.is_selected(e))
             .fold((0, 0), |(n, sz), e| (n + 1, sz + e.size.unwrap_or(0)))
     }
 
@@ -299,28 +295,49 @@ impl Panel {
 
 /// Case-insensitive `*` / `?` wildcard match. Several masks may be separated by `;` or spaces.
 pub fn wildcard_match(mask: &str, name: &str) -> bool {
-    fn m(p: &[char], s: &[char]) -> bool {
-        match (p.first(), s.first()) {
-            (None, None) => true,
-            (Some('*'), _) => m(&p[1..], s) || (!s.is_empty() && m(p, &s[1..])),
-            (Some('?'), Some(_)) => m(&p[1..], &s[1..]),
-            (Some(a), Some(b)) => a == b && m(&p[1..], &s[1..]),
-            _ => false,
-        }
-    }
     let name: Vec<char> = name.to_lowercase().chars().collect();
     mask.split([';', ' '])
         .filter(|p| !p.is_empty())
-        .any(|p| m(&p.to_lowercase().chars().collect::<Vec<_>>(), &name))
+        .any(|p| glob(&p.to_lowercase().chars().collect::<Vec<_>>(), &name))
+}
+
+/// Iterative glob with single-star backtracking: O(pattern × name), no exponential blowup.
+fn glob(p: &[char], s: &[char]) -> bool {
+    let (mut pi, mut si) = (0, 0);
+    let mut star: Option<(usize, usize)> = None; // (pattern index after '*', name index it matched up to)
+    while si < s.len() {
+        match p.get(pi) {
+            Some('*') => {
+                star = Some((pi + 1, si));
+                pi += 1;
+            }
+            Some(&c) if c == '?' || c == s[si] => {
+                pi += 1;
+                si += 1;
+            }
+            _ => match star {
+                // Let the last '*' swallow one more character and retry.
+                Some((sp, ss)) => {
+                    star = Some((sp, ss + 1));
+                    pi = sp;
+                    si = ss + 1;
+                }
+                None => return false,
+            },
+        }
+    }
+    p[pi..].iter().all(|&c| c == '*')
 }
 
 /// Case-insensitive comparison treating digit runs as numbers ("file2" < "file10").
-pub fn natural_cmp(a: &str, b: &str) -> std::cmp::Ordering {
+/// Names that compare equal this way ("A.txt"/"a.txt", "a01"/"a1") fall back to plain
+/// byte order so the sort is total and stable across refreshes.
+pub fn natural_cmp(a_str: &str, b_str: &str) -> std::cmp::Ordering {
     use std::cmp::Ordering;
-    let (mut a, mut b) = (a.chars().peekable(), b.chars().peekable());
+    let (mut a, mut b) = (a_str.chars().peekable(), b_str.chars().peekable());
     loop {
         match (a.peek().copied(), b.peek().copied()) {
-            (None, None) => return Ordering::Equal,
+            (None, None) => return a_str.cmp(b_str),
             (None, _) => return Ordering::Less,
             (_, None) => return Ordering::Greater,
             (Some(x), Some(y)) if x.is_ascii_digit() && y.is_ascii_digit() => {
@@ -421,6 +438,62 @@ mod tests {
         };
         p.set_listing(listing, None);
         assert_eq!(p.current().unwrap().name, "README.md");
+    }
+
+    #[test]
+    fn operations_only_target_visible_selection() {
+        let mut p = panel();
+        p.toggle_hidden();
+        p.select_mask("*", true);
+        assert_eq!(p.selection_summary().0, 5);
+        p.toggle_hidden();
+        p.set_filter("b");
+        let names: Vec<&str> = p.targets().iter().map(|e| e.name.as_str()).collect();
+        assert_eq!(names, ["b2.rs", "b10.rs"]);
+        assert_eq!(p.selection_summary(), (2, 55));
+    }
+
+    #[test]
+    fn invert_includes_directories() {
+        let mut p = panel();
+        p.focus_name("src");
+        p.toggle_current();
+        p.invert_selection();
+        assert!(!p.selected.contains("src"));
+        assert_eq!(p.selected.len(), 3);
+    }
+
+    #[test]
+    fn navigation_resets_state_and_focuses() {
+        let mut p = panel();
+        p.select_mask("*", true);
+        p.set_filter("b");
+        let listing = Listing {
+            location: Location::local("/y"),
+            entries: vec![Entry::file("one", 1), Entry::file("two", 1)],
+            writable: true,
+        };
+        p.set_listing(listing, Some("two"));
+        assert!(p.selected.is_empty() && p.filter.is_empty());
+        assert_eq!(p.current().unwrap().name, "two");
+    }
+
+    #[test]
+    fn natural_order_is_total() {
+        use std::cmp::Ordering;
+        assert_eq!(natural_cmp("file2", "file10"), Ordering::Less);
+        assert_ne!(natural_cmp("A.txt", "a.txt"), Ordering::Equal);
+        assert_ne!(natural_cmp("a01", "a1"), Ordering::Equal);
+    }
+
+    #[test]
+    fn wildcard_is_not_exponential() {
+        let start = std::time::Instant::now();
+        assert!(!wildcard_match("*a*a*a*a*a*a*a*a*a*a*b", &"a".repeat(40)));
+        assert!(start.elapsed().as_millis() < 100);
+        assert!(wildcard_match("*", ""));
+        assert!(wildcard_match("a*", "a"));
+        assert!(!wildcard_match("a?", "a"));
     }
 
     #[test]
