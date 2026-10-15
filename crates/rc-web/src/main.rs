@@ -5,6 +5,7 @@ mod app;
 mod diff_view;
 mod dom;
 mod events;
+mod find;
 mod help;
 mod hotlist;
 mod modal;

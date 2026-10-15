@@ -1,6 +1,7 @@
 //! Terminal front end (ratatui + crossterm).
 
 mod app;
+mod find;
 mod ui;
 mod views;
 

@@ -178,6 +178,46 @@ pub struct JobStatus {
     pub progress: Option<Progress>,
 }
 
+/// `POST /api/find[?job=ID]` → [`FindResult`]: search a folder tree, like Total
+/// Commander's Find Files. While it runs, the job's [`Progress`] has the folder being
+/// searched as `path`, the number of hits so far as `done`, and `total` 0.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct FindRequest {
+    pub root: Location,
+    /// Name masks (`*.rs;*.toml`); a mask without `*` or `?` matches names containing
+    /// it. Empty matches every name.
+    #[serde(default)]
+    pub name: String,
+    /// Only files containing this text (case-sensitive only if it has capitals).
+    /// Empty: no content search, and folders match too.
+    #[serde(default)]
+    pub contains: String,
+    /// Look into hidden files and folders (the inside of `.git` is always skipped).
+    #[serde(default)]
+    pub hidden: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct FindHit {
+    pub path: String,
+    pub is_dir: bool,
+    /// Content search: the first matching line (1-based) and its text.
+    #[serde(default)]
+    pub line: Option<usize>,
+    #[serde(default)]
+    pub text: Option<String>,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct FindResult {
+    pub hits: Vec<FindHit>,
+    /// Stopped at the hit limit; there may be more.
+    pub truncated: bool,
+    pub cancelled: bool,
+    /// Folders and files that could not be read.
+    pub unreadable: usize,
+}
+
 /// `POST /api/conflicts` with a [`FileOp`] body → [`Conflicts`]: what a copy or move
 /// would find already in place, so the UI can ask before running it.
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]

@@ -1,6 +1,7 @@
 //! Rendering. Colors use the 256-color palette because macOS Terminal.app has no truecolor.
 
 use super::app::{App, EDITOR_ROW, HIDDEN_ROW, LEFT, Mode, Options};
+use super::find::{Field, Find};
 use super::views::{DiffView, Viewer, sanitize};
 use chrono::{Local, Offset, TimeZone};
 use ratatui::Frame;
@@ -12,7 +13,7 @@ use rc_core::Settings;
 use rc_core::diff::{DiffRow, RowKind, Side, Visible};
 use rc_core::dircmp::CmpMark;
 use rc_core::format::human_size;
-use rc_core::{Column, Panel, Row, SortKey};
+use rc_core::{Column, Location, Panel, Row, SortKey};
 
 // Palette (256-color indices so it also works in macOS Terminal.app).
 const ACCENT: Color = Color::Indexed(75);
@@ -38,7 +39,7 @@ pub fn draw(f: &mut Frame, app: &mut App) {
         Layout::vertical([Constraint::Min(3), Constraint::Length(1), Constraint::Length(1)]).areas(f.area());
 
     match &mut app.mode {
-        Mode::Viewer(v) => draw_viewer(f, main, v),
+        Mode::Viewer(v) | Mode::FindView(_, v) => draw_viewer(f, main, v),
         Mode::Diff(d) => draw_diff(f, main, d),
         _ => {
             let [l, r] = Layout::horizontal([Constraint::Percentage(50); 2]).areas(main);
@@ -49,6 +50,9 @@ pub fn draw(f: &mut Frame, app: &mut App) {
 
     draw_message(f, message, app);
     draw_keys(f, keys, &app.mode);
+    if let Mode::Find(find) = &mut app.mode {
+        draw_find(f, main, find);
+    }
 
     match &app.mode {
         Mode::Prompt(p) => {
@@ -340,7 +344,17 @@ fn draw_message(f: &mut Frame, area: Rect, app: &App) {
 
 fn draw_keys(f: &mut Frame, area: Rect, mode: &Mode) {
     let keys: &[(&str, &str)] = match mode {
-        Mode::Viewer(_) => &[("Esc", "Close"), ("↑↓", "Scroll"), ("←→", "Pan"), ("PgUp/PgDn", "Page")],
+        Mode::Viewer(_) | Mode::FindView(..) => {
+            &[("Esc", "Close"), ("↑↓", "Scroll"), ("←→", "Pan"), ("PgUp/PgDn", "Page")]
+        }
+        Mode::Find(f) if f.search.is_some() => &[("Esc", "Stop")],
+        Mode::Find(f) if f.result.is_some() => &[("Enter", "Go to"), ("F3", "View"), ("Esc", "New search")],
+        Mode::Find(_) => &[
+            ("Enter", "Search"),
+            ("Tab", "Next field"),
+            ("Space", "Toggle"),
+            ("Esc", "Close"),
+        ],
         Mode::Diff(_) => &[
             ("Esc", "Close"),
             ("n", "Next"),
@@ -610,6 +624,137 @@ fn draw_hotlist(f: &mut Frame, area: Rect, cursor: usize, marks: &[String]) {
     );
 }
 
+fn draw_find(f: &mut Frame, area: Rect, find: &mut Find) {
+    let area = popup(area, 80, area.height.saturating_sub(2).max(10));
+    let Location::Local { path: root } = &find.root;
+    let block = Block::bordered()
+        .border_type(BorderType::Rounded)
+        .border_style(Style::new().fg(ACCENT))
+        .title(
+            Line::raw(format!(
+                " Find files in {} ",
+                elide_start(root, area.width.saturating_sub(20) as usize)
+            ))
+            .fg(TEXT)
+            .bold(),
+        );
+    let inner = block.inner(area);
+    f.render_widget(Clear, area);
+    f.render_widget(block, area);
+    let [fields, status, list, hint] = Layout::vertical([
+        Constraint::Length(3),
+        Constraint::Length(1),
+        Constraint::Min(1),
+        Constraint::Length(1),
+    ])
+    .areas(inner);
+
+    let editing = find.search.is_none() && find.result.is_none();
+    let field = |label: &'static str, value: &str, which: Field| {
+        let active = editing && find.field == which;
+        Line::from(vec![
+            Span::raw(format!(" {label:<9}"))
+                .fg(if active { ACCENT } else { META })
+                .bold(),
+            Span::raw(format!("{}{}", sanitize(value), if active { "█" } else { "" })).fg(TEXT),
+        ])
+    };
+    let hidden_active = editing && find.field == Field::Hidden;
+    let hidden = Line::from(vec![
+        Span::raw(format!(" {:<9}", "")),
+        Span::raw(format!(
+            "[{}] Search hidden files and folders",
+            if find.hidden { "x" } else { " " }
+        ))
+        .fg(if hidden_active { ACCENT } else { META }),
+    ]);
+    let hidden = if hidden_active { hidden.bold() } else { hidden };
+    f.render_widget(
+        Paragraph::new(vec![
+            field("Name", &find.name, Field::Name),
+            field("Contains", &find.contains, Field::Contains),
+            hidden,
+        ]),
+        fields,
+    );
+
+    let status_line = if let Some(search) = &find.search {
+        let (dir, n) = search
+            .progress
+            .as_ref()
+            .map_or((String::new(), 0), |p| (find.relative(&p.path).to_string(), p.done));
+        let dir = elide_start(&sanitize(&dir), status.width.saturating_sub(30) as usize);
+        let at = if dir.is_empty() || dir == find.root.to_string() {
+            String::new()
+        } else {
+            format!(" {dir}")
+        };
+        Line::raw(format!(" Searching{at} · {n} found")).fg(SELECTED)
+    } else if let Some(e) = &find.error {
+        Line::raw(format!(" {e}")).fg(ERR)
+    } else if let Some(r) = &find.result {
+        let mut s = format!(" {} found", r.hits.len());
+        if r.truncated {
+            s += " (limit reached)";
+        }
+        if r.cancelled {
+            s += " · stopped";
+        }
+        if r.unreadable > 0 {
+            s += &format!(" · {} unreadable", r.unreadable);
+        }
+        Line::raw(s).fg(if r.hits.is_empty() { DIM } else { OK })
+    } else {
+        Line::raw("")
+    };
+    f.render_widget(Paragraph::new(status_line), status);
+
+    if editing {
+        let help = vec![
+            Line::raw(" Name: masks like *.rs;*.toml — a plain word matches inside names; empty: all").fg(DIM),
+            Line::raw(" Contains: text in files (case-sensitive only if it has capitals); empty: names only").fg(DIM),
+        ];
+        f.render_widget(Paragraph::new(help), list);
+    } else {
+        find.page = list.height as usize;
+        if find.cursor < find.scroll {
+            find.scroll = find.cursor;
+        } else if find.cursor >= find.scroll + find.page {
+            find.scroll = find.cursor + 1 - find.page;
+        }
+        let lines: Vec<Line> = find
+            .hits()
+            .iter()
+            .enumerate()
+            .skip(find.scroll)
+            .take(find.page)
+            .map(|(i, hit)| {
+                let rel = sanitize(find.relative(&hit.path));
+                let mut spans = vec![if hit.is_dir {
+                    Span::raw(format!(" {rel}/")).fg(DIR)
+                } else {
+                    Span::raw(format!(" {rel}")).fg(TEXT)
+                }];
+                if let (Some(n), Some(text)) = (hit.line, &hit.text) {
+                    spans.push(Span::raw(format!(":{n}  ")).fg(DIM));
+                    spans.push(Span::raw(sanitize(text)).fg(META));
+                }
+                let line = Line::from(spans);
+                if i == find.cursor { line.bg(CURSOR_ACTIVE) } else { line }
+            })
+            .collect();
+        f.render_widget(Paragraph::new(lines), list);
+    }
+    let keys = if find.search.is_some() {
+        " Esc stop"
+    } else if find.result.is_some() {
+        " Enter go to · F3 view · Esc new search"
+    } else {
+        " Enter search · Tab next field · Space toggle · Esc close"
+    };
+    f.render_widget(Paragraph::new(Line::raw(keys).fg(DIM)), hint);
+}
+
 fn draw_help(f: &mut Frame, area: Rect) {
     const HELP: &[(&str, &str)] = &[
         ("↑↓ PgUp PgDn Home End", "move cursor"),
@@ -635,6 +780,7 @@ fn draw_help(f: &mut Frame, area: Rect) {
         ("F5  F6", "copy / move or rename"),
         ("F7  F8", "new directory / delete to Trash (Shift: permanent)"),
         ("F9", "compare directories (toggle)"),
+        ("Alt+F7  Shift+F", "find files (name mask, text inside)"),
         ("1..9", "same as F1..F9 (Mac: no fn needed)"),
         ("q  F10  Ctrl+C", "quit"),
     ];
@@ -705,16 +851,66 @@ mod tests {
     }
 
     #[test]
+    fn renders_the_find_dialog() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(tmp.path().join("notes.md"), "a\nfind me\n").unwrap();
+        let loc = rc_core::Location::local(tmp.path().to_string_lossy());
+        let mut app = App::new(Arc::new(rc_vfs::Vfs::new()), loc.clone(), loc);
+        app.handle_key(KeyEvent::new(KeyCode::Char('F'), KeyModifiers::SHIFT));
+        let s = screen(&mut app);
+        assert!(
+            s.contains("Find files in") && s.contains("Contains") && s.contains("Enter search"),
+            "{s}"
+        );
+        app.handle_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
+        for c in "find".chars() {
+            app.handle_key(KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE));
+        }
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        let start = std::time::Instant::now();
+        while !screen(&mut app).contains("1 found") {
+            app.tick();
+            assert!(start.elapsed().as_secs() < 10, "{}", screen(&mut app));
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        let s = screen(&mut app);
+        assert!(s.contains("notes.md:2  find me") && s.contains("Go to"), "{s}");
+    }
+
+    #[test]
     fn extreme_terminal_sizes_do_not_panic() {
         let tmp = tempfile::tempdir().unwrap();
         let loc = rc_core::Location::local(tmp.path().to_string_lossy());
         let mut app = App::new(Arc::new(rc_vfs::Vfs::new()), loc.clone(), loc);
-        for (w, h) in [(1000, 10), (10, 3), (1, 1)] {
+        std::fs::write(tmp.path().join("hit.txt"), "a needle").unwrap();
+        let draw_at = |app: &mut App, w: u16, h: u16| {
+            let mut term = Terminal::new(TestBackend::new(w, h)).unwrap();
+            term.draw(|f| draw(f, app)).unwrap();
+        };
+        for (w, h) in [(1000, 10), (40, 6), (10, 3), (1, 1)] {
             for code in [KeyCode::F(7), KeyCode::Esc, KeyCode::F(1), KeyCode::Esc] {
-                let mut term = Terminal::new(TestBackend::new(w, h)).unwrap();
-                term.draw(|f| draw(f, &mut app)).unwrap();
+                draw_at(&mut app, w, h);
                 app.handle_key(KeyEvent::new(code, KeyModifiers::NONE));
             }
+            // Find files in every state: fields, searching, results, viewing a hit.
+            app.handle_key(KeyEvent::new(KeyCode::Char('F'), KeyModifiers::SHIFT));
+            app.handle_key(KeyEvent::new(KeyCode::Char('h'), KeyModifiers::NONE));
+            draw_at(&mut app, w, h);
+            app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+            draw_at(&mut app, w, h);
+            let start = std::time::Instant::now();
+            while matches!(&app.mode, Mode::Find(f) if f.search.is_some()) {
+                app.tick();
+                assert!(start.elapsed().as_secs() < 10);
+            }
+            draw_at(&mut app, w, h);
+            app.handle_key(KeyEvent::new(KeyCode::F(3), KeyModifiers::NONE));
+            draw_at(&mut app, w, h);
+            for _ in 0..3 {
+                app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+                draw_at(&mut app, w, h);
+            }
+            assert!(matches!(app.mode, Mode::Normal));
         }
     }
 

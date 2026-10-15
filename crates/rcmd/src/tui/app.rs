@@ -1,6 +1,7 @@
 //! Terminal UI state and key handling. Drawing lives in `ui.rs`; this module has no
 //! terminal I/O so it can be unit-tested with plain key events.
 
+use super::find::{self, Find};
 use super::views::{DiffView, Viewer};
 use crate::control::Request;
 use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
@@ -38,6 +39,10 @@ pub enum Mode {
     /// The hotlist (bookmarks); the number is the cursor row.
     Hotlist(usize),
     Conflict(ConflictPrompt),
+    /// Find files (Alt+F7).
+    Find(Box<Find>),
+    /// A file viewed from the find results; closing it goes back to them.
+    FindView(Box<Find>, Viewer),
 }
 
 /// The options dialog: one row per optional column, then "show hidden", then the editor.
@@ -713,6 +718,9 @@ impl App {
         }
         changed |= self.tick_watch();
         changed |= self.tick_git();
+        if let Mode::Find(f) = &mut self.mode {
+            changed |= f.poll();
+        }
         self.tick_job() || changed
     }
 
@@ -789,7 +797,7 @@ impl App {
         // Never act behind a dialog the user is answering; harmless commands still go through.
         let busy = matches!(
             self.mode,
-            Mode::Prompt(_) | Mode::Confirm(_) | Mode::Filter | Mode::Options(_)
+            Mode::Prompt(_) | Mode::Confirm(_) | Mode::Filter | Mode::Options(_) | Mode::Find(_) | Mode::FindView(..)
         );
         if busy && !matches!(command, Command::Message { .. } | Command::Refresh) {
             return Reply::error("rcmd is busy: a dialog is open");
@@ -935,6 +943,14 @@ impl App {
                     self.mode = Mode::Viewer(v);
                 }
             }
+            Mode::FindView(f, mut v) => {
+                self.mode = if v.handle_key(key) {
+                    Mode::Find(f)
+                } else {
+                    Mode::FindView(f, v)
+                };
+            }
+            Mode::Find(f) => self.find_key(f, key),
             Mode::Diff(mut d) => {
                 if !d.handle_key(key) {
                     self.mode = Mode::Diff(d);
@@ -1040,6 +1056,50 @@ impl App {
             _ => {}
         }
         self.mode = Mode::Hotlist(cursor);
+    }
+
+    /// Alt+F7: find files under the active panel's folder.
+    fn open_find(&mut self) {
+        let p = self.active_panel();
+        self.mode = Mode::Find(Box::new(Find::new(p.location.clone(), p.show_hidden)));
+    }
+
+    fn find_key(&mut self, mut f: Box<Find>, key: KeyEvent) {
+        match f.handle_key(key) {
+            find::Action::None => self.mode = Mode::Find(f),
+            find::Action::Close => {}
+            find::Action::Start => {
+                f.start();
+                self.mode = Mode::Find(f);
+            }
+            // Show the hit in the active panel, cursor on it; the dialog closes.
+            find::Action::GoTo(hit) => {
+                let loc = Location::local(&hit.path);
+                let (Some(parent), Some(name)) = (loc.parent(), loc.file_name()) else {
+                    return;
+                };
+                let name = name.to_string();
+                if name.starts_with('.') && !self.active_panel().show_hidden {
+                    self.active_mut().toggle_hidden();
+                }
+                // A quick filter could hide it.
+                self.active_mut().set_filter("");
+                self.load(self.active, parent, Some(&name));
+            }
+            find::Action::View(hit) => match self.vfs.read_content(&Location::local(&hit.path)) {
+                Ok(content) => {
+                    let mut v = Viewer::new(content);
+                    if let Some(line) = hit.line {
+                        v.goto_line(line);
+                    }
+                    self.mode = Mode::FindView(f, v);
+                }
+                Err(e) => {
+                    self.error(format!("{e:#}"));
+                    self.mode = Mode::Find(f);
+                }
+            },
+        }
     }
 
     fn save_settings(&mut self) {
@@ -1213,6 +1273,8 @@ impl App {
             }
             KeyCode::F(5) => self.start_copy_move(false),
             KeyCode::F(6) => self.start_copy_move(true),
+            KeyCode::F(7) if alt => self.open_find(),
+            KeyCode::Char('F') => self.open_find(),
             KeyCode::F(7) => self.prompt("New directory".into(), String::new(), PromptAction::Mkdir),
             KeyCode::F(8) | KeyCode::Delete if self.in_changes() => {
                 let names: Vec<String> = self.active_panel().targets().iter().map(|e| e.name.clone()).collect();
@@ -1327,6 +1389,78 @@ mod tests {
         let loc = |d: &str| Location::local(root.join(d).to_string_lossy());
         let app = App::new(Arc::new(Vfs::new()), loc("left"), loc("right"));
         (tmp, app)
+    }
+
+    fn wait_find(app: &mut App) {
+        let start = Instant::now();
+        while matches!(&app.mode, Mode::Find(f) if f.search.is_some()) {
+            app.tick();
+            assert!(start.elapsed() < Duration::from_secs(10), "search timed out");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
+
+    #[test]
+    fn find_files_then_view_and_go_to_a_hit() {
+        let (tmp, mut app) = setup();
+        fs::write(
+            tmp.path().join("left/sub/deep.txt"),
+            "x
+two here
+",
+        )
+        .unwrap();
+        app.handle_key(KeyEvent::new(KeyCode::F(7), KeyModifiers::ALT));
+        typed(&mut app, "*.txt");
+        app.handle_key(key(KeyCode::Tab));
+        typed(&mut app, "two");
+        app.handle_key(key(KeyCode::Enter));
+        wait_find(&mut app);
+        let Mode::Find(f) = &app.mode else {
+            panic!("find dialog closed")
+        };
+        let found: Vec<_> = f.hits().iter().map(|h| f.relative(&h.path).to_string()).collect();
+        assert_eq!(found, ["a.txt", "sub/deep.txt"]);
+
+        // Remote control waits while the dialog is open.
+        let goto = app.apply(Command::Goto {
+            path: tmp.path().to_string_lossy().into(),
+            side: Side::Active,
+        });
+        assert!(!goto.ok, "commands are refused behind the find dialog");
+
+        app.handle_key(key(KeyCode::Down));
+        app.handle_key(key(KeyCode::F(3)));
+        let Mode::FindView(_, v) = &app.mode else {
+            panic!("viewer not opened")
+        };
+        assert_eq!(v.mark, Some(1), "the matching line is marked");
+        app.handle_key(key(KeyCode::Esc));
+        assert!(
+            matches!(app.mode, Mode::Find(_)),
+            "closing the viewer returns to the results"
+        );
+
+        app.handle_key(key(KeyCode::Enter));
+        assert!(matches!(app.mode, Mode::Normal));
+        assert!(app.panels[LEFT].location.to_string().ends_with("/left/sub"));
+        assert_eq!(app.panels[LEFT].current().unwrap().name, "deep.txt");
+    }
+
+    #[test]
+    fn going_to_a_hidden_hit_shows_hidden_files() {
+        let (tmp, mut app) = setup();
+        fs::write(tmp.path().join("left/.env"), "").unwrap();
+        app.panels[LEFT].toggle_hidden();
+        app.panels[LEFT].set_filter("zzz");
+        assert!(!app.panels[LEFT].show_hidden);
+        app.mode = Mode::Find(Box::new(Find::new(app.panels[LEFT].location.clone(), true)));
+        typed(&mut app, ".env");
+        app.handle_key(key(KeyCode::Enter));
+        wait_find(&mut app);
+        app.handle_key(key(KeyCode::Enter));
+        assert!(app.panels[LEFT].show_hidden && app.panels[LEFT].filter.is_empty());
+        assert_eq!(app.panels[LEFT].current().unwrap().name, ".env");
     }
 
     #[test]
