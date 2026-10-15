@@ -4,6 +4,7 @@
 
 pub mod local;
 pub mod settings;
+pub mod watch;
 
 use anyhow::{Result, bail};
 use local::Copied;
