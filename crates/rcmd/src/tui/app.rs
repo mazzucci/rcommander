@@ -10,7 +10,7 @@ use rc_core::panel::SortKey;
 use rc_core::{Column, Location, Panel, Row, Settings, dircmp};
 use rc_vfs::Vfs;
 use rc_vfs::watch::DirWatcher;
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::mpsc::{self, Receiver, TryRecvError};
@@ -115,6 +115,7 @@ pub struct App {
     watcher: Option<DirWatcher>,
     changes: Option<Receiver<PathBuf>>,
     watching: [Option<PathBuf>; 2],
+    watched_locations: [Location; 2],
     /// Entries that changed in a live refresh, highlighted briefly.
     pub flash: [HashMap<String, Instant>; 2],
 }
@@ -156,6 +157,7 @@ impl App {
             watcher: None,
             changes: None,
             watching: [None, None],
+            watched_locations: [Location::local(""), Location::local("")],
             flash: [HashMap::new(), HashMap::new()],
         };
         app.load(LEFT, left, None);
@@ -189,6 +191,8 @@ impl App {
             Ok(listing) => {
                 if listing.location != self.panels[side].location {
                     self.scroll[side] = 0;
+                    // Highlights belong to the directory they were made in.
+                    self.flash[side].clear();
                 }
                 self.panels[side].set_listing(listing, focus);
                 true
@@ -433,19 +437,27 @@ impl App {
     /// Keep the watcher on the panels' directories and refresh panels that changed.
     fn tick_watch(&mut self) -> bool {
         let Some(watcher) = &mut self.watcher else { return false };
-        let dirs = self.panels.each_ref().map(|p| {
-            let Location::Local { path } = &p.location;
-            std::fs::canonicalize(path).ok()
-        });
-        if dirs != self.watching {
+        // Resolve symlinks only when a panel moved, not on every tick (a stalled network
+        // mount would block the UI).
+        let locations = self.panels.each_ref().map(|p| p.location.clone());
+        if locations != self.watched_locations {
+            let dirs = locations.each_ref().map(|l| {
+                let Location::Local { path } = l;
+                std::fs::canonicalize(path).ok()
+            });
             watcher.set(dirs.iter().flatten().map(PathBuf::as_path));
             self.watching = dirs;
+            self.watched_locations = locations;
         }
-        let changed: Vec<PathBuf> = self
+        let changed: BTreeSet<PathBuf> = self
             .changes
             .as_ref()
             .map(|rx| rx.try_iter().collect())
             .unwrap_or_default();
+        // The directory itself may have been deleted and recreated, which drops its watch.
+        for dir in self.watching.iter().flatten().filter(|d| changed.contains(*d)) {
+            watcher.rewatch(dir);
+        }
         let mut redraw = false;
         for side in [LEFT, RIGHT] {
             if self.watching[side].as_ref().is_some_and(|d| changed.contains(d)) {
@@ -1184,6 +1196,10 @@ mod tests {
         assert!(app.flash[LEFT].contains_key("new.txt"));
         assert!(!app.flash[LEFT].contains_key("a.txt"));
         assert_eq!(app.panels[LEFT].current().unwrap().name, "b.txt", "cursor kept");
+        // Leaving the directory drops its highlights.
+        app.panels[LEFT].focus_name("sub");
+        app.handle_key(key(KeyCode::Enter));
+        assert!(app.flash[LEFT].is_empty());
     }
 
     #[test]
