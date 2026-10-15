@@ -1,5 +1,6 @@
 {
   "name": "rcommander",
+  "description": "Claude Code integration for rcommander, a dual-pane file manager for the terminal and the browser.",
   "owner": { "name": "mazzucci" },
   "plugins": [{ "name": "rcommander", "source": "./integrations/claude-code" }]
 }
