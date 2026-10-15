@@ -119,6 +119,7 @@ The **rcommander Claude Code plugin** (`integrations/claude-code`) builds on thi
 - a `/rc` command (`/rc goto <path>`, `/rc diff <a> <b>`, …);
 - a tool Claude can call to show you a file, a line, a directory or a diff (it only moves your file manager, so it runs without a permission prompt);
 - **Claude's changes**: before each edit it records the file's original (only the first time), so `c` in rcommander lists everything Claude touched and F2 shows each change in full (option *Record Claude's changes*);
+  originals are kept in your private runtime folder (`$XDG_RUNTIME_DIR/rcommander/changes`, or a per-user temp folder on macOS) until `rcmd ctl changes --clear` or logout, across all projects; files over 8 MiB are not recorded;
 - optionally following Claude's edits: after it edits a file, rcommander shows it in the other panel (`goto`, the default) or opens a diff of the change (`diff`).
 
 Install it from a Claude Code terminal session:

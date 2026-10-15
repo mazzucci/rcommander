@@ -20,6 +20,7 @@ const KEYS: &[(&str, &str)] = &[
     (".", "show / hide hidden files"),
     ("g  Ctrl+L", "go to path"),
     ("Ctrl+D", "hotlist (bookmarks)"),
+    ("c", "Claude's changes: F2 diff vs original, F8 forget"),
     ("o", "options: columns, hidden files, editor"),
     ("Ctrl+S  Ctrl+F3…F6", "cycle sort / sort by name, ext, date, size"),
     ("Ctrl+R  Ctrl+U", "refresh / swap panels"),

@@ -25,6 +25,9 @@ async function ctl(
 /** Following must never slow Claude down: give up quickly if rcmd is busy or stopped. */
 const FOLLOW = { timeoutMs: 3_000 }
 
+/** Matches rcmd's cap on saved originals (8 MiB). */
+const MAX_ORIGINAL = 8 * 1024 * 1024
+
 export const register: Register = (on, options) => {
   const rcmd = typeof options.rcmd_path === 'string' && options.rcmd_path ? options.rcmd_path : 'rcmd'
   const follow: Follow = options.follow === 'off' || options.follow === 'diff' ? options.follow : 'goto'
@@ -89,12 +92,15 @@ export const register: Register = (on, options) => {
       if (!file) return next(e)
       // The file as it was before the edit (empty if it is new). It goes to rcmd on stdin;
       // nothing is written to disk here.
-      const before = await $.fs.read(file).then(t => (typeof t === 'string' ? t : ''), () => '')
+      const before =
+        track || follow === 'diff' ? await $.fs.read(file).then(t => (typeof t === 'string' ? t : ''), () => '') : ''
+      // rcmd keeps originals up to 8 MiB; don't send what it would refuse.
+      const keep = track && before.length <= MAX_ORIGINAL
       const ran = await next(e)
       if (ran.deny === undefined && ran.isError !== true) {
         // rcommander may not be running; all of this is best effort and silent.
         // `track` keeps only the first original of each file, for "Claude's changes".
-        if (track) await ctl($, rcmd, ['track', '--', file], { ...FOLLOW, stdin: before })
+        if (keep) await ctl($, rcmd, ['track', '--', file], { ...FOLLOW, stdin: before })
         if (follow === 'goto') await ctl($, rcmd, ['goto', '--side', 'other', '--', file], FOLLOW)
         if (follow === 'diff') await ctl($, rcmd, ['diff', '--', '-', file], { ...FOLLOW, stdin: before })
       }

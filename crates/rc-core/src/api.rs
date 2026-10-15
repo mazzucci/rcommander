@@ -19,6 +19,13 @@ pub struct InitResponse {
     pub changes: Option<ChangesDirs>,
 }
 
+/// `POST /api/changes/forget` → [`OpResult`]: drop entries (by name) from "Claude's
+/// changes". Only the log's own link and saved original are removed.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct ForgetRequest {
+    pub names: Vec<String>,
+}
+
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct ChangesDirs {
     pub links: Location,

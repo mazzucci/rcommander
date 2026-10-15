@@ -19,7 +19,7 @@ use axum::routing::get;
 use axum::routing::post;
 use axum::{Json, Router};
 use rc_core::api::{ApiError, DiffRequest, FileOp, InitResponse, ListRequest, OpenRequest, ReadRequest};
-use rc_core::api::{BrowserEvent, ChangesDirs};
+use rc_core::api::{BrowserEvent, ChangesDirs, ForgetRequest};
 use rc_core::control::{Command, Reply};
 use rc_core::{Location, Settings};
 use rc_vfs::Vfs;
@@ -150,9 +150,10 @@ async fn serve(vfs: Arc<Vfs>, config: Config) -> Result<()> {
         right: vfs.normalize(config.right, None),
         home: Vfs::home(),
         settings: Settings::default(),
+        // Normalized like every panel location, so the browser recognizes the folder.
         changes: crate::control::changes_log().ok().map(|log| ChangesDirs {
-            links: Location::local(log.links_dir().to_string_lossy()),
-            originals: Location::local(log.originals_dir().to_string_lossy()),
+            links: vfs.normalize(Location::local(log.links_dir().to_string_lossy()), None),
+            originals: vfs.normalize(Location::local(log.originals_dir().to_string_lossy()), None),
         }),
     };
     let (events, _) = broadcast::channel(64);
@@ -264,6 +265,7 @@ fn router(state: AppState, port: u16) -> Router {
         .route("/diff_head", post(diff_head))
         .route("/op", post(op))
         .route("/conflicts", post(conflicts))
+        .route("/changes/forget", post(forget_changes))
         .route("/open", post(open_external))
         .route("/edit", post(edit_external))
         .route("/settings", post(save_settings))
@@ -399,6 +401,22 @@ async fn diff(State(s): State<AppState>, Json(req): Json<DiffRequest>) -> Respon
 
 async fn diff_head(State(s): State<AppState>, Json(req): Json<ReadRequest>) -> Response {
     blocking(move || s.vfs.diff_head(&s.vfs.normalize(req.location, None))).await
+}
+
+/// Drop entries from "Claude's changes" by name. The edited files are never touched.
+async fn forget_changes(Json(req): Json<ForgetRequest>) -> Response {
+    blocking(move || {
+        let log = crate::control::changes_log()?;
+        let mut res = rc_core::api::OpResult::default();
+        for name in &req.names {
+            match log.forget(name) {
+                Ok(()) => res.done += 1,
+                Err(e) => res.errors.push(format!("{e:#}")),
+            }
+        }
+        Ok(res)
+    })
+    .await
 }
 
 async fn conflicts(State(s): State<AppState>, Json(op): Json<FileOp>) -> Response {

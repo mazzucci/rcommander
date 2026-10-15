@@ -172,8 +172,11 @@ fn ctl(action: CtlAction, pid: Option<u32>, timeout: u64) -> anyhow::Result<()> 
         },
         CtlAction::Track { file } => {
             use std::io::Read;
+            // One byte over the cap is enough to know it is too large.
             let mut original = Vec::new();
-            std::io::stdin().read_to_end(&mut original)?;
+            std::io::stdin()
+                .take(rc_vfs::changes::MAX_ORIGINAL + 1)
+                .read_to_end(&mut original)?;
             control::changes_log()?.record(std::path::Path::new(&absolute(&file)), &original)?;
             // Panels showing the log pick the new entry up; no running rcmd is fine.
             let _ = control::send(&RemoteCommand::Refresh, pid, std::time::Duration::from_secs(timeout));

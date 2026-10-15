@@ -469,7 +469,12 @@ impl App {
     fn show_changes(self) {
         match self.changes.get_untracked() {
             Some(c) => {
-                self.load(self.active_side(), c.links, None);
+                // Edited dot-files (.env, .gitignore…) belong in the list too.
+                let side = self.active_side();
+                if !self.panels[side].with_untracked(|p| p.show_hidden) {
+                    self.panels[side].update(Panel::toggle_hidden);
+                }
+                self.load(side, c.links, None);
                 self.info("Claude's changes: F2 diff against the original · F3 view · F8 forget");
             }
             None => self.error("Claude's changes are not available"),
@@ -485,7 +490,14 @@ impl App {
         let original = c.originals.join(&e.name);
         let current = Location::local(&target);
         let title = format!("{target} (before)");
-        self.open_diff_titled(api::diff(original, current), Some(title));
+        // A file deleted (or moved) since shows as "does not exist" on the right.
+        let fut = async move {
+            match api::diff(original.clone(), current).await {
+                Ok(diff) => Ok(diff),
+                Err(_) => api::diff_sides(Some(original), None).await,
+            }
+        };
+        self.open_diff_titled(fut, Some(title));
     }
 
     /// F4: open the file under the cursor in the configured editor (server side), or
@@ -666,19 +678,20 @@ impl App {
             ModalKind::Delete { targets, permanent } => self.run_op(FileOp::Delete { targets, permanent }, None),
             // Forget entries: remove the log's link and saved original; the file stays.
             ModalKind::Forget { names } => {
-                if let Some(c) = self.changes.get_untracked() {
-                    let targets = names
-                        .iter()
-                        .flat_map(|n| [c.links.join(n), c.originals.join(n)])
-                        .collect();
-                    self.run_op(
-                        FileOp::Delete {
-                            targets,
-                            permanent: true,
-                        },
-                        None,
-                    );
-                }
+                let side = self.active_side();
+                self.request(api::forget_changes(names), move |res: OpResult| {
+                    let text = if res.errors.is_empty() {
+                        format!("Forgot {} from Claude's changes; the files are untouched", res.done)
+                    } else {
+                        format!("Forgot {}; {}", res.done, res.errors[0])
+                    };
+                    if res.errors.is_empty() {
+                        self.info(text)
+                    } else {
+                        self.error(text)
+                    }
+                    self.reload(side, None);
+                });
             }
             // Answered with a policy through `resolve_conflict`, never plain confirm.
             ModalKind::Conflict { .. } => {}

@@ -2,8 +2,8 @@
 
 use gloo_net::http::Request;
 use rc_core::api::{
-    ApiError, Conflicts, DiffRequest, DiffResponse, FileContent, FileOp, InitResponse, ListRequest, OpResult,
-    OpenRequest, ReadRequest,
+    ApiError, Conflicts, DiffRequest, DiffResponse, FileContent, FileOp, ForgetRequest, InitResponse, ListRequest,
+    OpResult, OpenRequest, ReadRequest,
 };
 use rc_core::{Listing, Location, Settings};
 use serde::Serialize;
@@ -98,6 +98,16 @@ pub async fn diff(left: Location, right: Location) -> Result<DiffResponse, Strin
         },
     )
     .await
+}
+
+/// Diff where either side may be missing (shown as empty, "does not exist").
+pub async fn diff_sides(left: Option<Location>, right: Option<Location>) -> Result<DiffResponse, String> {
+    call("diff", &DiffRequest { left, right }).await
+}
+
+/// Forget entries of "Claude's changes"; the files stay.
+pub async fn forget_changes(names: Vec<String>) -> Result<OpResult, String> {
+    call("changes/forget", &ForgetRequest { names }).await
 }
 
 /// Diff a file against its committed version (git HEAD).

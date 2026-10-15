@@ -4,6 +4,7 @@ export const USAGE = [
   '  diff <a> <b>       side-by-side diff of two files',
   '  view <path>        open a file in the viewer (--line N to point at a line)',
   '  changes            show the files Claude edited (F2: diff against the original)',
+  '  changes --clear    forget them (originals are kept until then, or until you log out)',
   '  select <mask>      select entries matching a mask, e.g. *.rs',
   '  refresh            re-read both panels',
   '  message <text>     show text in the status bar',

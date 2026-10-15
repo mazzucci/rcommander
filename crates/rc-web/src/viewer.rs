@@ -16,6 +16,9 @@ const PAD: i32 = 6;
 #[component]
 pub fn Viewer(app: App, content: Arc<FileContent>, line: Option<usize>) -> impl IntoView {
     let body = NodeRef::<Div>::new();
+    // A line past the end means the last line (as in the terminal UI).
+    let count = content.text.as_deref().map_or(1, |t| t.lines().count().max(1));
+    let line = line.map(|l| l.clamp(1, count));
     // Pointed at a line (e.g. by `rcmd ctl view --line`): scroll there, a few lines down.
     Effect::new(move |_| {
         if let (Some(el), Some(line)) = (body.get(), line) {

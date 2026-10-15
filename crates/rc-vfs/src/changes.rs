@@ -6,6 +6,9 @@ use anyhow::{Context, Result};
 use std::fs;
 use std::path::{Path, PathBuf};
 
+/// Largest original kept, the most a diff shows anyway.
+pub const MAX_ORIGINAL: u64 = crate::VIEW_LIMIT;
+
 pub struct ChangeLog {
     links: PathBuf,
     originals: PathBuf,
@@ -20,7 +23,13 @@ impl ChangeLog {
             originals: dir.join("originals"),
         };
         for d in [&log.links, &log.originals] {
-            fs::create_dir_all(d).with_context(|| format!("cannot create {}", d.display()))?;
+            let mut builder = fs::DirBuilder::new();
+            builder.recursive(true);
+            #[cfg(unix)]
+            std::os::unix::fs::DirBuilderExt::mode(&mut builder, 0o700);
+            builder
+                .create(d)
+                .with_context(|| format!("cannot create {}", d.display()))?;
         }
         Ok(log)
     }
@@ -36,8 +45,16 @@ impl ChangeLog {
 
     /// Note that `file` is being edited, with `original` its content before the edit.
     /// Only the first edit of a file is recorded, so the diff shows everything changed.
-    /// Returns false if the file was already in the log.
+    /// Returns false if the file was already in the log. Originals larger than
+    /// [`MAX_ORIGINAL`] are refused: the log lives in memory-backed storage.
     pub fn record(&self, file: &Path, original: &[u8]) -> Result<bool> {
+        if original.len() as u64 > MAX_ORIGINAL {
+            anyhow::bail!(
+                "{} is larger than {} MiB; not recorded",
+                file.display(),
+                MAX_ORIGINAL >> 20
+            );
+        }
         if self.entry_for(file).is_some() {
             return Ok(false);
         }
@@ -50,9 +67,13 @@ impl ChangeLog {
             .map(|i| if i == 1 { base.clone() } else { format!("{base} ({i})") })
             .find(|n| self.links.join(n).symlink_metadata().is_err())
             .expect("an unused name");
-        write_private(&self.originals.join(&name), original)?;
         #[cfg(unix)]
         std::os::unix::fs::symlink(file, self.links.join(&name))?;
+        // Never leave a half-made entry: an original without its link is invisible.
+        if let Err(e) = write_private(&self.originals.join(&name), original) {
+            let _ = fs::remove_file(self.links.join(&name));
+            return Err(e);
+        }
         Ok(true)
     }
 
@@ -76,12 +97,22 @@ impl ChangeLog {
         fs::remove_file(self.links.join(name)).with_context(|| format!("no change entry {name}"))
     }
 
-    /// Drop every entry.
+    /// Drop every entry, carrying on past entries that fail.
     pub fn clear(&self) -> Result<()> {
-        for e in fs::read_dir(&self.links)?.flatten() {
-            self.forget(&e.file_name().to_string_lossy())?;
+        let failed: Vec<String> = fs::read_dir(&self.links)?
+            .flatten()
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .filter(|name| self.forget(name).is_err())
+            .collect();
+        for orphan in fs::read_dir(&self.originals)?.flatten() {
+            if self.links.join(orphan.file_name()).symlink_metadata().is_err() {
+                let _ = fs::remove_file(orphan.path());
+            }
         }
-        Ok(())
+        match failed.as_slice() {
+            [] => Ok(()),
+            names => anyhow::bail!("could not forget: {}", names.join(", ")),
+        }
     }
 }
 
@@ -123,6 +154,14 @@ mod tests {
         log.forget("lib.rs").unwrap();
         assert!(fa.exists(), "forgetting never touches the file");
         assert_eq!(log.entry_for(&fa), None);
+        assert!(
+            log.record(&tmp.path().join("huge"), &vec![0u8; MAX_ORIGINAL as usize + 1])
+                .is_err()
+        );
+        // A dangling entry (file deleted since) still pairs, and clear() removes orphans too.
+        fs::remove_file(&fb).unwrap();
+        assert!(log.pair("lib.rs (2)").is_some());
+        fs::write(log.originals_dir().join("orphan"), "x").unwrap();
         log.clear().unwrap();
         assert_eq!(fs::read_dir(log.links_dir()).unwrap().count(), 0);
         assert_eq!(fs::read_dir(log.originals_dir()).unwrap().count(), 0);

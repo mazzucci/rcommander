@@ -346,6 +346,10 @@ impl App {
         match &self.change_log {
             Some(log) => {
                 let dir = Location::local(log.links_dir().to_string_lossy());
+                // Edited dot-files (.env, .gitignore…) belong in the list too.
+                if !self.panels[self.active].show_hidden {
+                    self.panels[self.active].toggle_hidden();
+                }
                 self.load(self.active, dir, None);
                 self.info("Claude's changes: F2 diff against the original · F3 view · F8 forget");
             }
@@ -367,7 +371,7 @@ impl App {
             return;
         };
         let Some((original, file)) = self.change_log.as_ref().and_then(|log| log.pair(&name)) else {
-            return;
+            return self.error(format!("{name} is not an entry of Claude's changes"));
         };
         let loc = |p: &std::path::Path| Location::local(p.to_string_lossy());
         let right = loc(&file);
