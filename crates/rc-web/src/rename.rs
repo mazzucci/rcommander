@@ -74,28 +74,25 @@ pub fn RenameView(app: App, target: RenameTarget) -> impl IntoView {
             return;
         };
         let value = input.value();
-        let at = input
-            .selection_start()
-            .ok()
-            .flatten()
-            .map_or(value.len(), |n| n as usize)
-            .min(value.len());
-        let end = input
-            .selection_end()
-            .ok()
-            .flatten()
-            .map_or(at, |n| n as usize)
-            .clamp(at, value.len());
-        // Selection offsets are UTF-16 units; masks with non-ASCII fall back to appending.
-        let (at, end) = if value.is_char_boundary(at) && value.is_char_boundary(end) && value.is_ascii() {
-            (at, end)
-        } else {
-            (value.len(), value.len())
+        // Selection offsets count UTF-16 units; turn them into byte offsets.
+        let byte = |units: Option<u32>| {
+            let units = units.map_or(usize::MAX, |n| n as usize);
+            let mut seen = 0;
+            value
+                .char_indices()
+                .find(|(_, c)| {
+                    let past = seen >= units;
+                    seen += c.len_utf16();
+                    past
+                })
+                .map_or(value.len(), |(i, _)| i)
         };
+        let at = byte(input.selection_start().ok().flatten());
+        let end = byte(input.selection_end().ok().flatten()).max(at);
         let new = format!("{}{token}{}", &value[..at], &value[end..]);
         rule.update(|r| r.mask = new.clone());
         input.set_value(&new);
-        let caret = (at + token.len()) as u32;
+        let caret = new[..at + token.len()].encode_utf16().count() as u32;
         let _ = input.focus();
         let _ = input.set_selection_range(caret, caret);
     };
@@ -221,6 +218,7 @@ pub fn RenameView(app: App, target: RenameTarget) -> impl IntoView {
                             type="number"
                             min="0"
                             prop:value=move || rule.with(|r| r.counter_start.to_string())
+                            on:blur=move |ev| show_value(&ev, rule.try_with_untracked(|r| r.counter_start))
                             on:input=move |ev| {
                                 if let Some(n) = number(event_target_value(&ev)) {
                                     rule.update(|r| r.counter_start = n);
@@ -235,6 +233,7 @@ pub fn RenameView(app: App, target: RenameTarget) -> impl IntoView {
                             min="1"
                             max="20"
                             prop:value=move || rule.with(|r| r.counter_digits.to_string())
+                            on:blur=move |ev| show_value(&ev, rule.try_with_untracked(|r| r.counter_digits as u64))
                             on:input=move |ev| {
                                 if let Some(n) = number(event_target_value(&ev)) {
                                     rule.update(|r| r.counter_digits = (n as usize).min(20));
@@ -256,5 +255,13 @@ pub fn RenameView(app: App, target: RenameTarget) -> impl IntoView {
                 </div>
             </div>
         </div>
+    }
+}
+
+/// Leaving a number field shows the value in use (an empty or invalid entry is ignored).
+/// `None`: the dialog is closing (removing a focused field blurs it); nothing to do.
+fn show_value(ev: &leptos::ev::FocusEvent, value: Option<u64>) {
+    if let Some(value) = value {
+        event_target::<web_sys::HtmlInputElement>(ev).set_value(&value.to_string());
     }
 }

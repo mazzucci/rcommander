@@ -1224,6 +1224,13 @@ mod tests {
                 draw_at(&mut app, w, h);
             }
             assert!(matches!(app.mode, Mode::Normal));
+            // Multi-rename with a preview.
+            app.handle_key(KeyEvent::new(KeyCode::Char('M'), KeyModifiers::SHIFT));
+            app.handle_key(KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE));
+            app.handle_key(KeyEvent::new(KeyCode::PageDown, KeyModifiers::NONE));
+            draw_at(&mut app, w, h);
+            app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+            assert!(matches!(app.mode, Mode::Normal));
         }
     }
 

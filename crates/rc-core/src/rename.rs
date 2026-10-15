@@ -106,7 +106,8 @@ impl Planned {
 /// part of the name (".bashrc" has none); folders have no extension.
 pub fn split_ext(name: &str, is_dir: bool) -> (&str, &str) {
     match name.rfind('.') {
-        Some(i) if i > 0 && !is_dir => (&name[..i], &name[i + 1..]),
+        // A trailing dot is part of the name ("notes." has no extension).
+        Some(i) if i > 0 && i + 1 < name.len() && !is_dir => (&name[..i], &name[i + 1..]),
         _ => (name, ""),
     }
 }
@@ -171,8 +172,12 @@ pub fn plan(rule: &RenameRule, entries: &[(String, bool)], parent: &str, existin
     for p in &mut planned {
         p.problem = if p.to.is_empty() {
             Some("empty name".into())
-        } else if p.to.contains(['/', '\0']) {
+        } else if p.to.contains('/') {
             Some("contains /".into())
+        } else if p.to.chars().any(char::is_control) {
+            Some("contains a control character".into())
+        } else if p.to.len() > 255 {
+            Some("name too long".into())
         } else if p.to == "." || p.to == ".." {
             Some("not a valid name".into())
         } else if targets[&p.to] > 1 {
@@ -198,10 +203,8 @@ mod tests {
     #[test]
     fn default_mask_keeps_names() {
         let rule = RenameRule::default();
-        assert_eq!(
-            names(&rule, &["a.txt", "Makefile", ".bashrc", "x.tar.gz"]),
-            ["a.txt", "Makefile", ".bashrc", "x.tar.gz"]
-        );
+        let same = ["a.txt", "Makefile", ".bashrc", "x.tar.gz", "notes."];
+        assert_eq!(names(&rule, &same), same);
     }
 
     #[test]
@@ -300,7 +303,14 @@ mod tests {
         assert!(p.iter().all(|p| p.problem.is_none()), "{p:?}");
 
         // Bad names.
-        for (mask, why) in [("", "empty name"), ("a/[N]", "contains /"), ("..", "not a valid name")] {
+        let long = "x".repeat(256);
+        for (mask, why) in [
+            ("", "empty name"),
+            ("a/[N]", "contains /"),
+            ("..", "not a valid name"),
+            ("a\nb", "contains a control character"),
+            (long.as_str(), "name too long"),
+        ] {
             let rule = RenameRule {
                 mask: mask.into(),
                 ..RenameRule::default()
