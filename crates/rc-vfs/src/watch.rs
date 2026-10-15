@@ -2,7 +2,7 @@
 //! (non-recursively) and reports, debounced, which of them changed.
 
 use anyhow::Result;
-use notify::{RecommendedWatcher, RecursiveMode, Watcher};
+use notify::{EventKind, RecommendedWatcher, RecursiveMode, Watcher};
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, mpsc};
@@ -25,6 +25,11 @@ impl DirWatcher {
         let filter = Arc::clone(&watched);
         let watcher = notify::recommended_watcher(move |res: notify::Result<notify::Event>| {
             let Ok(event) = res else { return };
+            // Reading a directory (as every refresh does) is not a change; reporting it
+            // would make a watcher that refreshes on change loop forever.
+            if matches!(event.kind, EventKind::Access(_)) {
+                return;
+            }
             let watched = filter.lock().expect("watch set");
             for path in event.paths {
                 // A change inside a watched directory, or to the directory itself. Only
@@ -135,5 +140,22 @@ mod tests {
         std::fs::write(a.join("late"), "x").unwrap();
         std::thread::sleep(Duration::from_millis(400));
         assert!(rx.try_iter().all(|d| d != a), "a is no longer watched");
+    }
+
+    #[test]
+    fn reading_a_directory_is_not_a_change() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().canonicalize().unwrap();
+        std::fs::write(dir.join("f"), "x").unwrap();
+        let (tx, rx) = mpsc::channel();
+        let mut w = DirWatcher::new(move |dir| {
+            let _ = tx.send(dir);
+        })
+        .unwrap();
+        w.set([dir.as_path()]);
+        std::thread::sleep(Duration::from_millis(100));
+        let _ = std::fs::read_dir(&dir).unwrap().count();
+        let _ = std::fs::read(dir.join("f")).unwrap();
+        assert!(rx.recv_timeout(DEBOUNCE * 4).is_err(), "reads were reported as changes");
     }
 }
