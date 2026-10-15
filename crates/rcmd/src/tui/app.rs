@@ -502,6 +502,10 @@ impl App {
     /// Run a (possibly long) file operation on a worker thread; `tick` collects the result.
     /// Run a copy/move, first asking what to do if it would meet existing files.
     fn start_transfer(&mut self, op: FileOp) {
+        if self.job.is_some() {
+            self.error("Another operation is still running");
+            return;
+        }
         let existing = self.vfs.conflicts(&op).existing;
         if existing.is_empty() {
             self.run_job(op);
@@ -511,11 +515,12 @@ impl App {
     }
 
     fn conflict_key(&mut self, c: ConflictPrompt, key: KeyEvent) {
+        // 'n' is "no" everywhere else, so it cancels here too; "only newer" is 'u' (update).
         let policy = match key.code {
             KeyCode::Char('o' | 'O') => OnConflict::Overwrite,
-            KeyCode::Char('n' | 'N') => OnConflict::IfNewer,
+            KeyCode::Char('u' | 'U') => OnConflict::IfNewer,
             KeyCode::Char('s' | 'S') => OnConflict::Skip,
-            KeyCode::Esc => return,
+            KeyCode::Esc | KeyCode::Char('n' | 'N') => return,
             _ => {
                 self.mode = Mode::Conflict(c);
                 return;
@@ -751,7 +756,8 @@ impl App {
     /// Show the result and refresh. The selection is kept when something failed so the
     /// user can retry.
     fn finish_op(&mut self, verb: &str, res: OpResult) {
-        let ok = res.errors.is_empty();
+        // A cancelled operation keeps the selection too, so the rest can be retried.
+        let ok = res.errors.is_empty() && !res.cancelled;
         self.report(&res.summary(verb), ok);
         if ok {
             self.panels.iter_mut().for_each(Panel::clear_selection);
@@ -1068,6 +1074,9 @@ impl App {
     /// Status line for the job in progress, if any.
     pub fn job_status(&self) -> Option<String> {
         let job = self.job.as_ref()?;
+        if job.cancel.load(Ordering::Relaxed) {
+            return Some(format!("Cancelling {}…", job.verb.to_lowercase()));
+        }
         let Some(p) = &job.progress else {
             return Some(format!("{}…  (Esc cancels)", job.verb));
         };
@@ -1569,6 +1578,11 @@ mod tests {
             panic!("expected a conflict prompt")
         };
         assert_eq!(c.existing.len(), 1);
+        // 'n' means no, as in every other dialog.
+        app.handle_key(key(KeyCode::Char('n')));
+        assert!(matches!(app.mode, Mode::Normal) && app.job.is_none());
+        app.handle_key(key(KeyCode::F(5)));
+        app.handle_key(key(KeyCode::Enter));
         app.handle_key(key(KeyCode::Char('s')));
         wait_job(&mut app);
         assert_eq!(
@@ -1607,6 +1621,7 @@ mod tests {
         app.panels[LEFT].select_mask("*", true);
         app.handle_key(key(KeyCode::Esc));
         assert!(app.job.as_ref().unwrap().cancel.load(Ordering::Relaxed));
+        assert!(app.job_status().unwrap().starts_with("Cancelling"));
         assert!(
             !app.panels[LEFT].selected.is_empty(),
             "Esc cancelled instead of clearing the selection"

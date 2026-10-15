@@ -186,6 +186,18 @@ impl Vfs {
             Err(e) if e.is::<local::Cancelled>() => res.cancelled = true,
             Err(e) => res.errors.push(format!("{e:#}")),
         };
+        // Copies and moves report every skipped file, not just top-level items.
+        let record_outcome = |res: &mut OpResult, r: Result<local::Outcome>| match r {
+            Ok(o) => {
+                if o.result() == Copied::Done {
+                    res.done += 1;
+                }
+                res.skipped
+                    .extend(o.skipped.iter().map(|p| p.to_string_lossy().into_owned()));
+            }
+            Err(e) if e.is::<local::Cancelled>() => res.cancelled = true,
+            Err(e) => res.errors.push(format!("{e:#}")),
+        };
         match op {
             FileOp::Copy {
                 sources,
@@ -213,7 +225,7 @@ impl Vfs {
                     } else {
                         local::copy(&src, &target, *on_conflict, &mut done, total, progress)
                     };
-                    record(&mut res, &target.to_string_lossy(), r);
+                    record_outcome(&mut res, r);
                     if res.cancelled {
                         break;
                     }

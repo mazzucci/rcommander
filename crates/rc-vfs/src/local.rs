@@ -245,9 +245,45 @@ fn replaces(policy: OnConflict, src: &fs::Metadata, dest: &Path) -> bool {
     }
 }
 
+/// What happened to one top-level item of a copy or move.
+#[derive(Debug, Default, PartialEq)]
+pub struct Outcome {
+    /// Files (or whole renamed items) written.
+    pub copied: usize,
+    /// Destinations left as they were because of the conflict policy.
+    pub skipped: Vec<PathBuf>,
+}
+
+impl Outcome {
+    /// Done if anything was written, or if there was nothing to skip.
+    pub fn result(&self) -> Copied {
+        if self.copied == 0 && !self.skipped.is_empty() {
+            Copied::Skipped
+        } else {
+            Copied::Done
+        }
+    }
+
+    fn add(&mut self, other: Outcome) {
+        self.copied += other.copied;
+        self.skipped.extend(other.skipped);
+    }
+}
+
+/// A scratch name next to `dest`: files are written there and renamed over `dest` only
+/// once complete, so a failure or cancel never damages what was already at `dest`.
+fn partial_path(dest: &Path) -> PathBuf {
+    let name = dest
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    dest.with_file_name(format!(".{name}.rcmd-{}.partial", std::process::id()))
+}
+
 /// Recursively copy `src` to `dest` (the full destination path, not its parent).
-/// Existing files are handled by `policy`; directories are merged. Modification times
-/// are preserved. `done` counts bytes copied so far, for progress.
+/// Directories are merged; existing files are handled by `policy`. Files are replaced
+/// atomically (a hard link at the destination is replaced, not written through) and keep
+/// their modification time. `done` counts bytes for progress.
 pub fn copy(
     src: &Path,
     dest: &Path,
@@ -255,20 +291,18 @@ pub fn copy(
     done: &mut u64,
     total: u64,
     progress: &mut ProgressFn,
-) -> Result<Copied> {
+) -> Result<Outcome> {
     let meta = fs::symlink_metadata(src).with_context(|| format!("cannot read {}", src.display()))?;
     check_not_into_itself(src, dest, &meta)?;
-    if dest.symlink_metadata().is_ok() && policy == OnConflict::Skip {
-        return Ok(Copied::Skipped);
-    }
     let mut ctx = CopyCtx {
         policy,
         done,
         total,
         progress,
+        outcome: Outcome::default(),
     };
     ctx.copy(src, dest, &meta)?;
-    Ok(Copied::Done)
+    Ok(ctx.outcome)
 }
 
 struct CopyCtx<'a, 'b> {
@@ -276,6 +310,7 @@ struct CopyCtx<'a, 'b> {
     done: &'a mut u64,
     total: u64,
     progress: &'a mut ProgressFn<'b>,
+    outcome: Outcome,
 }
 
 impl CopyCtx<'_, '_> {
@@ -293,7 +328,15 @@ impl CopyCtx<'_, '_> {
 
     fn copy(&mut self, src: &Path, dest: &Path, meta: &fs::Metadata) -> Result<()> {
         self.report(src)?;
+        let existing = fs::symlink_metadata(dest).ok();
         if meta.is_dir() {
+            if existing
+                .as_ref()
+                .is_some_and(|m| !m.is_dir() && !m.file_type().is_symlink())
+            {
+                bail!("cannot replace file {} with a folder", dest.display());
+            }
+            // Note: an existing symlink to a folder is followed, like `cp -R`.
             fs::create_dir_all(dest)?;
             for item in fs::read_dir(src)? {
                 let item = item?;
@@ -306,30 +349,41 @@ impl CopyCtx<'_, '_> {
             fs::set_permissions(dest, meta.permissions())?;
             return Ok(());
         }
-        if dest.symlink_metadata().is_ok() && !replaces(self.policy, meta, dest) {
-            *self.done += meta.len();
-            return Ok(());
+        if let Some(existing) = &existing {
+            if existing.is_dir() {
+                bail!("cannot replace folder {} with a file", dest.display());
+            }
+            // Checked at every level: a hard link or second path to the same file deep in
+            // a tree would otherwise be "replaced" by itself.
+            if !meta.file_type().is_symlink() && !existing.file_type().is_symlink() && same_file(src, dest) {
+                bail!("{} and {} are the same file", src.display(), dest.display());
+            }
+            if !replaces(self.policy, meta, dest) {
+                *self.done += meta.len();
+                self.outcome.skipped.push(dest.to_path_buf());
+                return Ok(());
+            }
         }
-        if meta.file_type().is_symlink() {
+        let partial = partial_path(dest);
+        let _ = fs::remove_file(&partial);
+        let written = if meta.file_type().is_symlink() {
             let target = fs::read_link(src)?;
-            // Replace whatever is there (a file or another link), never write through it.
-            let _ = fs::remove_file(dest);
             #[cfg(unix)]
-            std::os::unix::fs::symlink(target, dest)?;
+            let r = std::os::unix::fs::symlink(target, &partial).map_err(Into::into);
             #[cfg(not(unix))]
-            fs::copy(src, dest).map(|_| drop(target))?;
-            return Ok(());
-        }
-        // Replace a link at the destination instead of writing through it.
-        if dest.symlink_metadata().is_ok_and(|m| m.file_type().is_symlink()) {
-            fs::remove_file(dest)?;
-        }
-        let result = self.copy_file(src, dest, meta);
+            let r = fs::copy(src, &partial).map(|_| drop(target)).map_err(Into::into);
+            r
+        } else {
+            self.copy_file(src, &partial, meta)
+        };
+        let result = written
+            .and_then(|()| fs::rename(&partial, dest).with_context(|| format!("cannot write {}", dest.display())));
         if result.is_err() {
-            // Never leave a half-written file behind.
-            let _ = fs::remove_file(dest);
+            let _ = fs::remove_file(&partial);
         }
-        result
+        result?;
+        self.outcome.copied += 1;
+        Ok(())
     }
 
     /// Copy contents in chunks so progress and cancellation work mid-file.
@@ -354,8 +408,8 @@ impl CopyCtx<'_, '_> {
     }
 }
 
-/// Move `src` to `dest`. Conflicts follow `policy`; a directory moved onto an existing
-/// directory is merged entry by entry, leaving behind only what was skipped.
+/// Move `src` to `dest`. A folder moved onto an existing folder is merged entry by entry;
+/// whatever `policy` skips stays behind at the source, which is kept in that case.
 pub fn move_item(
     src: &Path,
     dest: &Path,
@@ -363,7 +417,7 @@ pub fn move_item(
     done: &mut u64,
     total: u64,
     progress: &mut ProgressFn,
-) -> Result<Copied> {
+) -> Result<Outcome> {
     let meta = fs::symlink_metadata(src).with_context(|| format!("cannot read {}", src.display()))?;
     if meta.is_dir() && resolve(dest).starts_with(resolve(src)) && resolve(dest) != resolve(src) {
         bail!("cannot move {} into itself", src.display());
@@ -373,32 +427,31 @@ pub fn move_item(
     let dest_meta = fs::symlink_metadata(dest).ok().filter(|_| !same_file(src, dest));
     if let Some(dm) = &dest_meta {
         if meta.is_dir() && dm.is_dir() {
-            if policy == OnConflict::Skip {
-                return Ok(Copied::Skipped);
-            }
-            let mut moved_all = true;
+            let mut outcome = Outcome::default();
             for item in fs::read_dir(src)? {
                 let item = item?;
-                let r = move_item(
+                outcome.add(move_item(
                     &item.path(),
                     &dest.join(item.file_name()),
                     policy,
                     done,
                     total,
                     progress,
-                )?;
-                moved_all &= r == Copied::Done;
+                )?);
             }
-            if moved_all {
+            if outcome.skipped.is_empty() {
                 let _ = fs::remove_dir(src);
             }
-            return Ok(Copied::Done);
-        }
-        if !replaces(policy, &meta, dest) {
-            return Ok(Copied::Skipped);
+            return Ok(outcome);
         }
         if dm.is_dir() {
             bail!("cannot replace folder {} with a file", dest.display());
+        }
+        if !replaces(policy, &meta, dest) {
+            return Ok(Outcome {
+                copied: 0,
+                skipped: vec![dest.to_path_buf()],
+            });
         }
     }
     let p = Progress {
@@ -412,12 +465,18 @@ pub fn move_item(
     match fs::rename(src, dest) {
         Ok(()) => {
             *done += total_size(dest);
-            Ok(Copied::Done)
+            Ok(Outcome {
+                copied: 1,
+                skipped: Vec::new(),
+            })
         }
         Err(e) if e.kind() == std::io::ErrorKind::CrossesDevices => {
-            copy(src, dest, policy, done, total, progress)?;
-            remove(src)?;
-            Ok(Copied::Done)
+            let outcome = copy(src, dest, policy, done, total, progress)?;
+            // Keep the source when anything was skipped: it may hold the only copy.
+            if outcome.skipped.is_empty() {
+                remove(src)?;
+            }
+            Ok(outcome)
         }
         Err(e) => Err(e).with_context(|| format!("cannot move {}", src.display())),
     }
@@ -438,11 +497,11 @@ mod tests {
     use super::*;
 
     fn cp(src: &Path, dest: &Path, policy: OnConflict) -> Result<Copied> {
-        copy(src, dest, policy, &mut 0, 0, &mut |_| ControlFlow::Continue(()))
+        copy(src, dest, policy, &mut 0, 0, &mut |_| ControlFlow::Continue(())).map(|o| o.result())
     }
 
     fn mv(src: &Path, dest: &Path, policy: OnConflict) -> Result<Copied> {
-        move_item(src, dest, policy, &mut 0, 0, &mut |_| ControlFlow::Continue(()))
+        move_item(src, dest, policy, &mut 0, 0, &mut |_| ControlFlow::Continue(())).map(|o| o.result())
     }
 
     #[test]
@@ -624,10 +683,76 @@ mod tests {
         fs::write(a.join("sub/new"), "n").unwrap();
         fs::write(a.join("sub/clash"), "a").unwrap();
         fs::write(b.join("sub/clash"), "b").unwrap();
-        assert_eq!(mv(&a, &b, OnConflict::Skip).unwrap(), Copied::Skipped);
+        // Skip still merges: new files move, existing ones stay, and so does the source.
+        assert_eq!(mv(&a, &b, OnConflict::Skip).unwrap(), Copied::Done);
+        assert!(b.join("sub/new").exists() && !a.join("sub/new").exists());
+        assert_eq!(fs::read_to_string(b.join("sub/clash")).unwrap(), "b");
+        assert!(a.join("sub/clash").exists(), "skipped file kept at the source");
         assert_eq!(mv(&a, &b, OnConflict::Overwrite).unwrap(), Copied::Done);
         assert_eq!(fs::read_to_string(b.join("sub/clash")).unwrap(), "a");
-        assert!(b.join("sub/new").exists());
         assert!(!a.exists(), "emptied source removed");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn failed_or_cancelled_overwrites_keep_the_old_file() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = tempfile::tempdir().unwrap();
+        let (src, dest) = (tmp.path().join("src"), tmp.path().join("dest"));
+        fs::write(&dest, "old").unwrap();
+        // Unreadable source: the destination is untouched.
+        fs::write(&src, "new").unwrap();
+        fs::set_permissions(&src, fs::Permissions::from_mode(0o000)).unwrap();
+        if fs::read(&src).is_err() {
+            assert!(cp(&src, &dest, OnConflict::Overwrite).is_err());
+            assert_eq!(fs::read_to_string(&dest).unwrap(), "old");
+        }
+        fs::set_permissions(&src, fs::Permissions::from_mode(0o644)).unwrap();
+        // Cancelled mid-file: the old content survives, no scratch file is left.
+        fs::write(&src, vec![1u8; 3 << 20]).unwrap();
+        let r = copy(&src, &dest, OnConflict::Overwrite, &mut 0, 3 << 20, &mut |p| {
+            if p.done >= 1 << 20 {
+                ControlFlow::Break(())
+            } else {
+                ControlFlow::Continue(())
+            }
+        });
+        assert!(r.unwrap_err().is::<Cancelled>());
+        assert_eq!(fs::read_to_string(&dest).unwrap(), "old");
+        assert_eq!(fs::read_dir(tmp.path()).unwrap().count(), 2, "no partial file left");
+        // A read-only destination can still be replaced (it is renamed over).
+        fs::set_permissions(&dest, fs::Permissions::from_mode(0o444)).unwrap();
+        fs::write(&src, "new").unwrap();
+        assert_eq!(cp(&src, &dest, OnConflict::Overwrite).unwrap(), Copied::Done);
+        assert_eq!(fs::read_to_string(&dest).unwrap(), "new");
+    }
+
+    #[test]
+    fn nested_hard_links_are_never_truncated() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (a, b) = (tmp.path().join("a"), tmp.path().join("b"));
+        fs::create_dir_all(&a).unwrap();
+        fs::create_dir_all(&b).unwrap();
+        fs::write(a.join("x"), "precious").unwrap();
+        fs::hard_link(a.join("x"), b.join("x")).unwrap();
+        assert!(cp(&a, &b, OnConflict::Overwrite).is_err());
+        assert_eq!(fs::read_to_string(a.join("x")).unwrap(), "precious");
+    }
+
+    #[test]
+    fn single_file_not_newer_is_reported_skipped() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (src, dest) = (tmp.path().join("src"), tmp.path().join("dest"));
+        fs::write(&src, "older").unwrap();
+        let old = std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1_000_000);
+        fs::File::options()
+            .write(true)
+            .open(&src)
+            .unwrap()
+            .set_modified(old)
+            .unwrap();
+        fs::write(&dest, "newer").unwrap();
+        assert_eq!(cp(&src, &dest, OnConflict::IfNewer).unwrap(), Copied::Skipped);
+        assert_eq!(fs::read_to_string(&dest).unwrap(), "newer");
     }
 }
