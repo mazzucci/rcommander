@@ -23,6 +23,36 @@ pub fn human_size(bytes: u64) -> String {
     }
 }
 
+/// `ls -l` style permission string, e.g. `drwxr-xr-x`, including setuid/setgid/sticky.
+pub fn permissions(mode: u32, is_dir: bool, is_link: bool) -> String {
+    let kind = if is_link {
+        'l'
+    } else if is_dir {
+        'd'
+    } else {
+        '-'
+    };
+    let mut s = String::with_capacity(10);
+    s.push(kind);
+    // (read, write, execute bit, special bit, special char when exec set / unset)
+    let triads = [
+        (0o400, 0o200, 0o100, 0o4000, 's', 'S'),
+        (0o40, 0o20, 0o10, 0o2000, 's', 'S'),
+        (0o4, 0o2, 0o1, 0o1000, 't', 'T'),
+    ];
+    for (r, w, x, special, on, off) in triads {
+        s.push(if mode & r != 0 { 'r' } else { '-' });
+        s.push(if mode & w != 0 { 'w' } else { '-' });
+        s.push(match (mode & x != 0, mode & special != 0) {
+            (true, true) => on,
+            (false, true) => off,
+            (true, false) => 'x',
+            (false, false) => '-',
+        });
+    }
+    s
+}
+
 /// Unix seconds plus a UTC offset → `"2026-10-14 13:05"`.
 pub fn format_time(secs: i64, utc_offset_secs: i64) -> String {
     let t = secs + utc_offset_secs;
@@ -55,6 +85,16 @@ mod tests {
         assert_eq!(human_size(5_000_000), "4.8M");
         assert_eq!(human_size(1024), "1.0K");
         assert_eq!(human_size(10239), "10K");
+    }
+
+    #[test]
+    fn permission_strings() {
+        assert_eq!(permissions(0o755, true, false), "drwxr-xr-x");
+        assert_eq!(permissions(0o644, false, false), "-rw-r--r--");
+        assert_eq!(permissions(0o4755, false, false), "-rwsr-xr-x");
+        assert_eq!(permissions(0o1777, true, false), "drwxrwxrwt");
+        assert_eq!(permissions(0o2640, false, false), "-rw-r-S---");
+        assert_eq!(permissions(0o777, false, true), "lrwxrwxrwx");
     }
 
     #[test]

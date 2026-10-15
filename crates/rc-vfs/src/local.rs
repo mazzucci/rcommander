@@ -8,36 +8,132 @@ use std::path::{Path, PathBuf};
 use std::time::UNIX_EPOCH;
 
 pub fn list(path: &str) -> Result<Listing> {
+    let mut names = owners::Names::default();
     let mut entries = Vec::new();
     for item in fs::read_dir(path).with_context(|| format!("cannot read {path}"))? {
         let Ok(item) = item else { continue };
         let name = item.file_name().to_string_lossy().into_owned();
-        let Ok(meta) = item.metadata() else { continue };
-        let is_link = meta.file_type().is_symlink();
+        let Ok(link_meta) = item.metadata() else { continue };
+        let is_link = link_meta.file_type().is_symlink();
         // For symlinks, describe the target (falls back to the link itself if dangling).
         let meta = if is_link {
-            fs::metadata(item.path()).unwrap_or(meta)
+            fs::metadata(item.path()).unwrap_or_else(|_| link_meta.clone())
         } else {
-            meta
+            link_meta.clone()
         };
-        entries.push(Entry {
+        let secs = |t: std::io::Result<std::time::SystemTime>| {
+            t.ok()
+                .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
+                .map(|d| d.as_secs() as i64)
+        };
+        let mut entry = Entry {
             hidden: name.starts_with('.'),
             is_dir: meta.is_dir(),
             is_link,
             size: (!meta.is_dir()).then_some(meta.len()),
-            modified: meta
-                .modified()
-                .ok()
-                .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
-                .map(|d| d.as_secs() as i64),
+            modified: secs(meta.modified()),
+            created: secs(meta.created()),
+            link_target: is_link
+                .then(|| fs::read_link(item.path()).ok())
+                .flatten()
+                .map(|t| t.to_string_lossy().into_owned()),
             name,
-        });
+            ..Entry::default()
+        };
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            // Permissions and ownership of the link itself, like `ls -l`.
+            entry.mode = Some(link_meta.mode() & 0o7777);
+            entry.owner = Some(names.user(link_meta.uid()));
+            entry.group = Some(names.group(link_meta.gid()));
+        }
+        entries.push(entry);
     }
     Ok(Listing {
         location: Location::local(path),
         entries,
         writable: true,
     })
+}
+
+/// uid/gid → name lookups, cached per listing.
+mod owners {
+    use std::collections::HashMap;
+
+    #[derive(Default)]
+    pub struct Names {
+        users: HashMap<u32, String>,
+        groups: HashMap<u32, String>,
+    }
+
+    #[cfg(unix)]
+    impl Names {
+        pub fn user(&mut self, uid: u32) -> String {
+            self.users
+                .entry(uid)
+                .or_insert_with(|| lookup_user(uid).unwrap_or_else(|| uid.to_string()))
+                .clone()
+        }
+
+        pub fn group(&mut self, gid: u32) -> String {
+            self.groups
+                .entry(gid)
+                .or_insert_with(|| lookup_group(gid).unwrap_or_else(|| gid.to_string()))
+                .clone()
+        }
+    }
+
+    /// Call a reentrant `get*_r` function, growing the buffer on ERANGE.
+    #[cfg(unix)]
+    fn with_buffer(mut call: impl FnMut(&mut [libc::c_char]) -> libc::c_int) -> Option<()> {
+        let mut size = 1024;
+        loop {
+            let mut buf = vec![0 as libc::c_char; size];
+            match call(&mut buf) {
+                0 => return Some(()),
+                libc::ERANGE if size < 1 << 20 => size *= 4,
+                _ => return None,
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    fn lookup_user(uid: u32) -> Option<String> {
+        let mut name = None;
+        with_buffer(|buf| {
+            // SAFETY: all pointers are valid for the duration of the call; the result
+            // points into `buf` and is copied out before `buf` is dropped.
+            unsafe {
+                let mut pwd: libc::passwd = std::mem::zeroed();
+                let mut result = std::ptr::null_mut();
+                let rc = libc::getpwuid_r(uid, &mut pwd, buf.as_mut_ptr(), buf.len(), &mut result);
+                if rc == 0 && !result.is_null() {
+                    name = Some(std::ffi::CStr::from_ptr(pwd.pw_name).to_string_lossy().into_owned());
+                }
+                rc
+            }
+        })?;
+        name
+    }
+
+    #[cfg(unix)]
+    fn lookup_group(gid: u32) -> Option<String> {
+        let mut name = None;
+        with_buffer(|buf| {
+            // SAFETY: as in `lookup_user`.
+            unsafe {
+                let mut grp: libc::group = std::mem::zeroed();
+                let mut result = std::ptr::null_mut();
+                let rc = libc::getgrgid_r(gid, &mut grp, buf.as_mut_ptr(), buf.len(), &mut result);
+                if rc == 0 && !result.is_null() {
+                    name = Some(std::ffi::CStr::from_ptr(grp.gr_name).to_string_lossy().into_owned());
+                }
+                rc
+            }
+        })?;
+        name
+    }
 }
 
 pub fn read(path: &str, limit: u64) -> Result<(Vec<u8>, u64)> {
@@ -282,6 +378,24 @@ mod tests {
         );
         remove(&link).unwrap();
         assert!(target.join("f").exists(), "deleting a link must not delete its target");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn lists_unix_metadata() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = tempfile::tempdir().unwrap();
+        let f = tmp.path().join("run.sh");
+        fs::write(&f, "#!/bin/sh").unwrap();
+        fs::set_permissions(&f, fs::Permissions::from_mode(0o750)).unwrap();
+        std::os::unix::fs::symlink("run.sh", tmp.path().join("link")).unwrap();
+        let listing = list(tmp.path().to_str().unwrap()).unwrap();
+        let get = |n: &str| listing.entries.iter().find(|e| e.name == n).unwrap();
+        assert_eq!(get("run.sh").mode, Some(0o750));
+        assert!(get("run.sh").owner.as_deref().is_some_and(|o| !o.is_empty()));
+        assert!(get("run.sh").group.is_some());
+        assert_eq!(get("link").link_target.as_deref(), Some("run.sh"));
+        assert!(get("link").is_link);
     }
 
     #[test]

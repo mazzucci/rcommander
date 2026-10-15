@@ -34,21 +34,14 @@ fn event_loop(terminal: &mut DefaultTerminal, app: &mut App) -> Result<()> {
             Event::Key(key) if key.kind == KeyEventKind::Press => match app.handle_key(key) {
                 Effect::None => {}
                 Effect::Quit => return Ok(()),
-                Effect::Edit(path) => {
+                Effect::Edit { path, editor } => {
                     ratatui::restore();
-                    let editor = std::env::var("VISUAL")
-                        .or_else(|_| std::env::var("EDITOR"))
-                        .unwrap_or("vi".into());
-                    // Allow editors with arguments, e.g. EDITOR="code --wait".
-                    let mut parts = editor.split_whitespace();
-                    let status = std::process::Command::new(parts.next().unwrap_or("vi"))
-                        .args(parts)
-                        .arg(&path)
-                        .status();
+                    let editor = editor_command(&editor);
+                    let status = run_editor(&editor, &path);
                     // A fresh alternate screen is blank and the next draw repaints everything.
                     *terminal = ratatui::init();
                     if let Err(e) = status {
-                        app.message = Some((format!("cannot run {editor}: {e}"), true));
+                        app.message = Some((format!("cannot run `{editor}`: {e}"), true));
                     }
                     app.refresh(0);
                     app.refresh(1);
@@ -56,5 +49,35 @@ fn event_loop(terminal: &mut DefaultTerminal, app: &mut App) -> Result<()> {
             },
             _ => {}
         }
+    }
+}
+
+/// The configured editor, else `$VISUAL`, `$EDITOR`, `vi`.
+fn editor_command(configured: &str) -> String {
+    [
+        configured.to_string(),
+        std::env::var("VISUAL").unwrap_or_default(),
+        std::env::var("EDITOR").unwrap_or_default(),
+    ]
+    .into_iter()
+    .find(|e| !e.trim().is_empty())
+    .unwrap_or_else(|| "vi".into())
+}
+
+/// Run an editor command line such as `code --wait` on `path` and wait for it.
+fn run_editor(editor: &str, path: &str) -> std::io::Result<std::process::ExitStatus> {
+    let mut parts = editor.split_whitespace();
+    let program = parts.next().unwrap_or("vi");
+    std::process::Command::new(program).args(parts).arg(path).status()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn configured_editor_wins() {
+        assert_eq!(editor_command("nano -w"), "nano -w");
+        assert!(!editor_command("  ").is_empty());
     }
 }

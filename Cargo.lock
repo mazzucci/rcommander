@@ -2374,11 +2374,13 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "dirs",
+ "libc",
  "open",
  "rc-core",
  "serde",
  "serde_json",
  "tempfile",
+ "toml",
  "trash",
 ]
 

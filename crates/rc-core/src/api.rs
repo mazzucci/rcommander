@@ -1,7 +1,7 @@
 //! Request/response types of the HTTP API between the web front end and `rcmd web`.
 //! All endpoints are `POST /api/<name>` with JSON bodies; errors are `{"error": "..."}`.
 
-use crate::{DiffResult, Location};
+use crate::{DiffResult, Location, Settings};
 use serde::{Deserialize, Serialize};
 
 /// `POST /api/init` → initial panel locations.
@@ -10,6 +10,8 @@ pub struct InitResponse {
     pub left: Location,
     pub right: Location,
     pub home: String,
+    #[serde(default)]
+    pub settings: Settings,
 }
 
 /// `POST /api/list` → [`crate::Listing`].
@@ -114,7 +116,11 @@ impl OpResult {
     }
 }
 
+/// `POST /api/settings` with a [`Settings`] body saves them and returns the saved value.
+///
 /// `POST /api/open` → `{}`. Opens a local file with the system default application.
+/// `POST /api/edit` → `{}`. Same body; opens it in the configured editor (or, without
+/// one, the system default application).
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct OpenRequest {
     pub location: Location,

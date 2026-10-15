@@ -5,6 +5,7 @@ mod app;
 mod diff_view;
 mod dom;
 mod modal;
+mod options;
 mod panel_view;
 mod viewer;
 

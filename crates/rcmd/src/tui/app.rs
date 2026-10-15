@@ -5,8 +5,9 @@ use super::views::{DiffView, Viewer};
 use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use rc_core::api::{FileOp, OpResult};
 use rc_core::panel::SortKey;
-use rc_core::{Location, Panel, Row, dircmp};
+use rc_core::{Column, Location, Panel, Row, Settings, dircmp};
 use rc_vfs::Vfs;
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::mpsc::{self, Receiver, TryRecvError};
 
@@ -22,7 +23,20 @@ pub enum Mode {
     Viewer(Viewer),
     Diff(DiffView),
     Help,
+    Options(Options),
 }
+
+/// The options dialog: one row per optional column, then "show hidden", then the editor.
+pub struct Options {
+    pub cursor: usize,
+    /// Text being typed into the editor field, if it is being edited.
+    pub editing: Option<String>,
+    /// Settings when the dialog opened, restored on Esc.
+    original: Settings,
+}
+
+pub const HIDDEN_ROW: usize = Column::ALL.len();
+pub const EDITOR_ROW: usize = Column::ALL.len() + 1;
 
 pub struct Prompt {
     pub title: String,
@@ -56,8 +70,11 @@ pub enum ConfirmAction {
 pub enum Effect {
     None,
     Quit,
-    /// Suspend the TUI and run `$EDITOR` on this path.
-    Edit(String),
+    /// Suspend the TUI and edit `path` with `editor` (empty: `$VISUAL`/`$EDITOR`).
+    Edit {
+        path: String,
+        editor: String,
+    },
 }
 
 /// A file operation running on a worker thread.
@@ -83,21 +100,41 @@ pub struct App {
     pub job: Option<Job>,
     /// Rows that fit in a panel, updated by the renderer; used for PageUp/PageDown.
     pub page: usize,
+    pub settings: Settings,
+    /// Where settings are saved; `None` keeps them in memory (tests).
+    settings_path: Option<PathBuf>,
 }
 
 impl App {
+    #[cfg(test)]
     pub fn new(vfs: Arc<Vfs>, left: Location, right: Location) -> Self {
+        Self::with_settings(vfs, left, right, Settings::default(), None)
+    }
+
+    pub fn with_settings(
+        vfs: Arc<Vfs>,
+        left: Location,
+        right: Location,
+        settings: Settings,
+        settings_path: Option<PathBuf>,
+    ) -> Self {
         let left = vfs.normalize(left, None);
         let right = vfs.normalize(right, None);
+        let mut panels = [Panel::new(left.clone()), Panel::new(right.clone())];
+        for p in &mut panels {
+            p.show_hidden = settings.show_hidden;
+        }
         let mut app = App {
             vfs,
-            panels: [Panel::new(left.clone()), Panel::new(right.clone())],
+            panels,
             scroll: [0, 0],
             active: LEFT,
             mode: Mode::Normal,
             message: None,
             job: None,
             page: 20,
+            settings,
+            settings_path,
         };
         app.load(LEFT, left, None);
         app.load(RIGHT, right, None);
@@ -413,6 +450,7 @@ impl App {
             Mode::Normal if ctrl_c => return self.request_quit(),
             Mode::Normal => return self.normal_key(key),
             // Ctrl+C backs out of whatever is open.
+            Mode::Options(o) if ctrl_c => self.revert_options(o),
             _ if ctrl_c => {}
             Mode::Help => {}
             Mode::Filter => return self.filter_key(key),
@@ -433,8 +471,70 @@ impl App {
                     self.mode = Mode::Diff(d);
                 }
             }
+            Mode::Options(o) => self.options_key(o, key),
         }
         Effect::None
+    }
+
+    fn options_key(&mut self, mut o: Options, key: KeyEvent) {
+        if let Some(text) = &mut o.editing {
+            match key.code {
+                KeyCode::Enter => {
+                    self.settings.editor = text.trim().to_string();
+                    o.editing = None;
+                }
+                KeyCode::Esc => o.editing = None,
+                KeyCode::Backspace => drop(text.pop()),
+                KeyCode::Char(c) if !has_command_modifier(key) => text.push(c),
+                _ => {}
+            }
+            self.mode = Mode::Options(o);
+            return;
+        }
+        // Same model as the browser dialog: changes preview live, Enter saves, Esc reverts.
+        match key.code {
+            KeyCode::Esc => return self.revert_options(o),
+            KeyCode::Enter if o.cursor != EDITOR_ROW => {
+                if self.settings != o.original {
+                    self.save_settings();
+                }
+                return;
+            }
+            KeyCode::Up => o.cursor = o.cursor.saturating_sub(1),
+            KeyCode::Down => o.cursor = (o.cursor + 1).min(EDITOR_ROW),
+            KeyCode::Char(' ') | KeyCode::Enter => match o.cursor {
+                EDITOR_ROW => o.editing = Some(self.settings.editor.clone()),
+                HIDDEN_ROW => {
+                    self.settings.show_hidden = !self.settings.show_hidden;
+                    // Apply right away so the effect is visible.
+                    for p in &mut self.panels {
+                        if p.show_hidden != self.settings.show_hidden {
+                            p.toggle_hidden();
+                        }
+                    }
+                }
+                i => self.settings.toggle_column(Column::ALL[i]),
+            },
+            _ => {}
+        }
+        self.mode = Mode::Options(o);
+    }
+
+    fn revert_options(&mut self, o: Options) {
+        self.settings = o.original;
+        for p in &mut self.panels {
+            if p.show_hidden != self.settings.show_hidden {
+                p.toggle_hidden();
+            }
+        }
+    }
+
+    fn save_settings(&mut self) {
+        let Some(path) = &self.settings_path else { return };
+        match rc_vfs::settings::save_to(path, &self.settings) {
+            Ok(()) => self.info(format!("Options saved to {}", path.display())),
+            Err(e) => self.error(format!("{e:#}")),
+        }
     }
 
     fn confirm(&mut self, action: ConfirmAction) -> Effect {
@@ -553,13 +653,21 @@ impl App {
             KeyCode::Char('g') => self.start_goto(),
             KeyCode::Char('l') if ctrl => self.start_goto(),
             KeyCode::F(1) | KeyCode::Char('?') => self.mode = Mode::Help,
+            KeyCode::Char('o') => {
+                self.mode = Mode::Options(Options {
+                    cursor: 0,
+                    editing: None,
+                    original: self.settings.clone(),
+                })
+            }
             KeyCode::F(2) => self.diff(),
             KeyCode::F(3) => self.view(),
             KeyCode::F(4) => {
                 let p = self.active_panel();
                 if let Some(e) = p.current().filter(|e| !e.is_dir) {
                     let Location::Local { path } = p.location.join(&e.name);
-                    return Effect::Edit(path);
+                    let editor = self.settings.editor.clone();
+                    return Effect::Edit { path, editor };
                 }
             }
             KeyCode::F(5) => self.start_copy_move(false),
@@ -790,6 +898,53 @@ mod tests {
         assert!(app.panels[LEFT].filter.is_empty() && !app.panels[LEFT].selected.is_empty());
         app.handle_key(key(KeyCode::Esc));
         assert!(app.panels[LEFT].selected.is_empty());
+    }
+
+    #[test]
+    fn options_toggle_columns_hidden_and_editor_and_save() {
+        let (tmp, mut app) = setup();
+        let cfg = tmp.path().join("cfg/settings.toml");
+        app.settings_path = Some(cfg.clone());
+        app.handle_key(key(KeyCode::Char('o')));
+        // Row 4 is Permissions.
+        for _ in 0..4 {
+            app.handle_key(key(KeyCode::Down));
+        }
+        app.handle_key(key(KeyCode::Char(' ')));
+        assert!(app.settings.shows(Column::Permissions));
+        // Hidden files row applies immediately.
+        app.panels[LEFT].show_hidden = true;
+        for _ in 0..3 {
+            app.handle_key(key(KeyCode::Down));
+        }
+        app.handle_key(key(KeyCode::Char(' ')));
+        assert!(!app.settings.show_hidden && !app.panels[LEFT].show_hidden);
+        // Editor row: typing '1' is text, not a function key.
+        app.handle_key(key(KeyCode::Down));
+        app.handle_key(key(KeyCode::Char(' ')));
+        typed(&mut app, "nano1");
+        app.handle_key(key(KeyCode::Enter));
+        assert_eq!(app.settings.editor, "nano1");
+        app.handle_key(key(KeyCode::Up));
+        app.handle_key(key(KeyCode::Enter));
+        assert!(matches!(app.mode, Mode::Normal));
+        assert_eq!(rc_vfs::settings::load_from(&cfg).unwrap(), app.settings);
+
+        // Esc reverts whatever changed since the dialog opened, including hidden files.
+        app.handle_key(key(KeyCode::Char('o')));
+        for _ in 0..HIDDEN_ROW {
+            app.handle_key(key(KeyCode::Down));
+        }
+        app.handle_key(key(KeyCode::Char(' ')));
+        assert!(app.panels[LEFT].show_hidden);
+        app.handle_key(key(KeyCode::Esc));
+        assert!(!app.settings.show_hidden && !app.panels[LEFT].show_hidden);
+
+        app.panels[LEFT].focus_name("a.txt");
+        let Effect::Edit { editor, .. } = app.handle_key(key(KeyCode::F(4))) else {
+            panic!("expected edit")
+        };
+        assert_eq!(editor, "nano1");
     }
 
     #[test]

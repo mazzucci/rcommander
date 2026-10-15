@@ -61,7 +61,9 @@ fn main() -> anyhow::Result<()> {
     match cli.command {
         None => {
             let (left, right) = cli.dirs.locations();
-            tui::run(tui::App::new(vfs, left, right))
+            let settings = rc_vfs::settings::load()?;
+            let path = rc_vfs::settings::path();
+            tui::run(tui::App::with_settings(vfs, left, right, settings, Some(path)))
         }
         Some(Command::Web {
             dirs,
@@ -70,6 +72,8 @@ fn main() -> anyhow::Result<()> {
             browser,
         }) => {
             let (left, right) = dirs.locations();
+            let settings = rc_vfs::settings::load()?;
+            let settings_path = Some(rc_vfs::settings::path());
             server::run(
                 vfs,
                 server::Config {
@@ -78,6 +82,8 @@ fn main() -> anyhow::Result<()> {
                     browser,
                     left,
                     right,
+                    settings,
+                    settings_path,
                 },
             )
         }
