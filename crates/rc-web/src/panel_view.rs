@@ -104,7 +104,6 @@ pub fn PanelView(app: App, side: usize) -> impl IntoView {
             .map(|&c| {
                 let text = match &entry {
                     Some(e) => c.text(e, utc_offset),
-                    None if c == Column::Size => "<UP>".into(),
                     None => String::new(),
                 };
                 view! { <span class=cell_class(c)>{text}</span> }

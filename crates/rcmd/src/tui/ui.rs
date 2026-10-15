@@ -129,10 +129,12 @@ fn mark_color(m: CmpMark) -> Color {
 fn panel_status(p: &Panel, settings: &Settings) -> String {
     let (n, size) = p.selection_summary();
     let visible = p.rows().iter().filter(|r| matches!(r, Row::Entry(_))).count();
-    let mut s = if n == 0 {
-        format!(" {visible} items ")
-    } else {
-        format!(" {n} of {visible} selected · {} ", human_size(size))
+    let plural = |n: usize, word: &str| format!("{n} {word}{}", if n == 1 { "" } else { "s" });
+    let mut s = match (n, size) {
+        (0, _) => format!(" {} ", plural(visible, "item")),
+        // Only directories selected: their size is unknown, so don't print "0".
+        (n, 0) => format!(" {n} of {visible} selected "),
+        (n, size) => format!(" {n} of {visible} selected · {} ", human_size(size)),
     };
     if p.sort != SortKey::Name || p.sort_desc {
         s += &format!("· {} {} ", p.sort.label(), if p.sort_desc { "↓" } else { "↑" });
@@ -338,8 +340,8 @@ fn draw_keys(f: &mut Frame, area: Rect, mode: &Mode) {
 fn draw_viewer(f: &mut Frame, area: Rect, v: &mut Viewer) {
     let block = Block::bordered()
         .border_type(BorderType::Rounded)
-        .title(v.title.as_str())
-        .cyan();
+        .border_style(Style::new().fg(ACCENT))
+        .title(Line::raw(format!(" {} ", v.title)).fg(TEXT).bold());
     let inner = block.inner(area);
     f.render_widget(block, area);
     v.page = inner.height as usize;
@@ -377,9 +379,9 @@ fn draw_diff(f: &mut Frame, area: Rect, d: &mut DiffView) {
     };
     let block = Block::bordered()
         .border_type(BorderType::Rounded)
-        .title(Line::raw(" Diff ").bold())
-        .title(Line::raw(format!(" {summary} ")).right_aligned())
-        .cyan();
+        .border_style(Style::new().fg(ACCENT))
+        .title(Line::raw(" Diff ").fg(TEXT).bold())
+        .title(Line::raw(format!(" {summary} ")).fg(DIM).right_aligned());
     let inner = block.inner(area);
     f.render_widget(block, area);
 
@@ -490,7 +492,7 @@ fn side_line<'a>(
 
 fn draw_options(f: &mut Frame, area: Rect, o: &Options, settings: &Settings) {
     let check = |on: bool| if on { "[x]" } else { "[ ]" };
-    let mut lines = vec![Line::raw(" Columns").cyan().bold()];
+    let mut lines = vec![Line::raw(" Columns").fg(ACCENT).bold()];
     let mut row = |i: usize, text: String| {
         let line = Line::raw(format!("  {text}"));
         lines.push(if i == o.cursor {
@@ -524,8 +526,8 @@ fn draw_options(f: &mut Frame, area: Rect, o: &Options, settings: &Settings) {
         Paragraph::new(lines).block(
             Block::bordered()
                 .border_type(BorderType::Rounded)
-                .title(" Options ")
-                .cyan(),
+                .border_style(Style::new().fg(ACCENT))
+                .title(Line::raw(" Options ").fg(TEXT).bold()),
         ),
         area,
     );
@@ -558,7 +560,7 @@ fn draw_help(f: &mut Frame, area: Rect) {
         .iter()
         .map(|(k, v)| {
             Line::from(vec![
-                Span::raw(format!(" {k:<22}")).cyan().bold(),
+                Span::raw(format!(" {k:<22}")).fg(ACCENT).bold(),
                 Span::raw(*v).white(),
             ])
         })
@@ -569,8 +571,8 @@ fn draw_help(f: &mut Frame, area: Rect) {
         Paragraph::new(lines).block(
             Block::bordered()
                 .border_type(BorderType::Rounded)
-                .title(" Keys ")
-                .cyan(),
+                .border_style(Style::new().fg(ACCENT))
+                .title(Line::raw(" Keys ").fg(TEXT).bold()),
         ),
         area,
     );

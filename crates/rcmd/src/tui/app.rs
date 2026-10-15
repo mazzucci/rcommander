@@ -286,7 +286,7 @@ impl App {
             return;
         }
         let verb = if is_move { "Move/rename" } else { "Copy" };
-        let title = format!("{verb} {} to:", Self::describe(&targets));
+        let title = format!("{verb} {} to", Self::describe(&targets));
         let dest = self.panels[self.other()].location.to_string();
         let action = if is_move {
             PromptAction::Move(targets)
@@ -298,7 +298,7 @@ impl App {
 
     fn start_goto(&mut self) {
         let current = self.active_panel().location.to_string();
-        self.prompt("Go to:".into(), current, PromptAction::GoTo);
+        self.prompt("Go to".into(), current, PromptAction::GoTo);
     }
 
     fn start_delete(&mut self, permanent: bool) {
@@ -698,12 +698,12 @@ impl App {
             KeyCode::Tab | KeyCode::BackTab => self.active = self.other(),
             KeyCode::Char(' ') | KeyCode::Insert => self.active_mut().toggle_current(),
             KeyCode::Char('+') => self.prompt(
-                "Select files matching:".into(),
+                "Select files matching".into(),
                 "*".into(),
                 PromptAction::SelectMask { select: true },
             ),
             KeyCode::Char('-') => self.prompt(
-                "Deselect files matching:".into(),
+                "Deselect files matching".into(),
                 "*".into(),
                 PromptAction::SelectMask { select: false },
             ),
@@ -752,7 +752,7 @@ impl App {
             }
             KeyCode::F(5) => self.start_copy_move(false),
             KeyCode::F(6) => self.start_copy_move(true),
-            KeyCode::F(7) => self.prompt("New directory:".into(), String::new(), PromptAction::Mkdir),
+            KeyCode::F(7) => self.prompt("New directory".into(), String::new(), PromptAction::Mkdir),
             KeyCode::F(8) | KeyCode::Delete => self.start_delete(shift),
             KeyCode::F(9) => self.compare_dirs(),
             _ => {}
