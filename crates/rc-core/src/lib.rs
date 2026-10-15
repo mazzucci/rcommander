@@ -11,7 +11,7 @@ pub mod panel;
 pub mod settings;
 
 pub use diff::{DiffResult, diff_text};
-pub use entry::{Entry, Listing};
+pub use entry::{Entry, GitStatus, Listing};
 pub use location::Location;
 pub use panel::{Panel, Row, SortKey};
 pub use settings::{Column, Settings};

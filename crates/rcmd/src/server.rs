@@ -189,6 +189,7 @@ fn router(state: AppState, port: u16) -> Router {
         .route("/list", post(list))
         .route("/read", post(read))
         .route("/diff", post(diff))
+        .route("/diff_head", post(diff_head))
         .route("/op", post(op))
         .route("/open", post(open_external))
         .route("/edit", post(edit_external))
@@ -297,7 +298,15 @@ async fn edit_external(State(s): State<AppState>, Json(req): Json<OpenRequest>) 
 }
 
 async fn list(State(s): State<AppState>, Json(req): Json<ListRequest>) -> Response {
-    blocking(move || s.vfs.list(&s.vfs.normalize(req.location, None))).await
+    blocking(move || {
+        let loc = s.vfs.normalize(req.location, None);
+        if s.settings.read().expect("settings lock").shows(rc_core::Column::Git) {
+            s.vfs.list_with_git(&loc)
+        } else {
+            s.vfs.list(&loc)
+        }
+    })
+    .await
 }
 
 async fn read(State(s): State<AppState>, Json(req): Json<ReadRequest>) -> Response {
@@ -311,6 +320,10 @@ async fn diff(State(s): State<AppState>, Json(req): Json<DiffRequest>) -> Respon
         s.vfs.diff(left.as_ref(), right.as_ref())
     })
     .await
+}
+
+async fn diff_head(State(s): State<AppState>, Json(req): Json<ReadRequest>) -> Response {
+    blocking(move || s.vfs.diff_head(&s.vfs.normalize(req.location, None))).await
 }
 
 async fn op(State(s): State<AppState>, Json(op): Json<FileOp>) -> Response {

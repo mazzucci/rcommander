@@ -25,6 +25,44 @@ pub struct Entry {
     /// Where a symlink points.
     #[serde(default)]
     pub link_target: Option<String>,
+    /// Git working-tree status, when the directory is inside a repository.
+    #[serde(default)]
+    pub git: Option<GitStatus>,
+}
+
+/// Ordered by significance, so a directory shows the strongest status inside it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum GitStatus {
+    Untracked,
+    Modified,
+    Renamed,
+    Added,
+    Deleted,
+    Conflicted,
+}
+
+impl GitStatus {
+    pub fn letter(self) -> char {
+        match self {
+            GitStatus::Untracked => '?',
+            GitStatus::Modified => 'M',
+            GitStatus::Renamed => 'R',
+            GitStatus::Added => 'A',
+            GitStatus::Deleted => 'D',
+            GitStatus::Conflicted => 'U',
+        }
+    }
+
+    /// Shared palette: hex for the browser, 256-color index for terminals.
+    pub fn color(self) -> (&'static str, u8) {
+        match self {
+            GitStatus::Untracked => ("#8b949e", 245),
+            GitStatus::Modified => ("#d29922", 178),
+            GitStatus::Renamed | GitStatus::Added => ("#3fb950", 71),
+            GitStatus::Deleted | GitStatus::Conflicted => ("#f85149", 203),
+        }
+    }
 }
 
 impl Entry {

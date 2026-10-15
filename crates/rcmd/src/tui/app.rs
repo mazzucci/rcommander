@@ -187,7 +187,12 @@ impl App {
 
     /// List `loc` into panel `side`. On failure the panel stays where it was.
     fn load(&mut self, side: usize, loc: Location, focus: Option<&str>) -> bool {
-        match self.vfs.list(&loc) {
+        let listed = if self.settings.shows(Column::Git) {
+            self.vfs.list_with_git(&loc)
+        } else {
+            self.vfs.list(&loc)
+        };
+        match listed {
             Ok(listing) => {
                 if listing.location != self.panels[side].location {
                     self.scroll[side] = 0;
@@ -254,13 +259,44 @@ impl App {
         }
     }
 
+    /// F2: diff the two files `diff_targets` picks. When the other panel has no such file,
+    /// fall back to the file's committed version, as Shift+F2 does explicitly.
     fn diff(&mut self) {
         let Some((left, right)) = rc_core::diff_targets(&self.panels[LEFT], &self.panels[RIGHT], self.active == LEFT)
         else {
             self.error("Diff: put the cursor on a file (or select two files)");
             return;
         };
+        let exists = |l: &Location| {
+            let Location::Local { path } = l;
+            std::path::Path::new(path).exists()
+        };
+        if !exists(&left) || !exists(&right) {
+            // No counterpart in the other panel: compare with git, explaining both if that fails.
+            let p = self.active_panel();
+            let Some(e) = p.current().filter(|e| !e.is_dir) else {
+                return;
+            };
+            match self.vfs.diff_head(&p.location.join(&e.name)) {
+                Ok(resp) => self.mode = Mode::Diff(DiffView::new(resp)),
+                Err(err) => self.error(format!("No {} in the other panel to compare with ({err:#})", e.name)),
+            }
+            return;
+        }
         match self.vfs.diff(Some(&left), Some(&right)) {
+            Ok(resp) => self.mode = Mode::Diff(DiffView::new(resp)),
+            Err(e) => self.error(format!("{e:#}")),
+        }
+    }
+
+    /// Shift+F2: diff the file under the cursor against git HEAD.
+    fn diff_head(&mut self) {
+        let p = self.active_panel();
+        let Some(e) = p.current().filter(|e| !e.is_dir) else {
+            self.error("Diff against HEAD: put the cursor on a file");
+            return;
+        };
+        match self.vfs.diff_head(&p.location.join(&e.name)) {
             Ok(resp) => self.mode = Mode::Diff(DiffView::new(resp)),
             Err(e) => self.error(format!("{e:#}")),
         }
@@ -830,6 +866,7 @@ impl App {
                     original: self.settings.clone(),
                 })
             }
+            KeyCode::F(2) if shift => self.diff_head(),
             KeyCode::F(2) => self.diff(),
             KeyCode::F(3) => self.view(),
             KeyCode::F(4) => {
@@ -1077,15 +1114,15 @@ mod tests {
         let cfg = tmp.path().join("cfg/settings.toml");
         app.settings_path = Some(cfg.clone());
         app.handle_key(key(KeyCode::Char('o')));
-        // Row 4 is Permissions.
-        for _ in 0..4 {
+        let perms = Column::ALL.iter().position(|c| *c == Column::Permissions).unwrap();
+        for _ in 0..perms {
             app.handle_key(key(KeyCode::Down));
         }
         app.handle_key(key(KeyCode::Char(' ')));
         assert!(app.settings.shows(Column::Permissions));
         // Hidden files row applies immediately.
         app.panels[LEFT].show_hidden = true;
-        for _ in 0..3 {
+        for _ in perms..HIDDEN_ROW {
             app.handle_key(key(KeyCode::Down));
         }
         app.handle_key(key(KeyCode::Char(' ')));
@@ -1200,6 +1237,43 @@ mod tests {
         app.panels[LEFT].focus_name("sub");
         app.handle_key(key(KeyCode::Enter));
         assert!(app.flash[LEFT].is_empty());
+    }
+
+    #[test]
+    fn f2_falls_back_to_git_head() {
+        let (tmp, mut app) = setup();
+        let left = tmp.path().join("left");
+        let git = |args: &[&str]| {
+            std::process::Command::new("git")
+                .arg("-C")
+                .arg(&left)
+                .args(args)
+                .output()
+        };
+        if git(&["init", "-q"]).is_err() {
+            return; // no git here
+        }
+        git(&["-c", "user.name=t", "-c", "user.email=t@e", "add", "."]).unwrap();
+        git(&["-c", "user.name=t", "-c", "user.email=t@e", "commit", "-qm", "x"]).unwrap();
+        fs::write(left.join("b.txt"), "changed\n").unwrap();
+        app.refresh(LEFT);
+        assert_eq!(
+            app.panels[LEFT]
+                .entries()
+                .iter()
+                .find(|e| e.name == "b.txt")
+                .unwrap()
+                .git,
+            Some(rc_core::GitStatus::Modified)
+        );
+        // The right panel has no b.txt, so F2 compares with HEAD.
+        app.panels[LEFT].focus_name("b.txt");
+        app.panels[RIGHT].focus_name("..");
+        app.handle_key(key(KeyCode::F(2)));
+        let Mode::Diff(d) = &app.mode else {
+            panic!("expected diff, got message {:?}", app.message)
+        };
+        assert_eq!(d.response.left_title, "HEAD:b.txt");
     }
 
     #[test]

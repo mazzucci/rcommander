@@ -9,6 +9,7 @@ use serde::{Deserialize, Serialize};
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Column {
+    Git,
     Ext,
     Size,
     Modified,
@@ -20,7 +21,8 @@ pub enum Column {
 
 impl Column {
     /// Every column, in display order.
-    pub const ALL: [Column; 7] = [
+    pub const ALL: [Column; 8] = [
+        Column::Git,
         Column::Ext,
         Column::Size,
         Column::Modified,
@@ -41,6 +43,7 @@ impl Column {
     /// Full name, for the options dialog.
     pub fn label(self) -> &'static str {
         match self {
+            Column::Git => "Git",
             Column::Ext => "Ext",
             Column::Size => "Size",
             Column::Modified => "Modified",
@@ -54,6 +57,7 @@ impl Column {
     /// Width in characters (terminal) or a hint for the browser.
     pub fn width(self) -> u16 {
         match self {
+            Column::Git => 3,
             Column::Ext => 8,
             Column::Size => 7,
             Column::Modified | Column::Created => 16,
@@ -70,6 +74,7 @@ impl Column {
     /// The settings-file name of a column.
     pub fn name(self) -> &'static str {
         match self {
+            Column::Git => "git",
             Column::Ext => "ext",
             Column::Size => "size",
             Column::Modified => "modified",
@@ -83,10 +88,11 @@ impl Column {
     /// When a panel is too narrow, columns are hidden in this order (highest first).
     fn drop_priority(self) -> u8 {
         match self {
-            Column::Created => 6,
-            Column::Group => 5,
-            Column::Owner => 4,
-            Column::Ext => 3,
+            Column::Created => 7,
+            Column::Group => 6,
+            Column::Owner => 5,
+            Column::Ext => 4,
+            Column::Git => 3,
             Column::Modified => 2,
             Column::Permissions => 1,
             Column::Size => 0,
@@ -103,7 +109,7 @@ impl Column {
             Column::Ext => Some(SortKey::Ext),
             Column::Size => Some(SortKey::Size),
             Column::Modified => Some(SortKey::Modified),
-            Column::Created | Column::Permissions | Column::Owner | Column::Group => None,
+            Column::Git | Column::Created | Column::Permissions | Column::Owner | Column::Group => None,
         }
     }
 
@@ -111,6 +117,7 @@ impl Column {
     pub fn text(self, e: &Entry, utc_offset: impl Fn(i64) -> i64) -> String {
         let time = |t: Option<i64>| t.map(|t| format_time(t, utc_offset(t))).unwrap_or_default();
         match self {
+            Column::Git => e.git.map(|g| g.letter().to_string()).unwrap_or_default(),
             Column::Ext => e.extension().to_string(),
             Column::Size if e.is_dir => "—".to_string(),
             Column::Size => e.size.map(human_size).unwrap_or_default(),
@@ -156,7 +163,7 @@ fn lenient_columns<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Vec<Column>
 impl Default for Settings {
     fn default() -> Self {
         Settings {
-            columns: vec![Column::Size, Column::Modified],
+            columns: vec![Column::Git, Column::Size, Column::Modified],
             show_hidden: true,
             editor: String::new(),
             gui_editor: String::new(),
@@ -230,7 +237,13 @@ mod tests {
         s.toggle_column(Column::Ext);
         assert_eq!(
             s.visible_columns().collect::<Vec<_>>(),
-            [Column::Ext, Column::Size, Column::Modified, Column::Permissions]
+            [
+                Column::Git,
+                Column::Ext,
+                Column::Size,
+                Column::Modified,
+                Column::Permissions
+            ]
         );
         s.toggle_column(Column::Size);
         assert!(!s.shows(Column::Size));

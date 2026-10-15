@@ -33,6 +33,7 @@ fn utc_offset(secs: i64) -> i64 {
 /// CSS class of a column's cells and header.
 fn column_class(c: Column) -> &'static str {
     match c {
+        Column::Git => "c-git",
         Column::Ext => "c-ext",
         Column::Size => "c-size",
         Column::Modified => "c-modified",
@@ -106,7 +107,12 @@ pub fn PanelView(app: App, side: usize) -> impl IntoView {
                     Some(e) => c.text(e, utc_offset),
                     None => String::new(),
                 };
-                view! { <span class=cell_class(c)>{text}</span> }
+                // Git status letters use the shared palette.
+                let color = match (c, entry.as_ref().and_then(|e| e.git)) {
+                    (Column::Git, Some(g)) => format!("color:{};font-weight:600", g.color().0),
+                    _ => String::new(),
+                };
+                view! { <span class=cell_class(c) style=color>{text}</span> }
             })
             .collect_view();
         view! {

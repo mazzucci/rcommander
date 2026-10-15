@@ -2,6 +2,7 @@
 //! Everything is blocking; the web server wraps calls in `spawn_blocking`.
 //! New sources (archives, SFTP, GitHub) plug in by matching on new `Location` variants.
 
+pub mod git;
 pub mod local;
 pub mod settings;
 pub mod watch;
@@ -75,6 +76,18 @@ impl Vfs {
         }
     }
 
+    /// `list` plus each entry's git status, for when the Git column is shown (it costs
+    /// two git processes per listing).
+    pub fn list_with_git(&self, loc: &Location) -> Result<Listing> {
+        let mut listing = self.list(loc)?;
+        let Location::Local { path } = &listing.location;
+        let status = git::statuses(Path::new(path));
+        for e in &mut listing.entries {
+            e.git = status.get(&e.name).copied();
+        }
+        Ok(listing)
+    }
+
     /// Read up to `limit` bytes. Returns the bytes and the full size (if known).
     pub fn read(&self, loc: &Location, limit: u64) -> Result<(Vec<u8>, Option<u64>)> {
         match loc {
@@ -97,44 +110,31 @@ impl Vfs {
     /// Diff two files. Only the first [`VIEW_LIMIT`] bytes are compared; if either file is
     /// longer the note says so and the files are never reported as identical.
     pub fn diff(&self, left: Option<&Location>, right: Option<&Location>) -> Result<DiffResponse> {
-        let load = |loc: Option<&Location>| -> Result<(Vec<u8>, bool)> {
-            let Some(l) = loc else { return Ok((Vec::new(), false)) };
-            let (mut bytes, _) = self.read(l, VIEW_LIMIT + 1)?;
-            let truncated = bytes.len() as u64 > VIEW_LIMIT;
-            bytes.truncate(VIEW_LIMIT as usize);
-            Ok((bytes, truncated))
+        let load = |loc: Option<&Location>| -> Result<Vec<u8>> {
+            match loc {
+                Some(l) => Ok(self.read(l, VIEW_LIMIT + 1)?.0),
+                None => Ok(Vec::new()),
+            }
         };
-        let ((a, a_cut), (b, b_cut)) = (load(left)?, load(right)?);
-        let truncated = a_cut || b_cut;
         let title = |l: Option<&Location>| l.map_or("(does not exist)".to_string(), |l| l.to_string());
-        let limit_note = format!(
-            "Files are larger than {} MiB; only the beginning was compared",
-            VIEW_LIMIT >> 20
-        );
-        let (result, note) = if diff::looks_binary(&a) || diff::looks_binary(&b) {
-            let note = match (a == b, truncated) {
-                (true, false) => "Binary files are identical".to_string(),
-                (true, true) => format!("Binary files: {limit_note}, no difference found there"),
-                (false, _) => "Binary files differ".to_string(),
-            };
-            (None, Some(note))
-        } else {
-            let r = rc_core::diff_text(&String::from_utf8_lossy(&a), &String::from_utf8_lossy(&b));
-            let note = if truncated {
-                Some(limit_note)
-            } else if r.identical() && a != b {
-                Some("Files differ only in line endings or the final newline".to_string())
-            } else {
-                r.identical().then(|| "Files are identical".to_string())
-            };
-            (Some(r), note)
+        Ok(diff_contents(title(left), load(left)?, title(right), load(right)?))
+    }
+
+    /// Diff a file against its committed version (git HEAD).
+    pub fn diff_head(&self, loc: &Location) -> Result<DiffResponse> {
+        let Location::Local { path } = loc;
+        if Path::new(path)
+            .symlink_metadata()
+            .is_ok_and(|m| m.file_type().is_symlink())
+        {
+            bail!("{path} is a symlink; git stores the link, not the file it points to");
+        }
+        let Some(head) = git::head_content(Path::new(path)) else {
+            bail!("{path} is not tracked by git (or has no commits)");
         };
-        Ok(DiffResponse {
-            left_title: title(left),
-            right_title: title(right),
-            result,
-            note,
-        })
+        let (current, _) = self.read(loc, VIEW_LIMIT + 1)?;
+        let name = loc.file_name().unwrap_or(path);
+        Ok(diff_contents(format!("HEAD:{name}"), head, path.clone(), current))
     }
 
     /// Run a file operation. `progress` is called with each path as it is processed.
@@ -272,6 +272,41 @@ pub fn check_program(program: &str) -> Result<()> {
         Ok(())
     } else {
         bail!("editor `{program}` not found")
+    }
+}
+
+/// Diff two byte buffers (each read with up to `VIEW_LIMIT + 1` bytes).
+fn diff_contents(left_title: String, mut a: Vec<u8>, right_title: String, mut b: Vec<u8>) -> DiffResponse {
+    let truncated = a.len() as u64 > VIEW_LIMIT || b.len() as u64 > VIEW_LIMIT;
+    a.truncate(VIEW_LIMIT as usize);
+    b.truncate(VIEW_LIMIT as usize);
+    let limit_note = format!(
+        "Files are larger than {} MiB; only the beginning was compared",
+        VIEW_LIMIT >> 20
+    );
+    let (result, note) = if diff::looks_binary(&a) || diff::looks_binary(&b) {
+        let note = match (a == b, truncated) {
+            (true, false) => "Binary files are identical".to_string(),
+            (true, true) => format!("Binary files: {limit_note}, no difference found there"),
+            (false, _) => "Binary files differ".to_string(),
+        };
+        (None, Some(note))
+    } else {
+        let r = rc_core::diff_text(&String::from_utf8_lossy(&a), &String::from_utf8_lossy(&b));
+        let note = if truncated {
+            Some(limit_note)
+        } else if r.identical() && a != b {
+            Some("Files differ only in line endings or the final newline".to_string())
+        } else {
+            r.identical().then(|| "Files are identical".to_string())
+        };
+        (Some(r), note)
+    };
+    DiffResponse {
+        left_title,
+        right_title,
+        result,
+        note,
     }
 }
 
