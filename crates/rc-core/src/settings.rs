@@ -145,6 +145,8 @@ pub struct Settings {
     /// Browser UI F4 command, which runs without a terminal: a GUI editor such as `code`,
     /// `zed` or `open -t`. Empty means the system default application.
     pub gui_editor: String,
+    /// Hotlist directories (Ctrl+D), in the order shown.
+    pub bookmarks: Vec<String>,
 }
 
 /// Longest editor command accepted.
@@ -167,6 +169,7 @@ impl Default for Settings {
             show_hidden: true,
             editor: String::new(),
             gui_editor: String::new(),
+            bookmarks: Vec::new(),
         }
     }
 }

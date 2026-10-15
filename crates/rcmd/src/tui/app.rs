@@ -6,6 +6,7 @@ use crate::control::Request;
 use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use rc_core::api::{FileOp, OpResult};
 use rc_core::control::{Command, Reply};
+use rc_core::history::History;
 use rc_core::panel::SortKey;
 use rc_core::{Column, Location, Panel, Row, Settings, dircmp};
 use rc_vfs::Vfs;
@@ -29,6 +30,8 @@ pub enum Mode {
     Diff(DiffView),
     Help,
     Options(Options),
+    /// The hotlist (bookmarks); the number is the cursor row.
+    Hotlist(usize),
 }
 
 /// The options dialog: one row per optional column, then "show hidden", then the editor.
@@ -54,6 +57,7 @@ pub enum PromptAction {
     Move(Vec<Location>),
     Mkdir,
     GoTo,
+    Zoxide,
     SelectMask { select: bool },
 }
 
@@ -118,6 +122,7 @@ pub struct App {
     watched_locations: [Location; 2],
     /// Entries that changed in a live refresh, highlighted briefly.
     pub flash: [HashMap<String, Instant>; 2],
+    history: [History; 2],
 }
 
 /// How long a changed row stays highlighted after a live refresh.
@@ -159,6 +164,7 @@ impl App {
             watching: [None, None],
             watched_locations: [Location::local(""), Location::local("")],
             flash: [HashMap::new(), HashMap::new()],
+            history: [History::default(), History::default()],
         };
         app.load(LEFT, left, None);
         app.load(RIGHT, right, None);
@@ -187,6 +193,11 @@ impl App {
 
     /// List `loc` into panel `side`. On failure the panel stays where it was.
     fn load(&mut self, side: usize, loc: Location, focus: Option<&str>) -> bool {
+        self.show(side, loc, focus, true)
+    }
+
+    /// List `loc` into a panel; `record` adds the place we leave to the back history.
+    fn show(&mut self, side: usize, loc: Location, focus: Option<&str>, record: bool) -> bool {
         let listed = if self.settings.shows(Column::Git) {
             self.vfs.list_with_git(&loc)
         } else {
@@ -198,6 +209,11 @@ impl App {
                     self.scroll[side] = 0;
                     // Highlights belong to the directory they were made in.
                     self.flash[side].clear();
+                    if record && !self.panels[side].location.to_string().is_empty() {
+                        self.history[side].visit(self.panels[side].location.clone());
+                    }
+                    let Location::Local { path } = &listing.location;
+                    zoxide_add(path);
                 }
                 self.panels[side].set_listing(listing, focus);
                 true
@@ -205,6 +221,30 @@ impl App {
             Err(e) => {
                 self.error(format!("{e:#}"));
                 false
+            }
+        }
+    }
+
+    /// Alt+← / Alt+→: step through the panel's history.
+    fn history_step(&mut self, forward: bool) {
+        let side = self.active;
+        let current = self.panels[side].location.clone();
+        let target = if forward {
+            self.history[side].forward(current)
+        } else {
+            self.history[side].back(current)
+        };
+        let Some(target) = target else { return };
+        // Put the cursor back where we were when coming back out of a subdirectory.
+        let came_from = self.panels[side].location.clone();
+        let focus = (came_from.parent().as_ref() == Some(&target))
+            .then(|| came_from.file_name().map(str::to_string))
+            .flatten();
+        if !self.show(side, target.clone(), focus.as_deref(), false) {
+            if forward {
+                self.history[side].undo_forward(target);
+            } else {
+                self.history[side].undo_back(target);
             }
         }
     }
@@ -389,6 +429,12 @@ impl App {
                     if select { "Selected" } else { "Deselected" }
                 ));
             }
+            PromptAction::Zoxide => match zoxide_query(input) {
+                Ok(path) => {
+                    self.load(self.active, Location::local(path), None);
+                }
+                Err(e) => self.error(e),
+            },
             PromptAction::GoTo => {
                 if let Some(loc) = Location::resolve_input(input, &base) {
                     let loc = self.vfs.normalize(loc, Some(&base));
@@ -678,6 +724,7 @@ impl App {
                 }
             }
             Mode::Options(o) => self.options_key(o, key),
+            Mode::Hotlist(cursor) => self.hotlist_key(cursor, key),
         }
         Effect::None
     }
@@ -733,6 +780,38 @@ impl App {
                 p.toggle_hidden();
             }
         }
+    }
+
+    fn hotlist_key(&mut self, mut cursor: usize, key: KeyEvent) {
+        let marks = &mut self.settings.bookmarks;
+        let here = self.panels[self.active].location.to_string();
+        match key.code {
+            KeyCode::Esc | KeyCode::Char('q') => return,
+            KeyCode::Up => cursor = cursor.saturating_sub(1),
+            KeyCode::Down => cursor = (cursor + 1).min(marks.len().saturating_sub(1)),
+            KeyCode::Char('a') if !marks.contains(&here) => {
+                marks.push(here);
+                cursor = marks.len() - 1;
+                self.save_settings();
+            }
+            KeyCode::Char('d') | KeyCode::Delete if cursor < marks.len() => {
+                marks.remove(cursor);
+                cursor = cursor.min(marks.len().saturating_sub(1));
+                self.save_settings();
+            }
+            KeyCode::Enter | KeyCode::Char('1'..='9') => {
+                let index = match key.code {
+                    KeyCode::Char(c) => c as usize - '1' as usize,
+                    _ => cursor,
+                };
+                if let Some(path) = marks.get(index).cloned() {
+                    self.load(self.active, Location::local(path), None);
+                    return;
+                }
+            }
+            _ => {}
+        }
+        self.mode = Mode::Hotlist(cursor);
     }
 
     fn save_settings(&mut self) {
@@ -800,6 +879,7 @@ impl App {
     fn normal_key(&mut self, key: KeyEvent) -> Effect {
         let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
         let shift = key.modifiers.contains(KeyModifiers::SHIFT);
+        let alt = key.modifiers.contains(KeyModifiers::ALT);
         let page = self.page.max(1) as isize;
         // Digits stand in for function keys: Mac laptop keyboards need fn for F-keys.
         let code = match key.code {
@@ -815,6 +895,8 @@ impl App {
             KeyCode::Home => self.active_mut().cursor_home(),
             KeyCode::End => self.active_mut().cursor_end(),
             KeyCode::Enter => self.activate(),
+            KeyCode::Left if alt => self.history_step(false),
+            KeyCode::Right if alt => self.history_step(true),
             KeyCode::Backspace | KeyCode::Left if !ctrl => self.go_up(),
             KeyCode::Right => {
                 if self.active_panel().current().is_some_and(|e| e.is_dir) {
@@ -850,6 +932,7 @@ impl App {
             KeyCode::Char('u') if ctrl => {
                 self.panels.swap(LEFT, RIGHT);
                 self.scroll.swap(LEFT, RIGHT);
+                self.history.swap(LEFT, RIGHT);
             }
             KeyCode::Char('s') if ctrl => self.active_mut().cycle_sort(),
             KeyCode::F(n @ 3..=6) if ctrl => {
@@ -859,6 +942,10 @@ impl App {
             KeyCode::Char('g') => self.start_goto(),
             KeyCode::Char('l') if ctrl => self.start_goto(),
             KeyCode::F(1) | KeyCode::Char('?') => self.mode = Mode::Help,
+            KeyCode::Char('[') => self.history_step(false),
+            KeyCode::Char(']') => self.history_step(true),
+            KeyCode::Char('d') if ctrl => self.mode = Mode::Hotlist(0),
+            KeyCode::Char('z') => self.prompt("Jump to (zoxide query):".into(), String::new(), PromptAction::Zoxide),
             KeyCode::Char('o') => {
                 self.mode = Mode::Options(Options {
                     cursor: 0,
@@ -891,6 +978,29 @@ impl App {
     pub fn job_status(&self) -> Option<String> {
         self.job.as_ref().map(|j| format!("{}: {}", j.verb, j.current))
     }
+}
+
+/// Best-effort: tell zoxide (if installed) that we visited `path`, like its shell hook.
+fn zoxide_add(path: &str) {
+    static HAS_ZOXIDE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if *HAS_ZOXIDE.get_or_init(|| std::process::Command::new("zoxide").arg("--version").output().is_ok()) {
+        let path = path.to_string();
+        std::thread::spawn(move || std::process::Command::new("zoxide").args(["add", "--", &path]).output());
+    }
+}
+
+/// Ask zoxide for the best match for `query` (space-separated keywords).
+fn zoxide_query(query: &str) -> Result<String, String> {
+    let words: Vec<&str> = query.split_whitespace().collect();
+    let out = std::process::Command::new("zoxide")
+        .args(["query", "--"])
+        .args(&words)
+        .output()
+        .map_err(|_| "zoxide is not installed (https://github.com/ajeetdsouza/zoxide)".to_string())?;
+    if !out.status.success() {
+        return Err(format!("zoxide: no match for “{query}”"));
+    }
+    Ok(String::from_utf8_lossy(&out.stdout).trim().to_string())
 }
 
 /// Ctrl/Alt chords are commands, never text.
@@ -1274,6 +1384,42 @@ mod tests {
             panic!("expected diff, got message {:?}", app.message)
         };
         assert_eq!(d.response.left_title, "HEAD:b.txt");
+    }
+
+    #[test]
+    fn history_back_and_forward() {
+        let (_tmp, mut app) = setup();
+        let start = app.panels[LEFT].location.clone();
+        app.panels[LEFT].focus_name("sub");
+        app.handle_key(key(KeyCode::Enter));
+        let sub = app.panels[LEFT].location.clone();
+        assert_ne!(sub, start);
+        app.handle_key(KeyEvent::new(KeyCode::Left, KeyModifiers::ALT));
+        assert_eq!(app.panels[LEFT].location, start);
+        assert_eq!(
+            app.panels[LEFT].current().unwrap().name,
+            "sub",
+            "cursor on the dir we came from"
+        );
+        app.handle_key(key(KeyCode::Char(']')));
+        assert_eq!(app.panels[LEFT].location, sub);
+    }
+
+    #[test]
+    fn hotlist_add_jump_delete() {
+        let (_tmp, mut app) = setup();
+        let left = app.panels[LEFT].location.to_string();
+        app.handle_key(KeyEvent::new(KeyCode::Char('d'), KeyModifiers::CONTROL));
+        app.handle_key(key(KeyCode::Char('a')));
+        assert_eq!(app.settings.bookmarks, std::slice::from_ref(&left));
+        app.handle_key(key(KeyCode::Esc));
+        app.handle_key(key(KeyCode::Tab));
+        app.handle_key(KeyEvent::new(KeyCode::Char('d'), KeyModifiers::CONTROL));
+        app.handle_key(key(KeyCode::Char('1')));
+        assert_eq!(app.panels[RIGHT].location.to_string(), left);
+        app.handle_key(KeyEvent::new(KeyCode::Char('d'), KeyModifiers::CONTROL));
+        app.handle_key(key(KeyCode::Char('d')));
+        assert!(app.settings.bookmarks.is_empty());
     }
 
     #[test]

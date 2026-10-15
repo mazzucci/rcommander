@@ -87,6 +87,7 @@ pub fn draw(f: &mut Frame, app: &mut App) {
         }
         Mode::Help => draw_help(f, main),
         Mode::Options(o) => draw_options(f, main, o, &app.settings),
+        Mode::Hotlist(cursor) => draw_hotlist(f, main, *cursor, &app.settings.bookmarks),
         _ => {}
     }
 }
@@ -542,6 +543,41 @@ fn draw_options(f: &mut Frame, area: Rect, o: &Options, settings: &Settings) {
     );
 }
 
+fn draw_hotlist(f: &mut Frame, area: Rect, cursor: usize, marks: &[String]) {
+    let mut lines: Vec<Line> = marks
+        .iter()
+        .enumerate()
+        .map(|(i, m)| {
+            let n = if i < 9 { format!("{} ", i + 1) } else { "  ".into() };
+            let line = Line::from(vec![
+                Span::raw(format!(" {n}")).fg(ACCENT).bold(),
+                Span::raw(m.as_str()),
+            ]);
+            if i == cursor {
+                line.fg(Color::White).bg(CURSOR_ACTIVE)
+            } else {
+                line.fg(TEXT)
+            }
+        })
+        .collect();
+    if marks.is_empty() {
+        lines.push(Line::raw(" No bookmarks yet.").fg(DIM));
+    }
+    lines.push(Line::raw(""));
+    lines.push(Line::raw(" Enter/1-9 go · a add current folder · d remove · Esc close").fg(DIM));
+    let area = popup(area, 60, lines.len() as u16 + 2);
+    f.render_widget(Clear, area);
+    f.render_widget(
+        Paragraph::new(lines).block(
+            Block::bordered()
+                .border_type(BorderType::Rounded)
+                .border_style(Style::new().fg(ACCENT))
+                .title(Line::raw(" Hotlist ").fg(TEXT).bold()),
+        ),
+        area,
+    );
+}
+
 fn draw_help(f: &mut Frame, area: Rect) {
     const HELP: &[(&str, &str)] = &[
         ("↑↓ PgUp PgDn Home End", "move cursor"),
@@ -555,6 +591,9 @@ fn draw_help(f: &mut Frame, area: Rect) {
         (".", "show / hide hidden files"),
         ("o", "options: columns, hidden files, editor"),
         ("g  Ctrl+L", "go to path"),
+        ("z", "jump with zoxide"),
+        ("Alt+←/→  [  ]", "back / forward"),
+        ("Ctrl+D", "hotlist (bookmarks)"),
         ("Ctrl+S  Ctrl+F3..F6", "cycle sort / sort by name, ext, date, size"),
         ("Ctrl+R  Ctrl+U", "refresh / swap panels"),
         ("F2", "diff: cursor files in both panels, or 2 selected"),
