@@ -1,7 +1,7 @@
 use crate::Location;
 use serde::{Deserialize, Serialize};
 
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct Entry {
     pub name: String,
     pub is_dir: bool,
@@ -12,17 +12,27 @@ pub struct Entry {
     pub size: Option<u64>,
     /// Unix seconds.
     pub modified: Option<i64>,
+    /// Unix seconds; not every filesystem records it.
+    #[serde(default)]
+    pub created: Option<i64>,
+    /// Unix permission bits (`st_mode & 0o7777`).
+    #[serde(default)]
+    pub mode: Option<u32>,
+    #[serde(default)]
+    pub owner: Option<String>,
+    #[serde(default)]
+    pub group: Option<String>,
+    /// Where a symlink points.
+    #[serde(default)]
+    pub link_target: Option<String>,
 }
 
 impl Entry {
     pub fn file(name: impl Into<String>, size: u64) -> Self {
         Entry {
             name: name.into(),
-            is_dir: false,
-            is_link: false,
-            hidden: false,
             size: Some(size),
-            modified: None,
+            ..Entry::default()
         }
     }
 

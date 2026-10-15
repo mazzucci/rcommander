@@ -7,11 +7,13 @@ mod entry;
 pub mod format;
 mod location;
 pub mod panel;
+pub mod settings;
 
 pub use diff::{DiffResult, diff_text};
 pub use entry::{Entry, Listing};
 pub use location::Location;
 pub use panel::{Panel, Row, SortKey};
+pub use settings::{Column, Settings};
 
 /// Which two files "Compare by content" (F2) should diff, left side first.
 ///

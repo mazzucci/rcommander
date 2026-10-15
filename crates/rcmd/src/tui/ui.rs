@@ -1,6 +1,6 @@
 //! Rendering. Colors use the 256-color palette because macOS Terminal.app has no truecolor.
 
-use super::app::{App, LEFT, Mode};
+use super::app::{App, EDITOR_ROW, HIDDEN_ROW, LEFT, Mode, Options};
 use super::views::{DiffView, Viewer, sanitize};
 use chrono::{Local, Offset, TimeZone};
 use ratatui::Frame;
@@ -8,10 +8,11 @@ use ratatui::layout::{Alignment, Constraint, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style, Stylize};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, BorderType, Cell, Clear, Paragraph, Row as TableRow, Table};
+use rc_core::Settings;
 use rc_core::diff::{DiffRow, RowKind, Side, Visible};
 use rc_core::dircmp::CmpMark;
-use rc_core::format::{format_time, human_size};
-use rc_core::{Panel, Row};
+use rc_core::format::human_size;
+use rc_core::{Column, Panel, Row};
 
 const CURSOR_ACTIVE: Color = Color::Cyan;
 const CURSOR_INACTIVE: Color = Color::Indexed(238);
@@ -69,6 +70,7 @@ pub fn draw(f: &mut Frame, app: &mut App) {
             f.render_widget(Paragraph::new(text).alignment(Alignment::Center).block(block), area);
         }
         Mode::Help => draw_help(f, main),
+        Mode::Options(o) => draw_options(f, main, o, &app.settings),
         _ => {}
     }
 }
@@ -96,12 +98,12 @@ fn elide_start(s: &str, max: usize) -> String {
     format!("…{tail}")
 }
 
-fn local_time(secs: i64) -> String {
-    let offset = Local
+/// Local UTC offset in seconds at a given moment (DST-aware).
+fn utc_offset(secs: i64) -> i64 {
+    Local
         .timestamp_opt(secs, 0)
         .single()
-        .map_or(0, |d| d.offset().fix().local_minus_utc());
-    format_time(secs, offset.into())
+        .map_or(0, |d| d.offset().fix().local_minus_utc().into())
 }
 
 fn mark_color(m: CmpMark) -> Color {
@@ -158,15 +160,40 @@ fn draw_panel(f: &mut Frame, area: Rect, app: &mut App, side: usize) {
     }
     let scroll = *scroll;
 
-    let wide = inner.width >= 48;
+    // Optional columns that fit while leaving the name at least 12 characters.
+    let mut columns: Vec<Column> = app.settings.visible_columns().collect();
+    let needed = |cols: &[Column]| cols.iter().map(|c| c.width() + 1).sum::<u16>() + 2 + 12;
+    while !columns.is_empty() && inner.width < needed(&columns) {
+        columns.pop();
+    }
+
     let cursor_bg = if is_active { CURSOR_ACTIVE } else { CURSOR_INACTIVE };
+    let cell = |text: String, c: Column| {
+        let line = Line::raw(text);
+        Cell::from(if c.right_aligned() {
+            line.alignment(Alignment::Right)
+        } else {
+            line
+        })
+    };
     let rows = (scroll..p.len().min(scroll + height)).map(|r| {
-        let (mark, name, size, date, mut style) = match p.rows()[r] {
+        let (mark, name, values, mut style) = match p.rows()[r] {
             Row::Parent => (
                 Cell::from(" "),
                 "[..]".to_string(),
-                "<UP>".to_string(),
-                String::new(),
+                columns
+                    .iter()
+                    .map(|&c| {
+                        cell(
+                            if c == Column::Size {
+                                "<UP>".into()
+                            } else {
+                                String::new()
+                            },
+                            c,
+                        )
+                    })
+                    .collect::<Vec<_>>(),
                 Style::new().fg(Color::White).bold(),
             ),
             Row::Entry(_) => {
@@ -186,21 +213,19 @@ fn draw_panel(f: &mut Frame, area: Rect, app: &mut App, side: usize) {
                 if p.is_selected(e) {
                     style = style.fg(Color::Yellow).bold();
                 }
-                let name = if e.is_dir {
+                let mut name = if e.is_dir {
                     format!("[{}]", e.name)
                 } else {
                     e.name.clone()
                 };
-                let name = if e.is_link { format!("{name} →") } else { name };
-                let size = if e.is_dir {
-                    "<DIR>".into()
-                } else {
-                    e.size.map(human_size).unwrap_or_default()
-                };
+                if e.is_link {
+                    name += &format!(" → {}", e.link_target.as_deref().unwrap_or("?"));
+                }
                 let mark = mark.map_or(Cell::from(" "), |m| {
                     Cell::from(m.symbol().to_string()).style(Style::new().fg(mark_color(m)))
                 });
-                (mark, name, size, e.modified.map(local_time).unwrap_or_default(), style)
+                let values = columns.iter().map(|&c| cell(c.text(e, utc_offset), c)).collect();
+                (mark, name, values, style)
             }
         };
         if r == p.cursor {
@@ -214,23 +239,22 @@ fn draw_panel(f: &mut Frame, area: Rect, app: &mut App, side: usize) {
             };
             style = style.bg(cursor_bg).fg(fg);
         }
-        let mut cells = vec![
-            mark,
-            Cell::from(name),
-            Cell::from(Line::raw(size).alignment(Alignment::Right)),
-        ];
-        if wide {
-            cells.push(Cell::from(date));
-        }
+        let cells = [mark, Cell::from(name)].into_iter().chain(values);
         TableRow::new(cells).style(style)
     });
 
-    let mut widths = vec![Constraint::Length(1), Constraint::Fill(1), Constraint::Length(7)];
-    let mut header = vec!["", "Name", "   Size"];
-    if wide {
-        widths.push(Constraint::Length(16));
-        header.push("Date");
-    }
+    let widths = [Constraint::Length(1), Constraint::Fill(1)]
+        .into_iter()
+        .chain(columns.iter().map(|c| Constraint::Length(c.width())));
+    let header = ["".to_string(), "Name".to_string()]
+        .into_iter()
+        .chain(columns.iter().map(|c| {
+            if c.right_aligned() {
+                format!("{:>w$}", c.title(), w = c.width() as usize)
+            } else {
+                c.title().to_string()
+            }
+        }));
     let table = Table::new(rows, widths)
         .header(TableRow::new(header).style(Style::new().fg(Color::Cyan).bold()))
         .column_spacing(1);
@@ -269,6 +293,7 @@ fn draw_keys(f: &mut Frame, area: Rect, mode: &Mode) {
             ("7", "MkDir"),
             ("8", "Delete"),
             ("9", "CmpDirs"),
+            ("o", "Options"),
             ("q", "Quit"),
         ],
     };
@@ -421,6 +446,42 @@ fn side_line<'a>(
     }
 }
 
+fn draw_options(f: &mut Frame, area: Rect, o: &Options, settings: &Settings) {
+    let check = |on: bool| if on { "[x]" } else { "[ ]" };
+    let mut lines = vec![Line::raw(" Columns").cyan().bold()];
+    let mut row = |i: usize, text: String| {
+        let line = Line::raw(format!("  {text}"));
+        lines.push(if i == o.cursor {
+            line.black().on_cyan()
+        } else {
+            line.white()
+        });
+    };
+    for (i, c) in Column::ALL.iter().enumerate() {
+        row(i, format!("{} {}", check(settings.shows(*c)), c.label()));
+    }
+    row(HIDDEN_ROW, format!("{} Show hidden files", check(settings.show_hidden)));
+    let editor = match &o.editing {
+        Some(text) => format!("{text}█"),
+        None if settings.editor.is_empty() => "($VISUAL / $EDITOR)".into(),
+        None => settings.editor.clone(),
+    };
+    row(EDITOR_ROW, format!("Editor (F4): {editor}"));
+    lines.push(Line::raw(""));
+    lines.push(Line::raw(" ↑↓ move · Space/Enter toggle or edit · Esc save & close").fg(DIM));
+    let area = popup(area, 60, lines.len() as u16 + 2);
+    f.render_widget(Clear, area);
+    f.render_widget(
+        Paragraph::new(lines).block(
+            Block::bordered()
+                .border_type(BorderType::Rounded)
+                .title(" Options ")
+                .cyan(),
+        ),
+        area,
+    );
+}
+
 fn draw_help(f: &mut Frame, area: Rect) {
     const HELP: &[(&str, &str)] = &[
         ("↑↓ PgUp PgDn Home End", "move cursor"),
@@ -432,11 +493,12 @@ fn draw_help(f: &mut Frame, area: Rect) {
         ("Esc", "clear selection and filter"),
         ("/  Ctrl+F", "quick filter"),
         (".", "show / hide hidden files"),
+        ("o", "options: columns, hidden files, editor"),
         ("g  Ctrl+L", "go to path"),
         ("Ctrl+S  Ctrl+F3..F6", "cycle sort / sort by name, ext, date, size"),
         ("Ctrl+R  Ctrl+U", "refresh / swap panels"),
         ("F2", "diff: cursor files in both panels, or 2 selected"),
-        ("F3  F4", "view / edit with $EDITOR"),
+        ("F3  F4", "view / edit (editor set in options, else $EDITOR)"),
         ("F5  F6", "copy / move or rename"),
         ("F7  F8", "new directory / delete to Trash (Shift: permanent)"),
         ("F9", "compare directories (toggle)"),
@@ -548,6 +610,24 @@ mod tests {
         app.handle_key(KeyEvent::new(KeyCode::Home, KeyModifiers::NONE));
         let s = screen(&mut app);
         assert!(s.contains("[..]") && !s.contains("f099"));
+    }
+
+    #[test]
+    fn renders_configured_columns_and_options() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(tmp.path().join("a.txt"), "x").unwrap();
+        let loc = rc_core::Location::local(tmp.path().to_string_lossy());
+        let mut app = App::new(Arc::new(rc_vfs::Vfs::new()), loc.clone(), loc);
+        app.settings.toggle_column(Column::Permissions);
+        app.settings.toggle_column(Column::Modified);
+        let s = screen(&mut app);
+        assert!(
+            s.contains("Perms") && s.contains("-rw-") && !s.contains("Modified"),
+            "{s}"
+        );
+        app.handle_key(KeyEvent::new(KeyCode::Char('o'), KeyModifiers::NONE));
+        let s = screen(&mut app);
+        assert!(s.contains("[x] Permissions") && s.contains("[ ] Modified"), "{s}");
     }
 
     #[test]
