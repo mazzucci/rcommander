@@ -9,9 +9,19 @@ use rc_core::api::FileContent;
 use rc_core::format::human_size;
 use std::sync::Arc;
 
+/// Must match `.viewer-text pre` in style.css (line height and top padding).
+const LINE_HEIGHT: i32 = 18;
+const PAD: i32 = 6;
+
 #[component]
-pub fn Viewer(app: App, content: Arc<FileContent>) -> impl IntoView {
+pub fn Viewer(app: App, content: Arc<FileContent>, line: Option<usize>) -> impl IntoView {
     let body = NodeRef::<Div>::new();
+    // Pointed at a line (e.g. by `rcmd ctl view --line`): scroll there, a few lines down.
+    Effect::new(move |_| {
+        if let (Some(el), Some(line)) = (body.get(), line) {
+            el.set_scroll_top((line.saturating_sub(4) as i32) * LINE_HEIGHT);
+        }
+    });
     let keys = window_event_listener(ev::keydown, move |ev| {
         let key = ev.key();
         if matches!(key.as_str(), "Escape" | "F3" | "3" | "q") {
@@ -32,6 +42,7 @@ pub fn Viewer(app: App, content: Arc<FileContent>) -> impl IntoView {
             let gutter: String = (1..=lines).map(|n| format!("{n}\n")).collect();
             view! {
                 <div class="viewer-text">
+                    {line.map(|l| view! { <div class="line-mark" style=format!("top:{}px", PAD + (l.max(1) as i32 - 1) * LINE_HEIGHT)></div> })}
                     <pre class="gutter">{gutter}</pre>
                     <pre class="text">{text.clone()}</pre>
                 </div>

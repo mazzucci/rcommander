@@ -23,6 +23,10 @@ pub enum ModalKind {
         targets: Vec<Location>,
         permanent: bool,
     },
+    /// Forget entries of "Claude's changes" (by name); the files stay.
+    Forget {
+        names: Vec<String>,
+    },
     /// A copy or move would meet `existing` destination paths.
     Conflict {
         op: FileOp,

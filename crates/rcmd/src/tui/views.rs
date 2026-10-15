@@ -15,9 +15,18 @@ pub struct Viewer {
     pub hscroll: usize,
     /// Visible text rows, set by the renderer.
     pub page: usize,
+    /// A line to highlight (0-based), e.g. the one `rcmd ctl view --line` pointed at.
+    pub mark: Option<usize>,
 }
 
 impl Viewer {
+    /// Scroll to a 1-based line, a few lines below the top, and highlight it.
+    pub fn goto_line(&mut self, line: usize) {
+        let i = line.saturating_sub(1).min(self.lines.len().saturating_sub(1));
+        self.mark = Some(i);
+        self.scroll = i.saturating_sub(3);
+    }
+
     pub fn new(content: FileContent) -> Self {
         let mut title = format!("{}  ({})", content.location, human_size(content.size));
         let lines = match &content.text {
@@ -33,6 +42,7 @@ impl Viewer {
             scroll: 0,
             hscroll: 0,
             page: 20,
+            mark: None,
         }
     }
 

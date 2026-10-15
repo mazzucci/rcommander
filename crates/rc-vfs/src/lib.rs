@@ -2,6 +2,7 @@
 //! Everything is blocking; the web server wraps calls in `spawn_blocking`.
 //! New sources (archives, SFTP, GitHub) plug in by matching on new `Location` variants.
 
+pub mod changes;
 pub mod git;
 pub mod local;
 pub mod settings;

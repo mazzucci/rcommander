@@ -11,7 +11,7 @@ use crate::{api, dom, events};
 use leptos::ev;
 use leptos::prelude::*;
 use leptos::task::spawn_local;
-use rc_core::api::{BrowserEvent, Conflicts, DiffResponse, FileContent, FileOp, OnConflict, OpResult};
+use rc_core::api::{BrowserEvent, ChangesDirs, Conflicts, DiffResponse, FileContent, FileOp, OnConflict, OpResult};
 use rc_core::dircmp::{self, CmpMark};
 use rc_core::history::History;
 use rc_core::{Location, Panel, Row, Settings, SortKey};
@@ -37,7 +37,8 @@ pub struct Message {
 /// Views that cover the panels and take over the keyboard while open.
 #[derive(Clone)]
 pub enum Overlay {
-    View(Arc<FileContent>),
+    /// A file, and a 1-based line to scroll to and highlight.
+    View(Arc<FileContent>, Option<usize>),
     Diff(Arc<DiffResponse>),
     Help,
 }
@@ -68,6 +69,8 @@ pub struct App {
     pub hotlist_open: RwSignal<bool>,
     /// Saved preferences, from `init` and the options dialog.
     pub settings: RwSignal<Settings>,
+    /// Where "Claude's changes" lives, from `init`.
+    pub changes: RwSignal<Option<ChangesDirs>>,
     pub overlay: RwSignal<Option<Overlay>>,
     pub message: RwSignal<Option<Message>>,
     /// Number of API requests in flight.
@@ -114,6 +117,7 @@ impl App {
             options_open: RwSignal::new(false),
             hotlist_open: RwSignal::new(false),
             settings: RwSignal::new(Settings::default()),
+            changes: RwSignal::new(None),
             overlay: RwSignal::new(None),
             message: RwSignal::new(None),
             busy: RwSignal::new(0),
@@ -191,6 +195,7 @@ impl App {
                 panel.update(|p| p.show_hidden = init.settings.show_hidden);
             }
             self.settings.set(init.settings);
+            self.changes.set(init.changes);
             self.load(LEFT, init.left, None);
             self.load(RIGHT, init.right, None);
             events::connect(self);
@@ -227,7 +232,7 @@ impl App {
                 self.show(side.index(active), location, focus, Nav::Visit, |_| {});
             }
             BrowserEvent::Diff { left, right } => self.open_diff(api::diff(left, right)),
-            BrowserEvent::View { location } => self.view(location),
+            BrowserEvent::View { location, line } => self.view_at(location, line),
             BrowserEvent::Select { side, mask } => {
                 reveal();
                 let n = self.panels[side.index(active)]
@@ -427,17 +432,60 @@ impl App {
     // ---- file actions -----------------------------------------------------------
 
     fn view(self, location: Location) {
+        self.view_at(location, None);
+    }
+
+    /// Open the viewer, optionally at a line.
+    fn view_at(self, location: Location, line: Option<usize>) {
         self.request(api::read(location), move |content| {
             dom::blur_active();
-            self.overlay.set(Some(Overlay::View(Arc::new(content))));
+            self.overlay.set(Some(Overlay::View(Arc::new(content), line)));
         });
     }
 
     fn open_diff(self, fut: impl Future<Output = Result<DiffResponse, String>> + 'static) {
-        self.request(fut, move |diff| {
+        self.open_diff_titled(fut, None);
+    }
+
+    /// Like `open_diff`, replacing the left side's title.
+    fn open_diff_titled(self, fut: impl Future<Output = Result<DiffResponse, String>> + 'static, left: Option<String>) {
+        self.request(fut, move |mut diff: DiffResponse| {
+            if let Some(title) = left {
+                diff.left_title = title;
+            }
             dom::blur_active();
             self.overlay.set(Some(Overlay::Diff(Arc::new(diff))));
         });
+    }
+
+    /// Whether the active panel shows "Claude's changes".
+    fn in_changes(self) -> bool {
+        let here = self.panels[self.active_side()].with_untracked(|p| p.location.clone());
+        self.changes
+            .with_untracked(|c| c.as_ref().is_some_and(|c| c.links == here))
+    }
+
+    /// `c`: show "Claude's changes" (files an agent edited) in the active panel.
+    fn show_changes(self) {
+        match self.changes.get_untracked() {
+            Some(c) => {
+                self.load(self.active_side(), c.links, None);
+                self.info("Claude's changes: F2 diff against the original · F3 view · F8 forget");
+            }
+            None => self.error("Claude's changes are not available"),
+        }
+    }
+
+    /// F2 in "Claude's changes": the file against its content before the agent's edits.
+    fn diff_change(self) {
+        let Some(c) = self.changes.get_untracked() else { return };
+        let entry = self.panels[self.active_side()].with_untracked(|p| p.current().cloned());
+        let Some(e) = entry.filter(|e| e.is_link) else { return };
+        let Some(target) = e.link_target.clone() else { return };
+        let original = c.originals.join(&e.name);
+        let current = Location::local(&target);
+        let title = format!("{target} (before)");
+        self.open_diff_titled(api::diff(original, current), Some(title));
     }
 
     /// F4: open the file under the cursor in the configured editor (server side), or
@@ -471,6 +519,9 @@ impl App {
     /// other panel (the cursor file there, else the same name). Left panel = left side.
     /// If the other panel has no such file, diff against git HEAD as Shift+F2 does.
     fn diff(self) {
+        if self.in_changes() {
+            return self.diff_change();
+        }
         let side = self.active_side();
         let pair = self.panels[LEFT]
             .with_untracked(|l| self.panels[RIGHT].with_untracked(|r| rc_core::diff_targets(l, r, side == LEFT)));
@@ -539,6 +590,25 @@ impl App {
     }
 
     /// F8: trash, Shift+F8: permanent delete.
+    /// F8 in "Claude's changes": forget entries, never touching the edited files.
+    fn ask_forget(self) {
+        let names: Vec<String> =
+            self.panels[self.active_side()].with_untracked(|p| p.targets().iter().map(|e| e.name.clone()).collect());
+        let title = match &names[..] {
+            [] => return,
+            [one] => format!("Forget \"{one}\" from Claude's changes? The file stays as it is."),
+            many => format!(
+                "Forget {} entries from Claude's changes? The files stay as they are.",
+                many.len()
+            ),
+        };
+        self.modal.set(Some(Modal {
+            title,
+            input: None,
+            kind: ModalKind::Forget { names },
+        }));
+    }
+
     fn ask_delete(self, permanent: bool) {
         let Some((targets, label)) = self.targets() else { return };
         let title = if permanent {
@@ -594,6 +664,22 @@ impl App {
                 ));
             }
             ModalKind::Delete { targets, permanent } => self.run_op(FileOp::Delete { targets, permanent }, None),
+            // Forget entries: remove the log's link and saved original; the file stays.
+            ModalKind::Forget { names } => {
+                if let Some(c) = self.changes.get_untracked() {
+                    let targets = names
+                        .iter()
+                        .flat_map(|n| [c.links.join(n), c.originals.join(n)])
+                        .collect();
+                    self.run_op(
+                        FileOp::Delete {
+                            targets,
+                            permanent: true,
+                        },
+                        None,
+                    );
+                }
+            }
             // Answered with a policy through `resolve_conflict`, never plain confirm.
             ModalKind::Conflict { .. } => {}
         }
@@ -686,6 +772,7 @@ impl App {
             5 => self.ask_transfer(false),
             6 => self.ask_transfer(true),
             7 => self.ask_mkdir(),
+            8 if self.in_changes() => self.ask_forget(),
             8 => self.ask_delete(shift),
             9 => self.compare_dirs(),
             _ => {}
@@ -763,7 +850,9 @@ impl App {
             (false, "+") => self.ask_mask(true),
             (false, "-") => self.ask_mask(false),
             (false, "*") => panel.update(Panel::invert_selection),
+            (false, "Delete") if self.in_changes() => self.ask_forget(),
             (false, "Delete") => self.ask_delete(shift),
+            (false, "c") => self.show_changes(),
             (false, "Escape") => panel.update(|p| {
                 if p.filter.is_empty() {
                     p.clear_selection();
@@ -867,7 +956,7 @@ pub fn Root() -> impl IntoView {
             app.overlay
                 .get()
                 .map(|overlay| match overlay {
-                    Overlay::View(content) => view! { <Viewer app content/> }.into_any(),
+                    Overlay::View(content, line) => view! { <Viewer app content line/> }.into_any(),
                     Overlay::Diff(diff) => view! { <DiffView app diff/> }.into_any(),
                     Overlay::Help => view! { <HelpView app/> }.into_any(),
                 })

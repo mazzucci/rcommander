@@ -13,6 +13,16 @@ pub struct InitResponse {
     pub home: String,
     #[serde(default)]
     pub settings: Settings,
+    /// Where "Claude's changes" lives, if available: the folder to show and the folder
+    /// with each file's original content (same entry names).
+    #[serde(default)]
+    pub changes: Option<ChangesDirs>,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct ChangesDirs {
+    pub links: Location,
+    pub originals: Location,
 }
 
 /// `POST /api/list` → [`crate::Listing`].
@@ -209,6 +219,8 @@ pub enum BrowserEvent {
     },
     View {
         location: Location,
+        #[serde(default)]
+        line: Option<usize>,
     },
     Select {
         side: Side,

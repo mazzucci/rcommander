@@ -18,8 +18,8 @@ use axum::response::{Html, IntoResponse, Response};
 use axum::routing::get;
 use axum::routing::post;
 use axum::{Json, Router};
-use rc_core::api::BrowserEvent;
 use rc_core::api::{ApiError, DiffRequest, FileOp, InitResponse, ListRequest, OpenRequest, ReadRequest};
+use rc_core::api::{BrowserEvent, ChangesDirs};
 use rc_core::control::{Command, Reply};
 use rc_core::{Location, Settings};
 use rc_vfs::Vfs;
@@ -150,6 +150,10 @@ async fn serve(vfs: Arc<Vfs>, config: Config) -> Result<()> {
         right: vfs.normalize(config.right, None),
         home: Vfs::home(),
         settings: Settings::default(),
+        changes: crate::control::changes_log().ok().map(|log| ChangesDirs {
+            links: Location::local(log.links_dir().to_string_lossy()),
+            originals: Location::local(log.originals_dir().to_string_lossy()),
+        }),
     };
     let (events, _) = broadcast::channel(64);
     let live = LiveDirs::new(events.clone());
@@ -486,8 +490,9 @@ fn browser_event(vfs: &Vfs, command: Command) -> Result<BrowserEvent, String> {
             left: existing(&left)?,
             right: existing(&right)?,
         },
-        Command::View { path } => BrowserEvent::View {
+        Command::View { path, line } => BrowserEvent::View {
             location: existing(&path)?,
+            line,
         },
         Command::Select { mask, side } => BrowserEvent::Select { side, mask },
         Command::Refresh => BrowserEvent::Refresh,
@@ -564,6 +569,7 @@ mod tests {
                 right: loc,
                 home: "/".into(),
                 settings: Settings::default(),
+                changes: None,
             }),
             settings: Arc::new(RwLock::new(Settings::default())),
             settings_path: None,
@@ -781,6 +787,7 @@ mod tests {
             &vfs,
             Command::View {
                 path: format!("{dir}/missing"),
+                line: None,
             },
         )
         .unwrap_err();
@@ -812,6 +819,7 @@ mod tests {
                 right: loc,
                 home: "/".into(),
                 settings: Settings::default(),
+                changes: None,
             }),
             settings: Arc::new(RwLock::new(Settings::default())),
             settings_path: None,
@@ -944,6 +952,7 @@ mod tests {
                 right: Location::local(&dir),
                 home: "/".into(),
                 settings: Settings::default(),
+                changes: None,
             }),
             settings: Arc::new(RwLock::new(Settings::default())),
             settings_path: None,

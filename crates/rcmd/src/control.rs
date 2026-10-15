@@ -48,6 +48,13 @@ pub fn private_dir() -> Result<PathBuf> {
     Ok(dir)
 }
 
+/// The "Claude's changes" log in the private directory.
+pub fn changes_log() -> Result<rc_vfs::changes::ChangeLog> {
+    let dir = private_dir()?.join("changes");
+    secure_dir(&dir)?;
+    rc_vfs::changes::ChangeLog::open(&dir)
+}
+
 /// Create `dir` as 0700 if missing, then insist it is ours and private.
 pub fn secure_dir(dir: &Path) -> Result<()> {
     use std::os::unix::fs::{DirBuilderExt, MetadataExt};

@@ -12,6 +12,7 @@ use rc_core::history::History;
 use rc_core::panel::SortKey;
 use rc_core::{Column, Location, Panel, Row, Settings, dircmp};
 use rc_vfs::Vfs;
+use rc_vfs::changes::ChangeLog;
 use rc_vfs::watch::DirWatcher;
 use std::collections::{BTreeSet, HashMap};
 use std::ops::ControlFlow;
@@ -75,6 +76,8 @@ pub struct Confirm {
 
 pub enum ConfirmAction {
     Run(FileOp),
+    /// Drop entries from "Claude's changes" (the files stay).
+    Forget(Vec<String>),
     /// Quit even though a job is running (it is abandoned half-way).
     Quit,
 }
@@ -127,6 +130,8 @@ pub struct App {
     settings_path: Option<PathBuf>,
     /// Remote-control requests from `rcmd ctl` (see `control.rs`).
     pub control: Option<Receiver<Request>>,
+    /// "Claude's changes", when the private runtime directory is available.
+    pub change_log: Option<ChangeLog>,
     /// Live refresh: the watcher, the directories it reports, and what it watches now
     /// (canonical paths, which is what the OS reports).
     watcher: Option<DirWatcher>,
@@ -172,6 +177,7 @@ impl App {
             settings,
             settings_path,
             control: None,
+            change_log: None,
             watcher: None,
             changes: None,
             watching: [None, None],
@@ -328,7 +334,57 @@ impl App {
 
     /// F2: diff the two files `diff_targets` picks. When the other panel has no such file,
     /// fall back to the file's committed version, as Shift+F2 does explicitly.
+    fn count(names: &[String]) -> String {
+        match names {
+            [one] => format!("\"{one}\""),
+            many => format!("{} entries", many.len()),
+        }
+    }
+
+    /// `c`: show "Claude's changes" (files an agent edited) in the active panel.
+    fn show_changes(&mut self) {
+        match &self.change_log {
+            Some(log) => {
+                let dir = Location::local(log.links_dir().to_string_lossy());
+                self.load(self.active, dir, None);
+                self.info("Claude's changes: F2 diff against the original · F3 view · F8 forget");
+            }
+            None => self.error("Claude's changes are not available"),
+        }
+    }
+
+    /// Whether the active panel shows "Claude's changes".
+    fn in_changes(&self) -> bool {
+        let Location::Local { path } = &self.active_panel().location;
+        self.change_log
+            .as_ref()
+            .is_some_and(|log| log.links_dir() == std::path::Path::new(path))
+    }
+
+    /// F2 in "Claude's changes": each file against its content before the agent's edits.
+    fn diff_change(&mut self) {
+        let Some(name) = self.active_panel().current().map(|e| e.name.clone()) else {
+            return;
+        };
+        let Some((original, file)) = self.change_log.as_ref().and_then(|log| log.pair(&name)) else {
+            return;
+        };
+        let loc = |p: &std::path::Path| Location::local(p.to_string_lossy());
+        let right = loc(&file);
+        let right = if file.exists() { Some(&right) } else { None };
+        match self.vfs.diff(Some(&loc(&original)), right) {
+            Ok(mut resp) => {
+                resp.left_title = format!("{} (before)", file.display());
+                self.mode = Mode::Diff(DiffView::new(resp));
+            }
+            Err(e) => self.error(format!("{e:#}")),
+        }
+    }
+
     fn diff(&mut self) {
+        if self.in_changes() {
+            return self.diff_change();
+        }
         let Some((left, right)) = rc_core::diff_targets(&self.panels[LEFT], &self.panels[RIGHT], self.active == LEFT)
         else {
             self.error("Diff: put the cursor on a file (or select two files)");
@@ -706,8 +762,14 @@ impl App {
                 Ok(resp) => self.mode = Mode::Diff(DiffView::new(resp)),
                 Err(e) => return Reply::error(format!("{e:#}")),
             },
-            Command::View { path } => match self.vfs.read_content(&loc(&path)) {
-                Ok(content) => self.mode = Mode::Viewer(Viewer::new(content)),
+            Command::View { path, line } => match self.vfs.read_content(&loc(&path)) {
+                Ok(content) => {
+                    let mut viewer = Viewer::new(content);
+                    if let Some(line) = line {
+                        viewer.goto_line(line);
+                    }
+                    self.mode = Mode::Viewer(viewer);
+                }
                 Err(e) => return Reply::error(format!("{e:#}")),
             },
             Command::Select { mask, side } => {
@@ -915,6 +977,18 @@ impl App {
     fn confirm(&mut self, action: ConfirmAction) -> Effect {
         match action {
             ConfirmAction::Run(op) => self.run_job(op),
+            ConfirmAction::Forget(names) => {
+                if let Some(log) = &self.change_log {
+                    let failed = names.iter().filter(|n| log.forget(n).is_err()).count();
+                    let msg = format!(
+                        "Forgot {} of {} changes; the files are untouched",
+                        names.len() - failed,
+                        names.len()
+                    );
+                    self.report(&msg, failed == 0);
+                }
+                self.refresh_all();
+            }
             ConfirmAction::Quit => return Effect::Quit,
         }
         Effect::None
@@ -1064,7 +1138,21 @@ impl App {
             KeyCode::F(5) => self.start_copy_move(false),
             KeyCode::F(6) => self.start_copy_move(true),
             KeyCode::F(7) => self.prompt("New directory".into(), String::new(), PromptAction::Mkdir),
+            KeyCode::F(8) | KeyCode::Delete if self.in_changes() => {
+                let names: Vec<String> = self.active_panel().targets().iter().map(|e| e.name.clone()).collect();
+                if !names.is_empty() {
+                    self.mode = Mode::Confirm(Confirm {
+                        text: format!(
+                            "Forget {} from Claude's changes? The files stay as they are.",
+                            Self::count(&names)
+                        ),
+                        action: ConfirmAction::Forget(names),
+                        enter_confirms: true,
+                    });
+                }
+            }
             KeyCode::F(8) | KeyCode::Delete => self.start_delete(shift),
+            KeyCode::Char('c') => self.show_changes(),
             KeyCode::F(9) => self.compare_dirs(),
             _ => {}
         }
@@ -1430,7 +1518,13 @@ mod tests {
             })
             .ok
         );
-        assert!(!app.apply(Command::View { path: p("nope") }).ok);
+        assert!(
+            !app.apply(Command::View {
+                path: p("nope"),
+                line: None
+            })
+            .ok
+        );
         assert!(
             !app.apply(Command::Goto {
                 path: p("left/missing.txt"),
@@ -1440,7 +1534,13 @@ mod tests {
         );
         // A dialog the user is answering is never replaced.
         app.handle_key(key(KeyCode::F(7)));
-        assert!(!app.apply(Command::View { path: p("left/a.txt") }).ok);
+        assert!(
+            !app.apply(Command::View {
+                path: p("left/a.txt"),
+                line: None
+            })
+            .ok
+        );
         assert!(matches!(app.mode, Mode::Prompt(_)));
         assert!(app.apply(Command::Message { text: "hi".into() }).ok);
         assert_eq!(app.message.as_ref().unwrap().0, "hi");
@@ -1626,6 +1726,41 @@ mod tests {
             !app.panels[LEFT].selected.is_empty(),
             "Esc cancelled instead of clearing the selection"
         );
+    }
+
+    #[test]
+    fn claudes_changes_panel() {
+        let (tmp, mut app) = setup();
+        let log = ChangeLog::open(&tmp.path().join("log")).unwrap();
+        let file = tmp.path().join("left/a.txt");
+        log.record(&file, b"one\nold\n").unwrap();
+        app.change_log = Some(log);
+        app.handle_key(key(KeyCode::Char('c')));
+        assert!(app.panels[LEFT].location.to_string().ends_with("/log/links"));
+        app.panels[LEFT].focus_name("a.txt");
+        app.handle_key(key(KeyCode::F(2)));
+        let Mode::Diff(d) = &app.mode else {
+            panic!("expected a diff, got {:?}", app.message)
+        };
+        assert!(d.response.left_title.ends_with("a.txt (before)"));
+        assert_eq!(d.response.result.as_ref().unwrap().hunks.len(), 1);
+        app.handle_key(key(KeyCode::Esc));
+        // F8 forgets the entry; the file itself stays.
+        app.handle_key(key(KeyCode::F(8)));
+        app.handle_key(key(KeyCode::Char('y')));
+        assert!(app.panels[LEFT].entries().is_empty());
+        assert!(file.exists());
+    }
+
+    #[test]
+    fn remote_view_can_point_at_a_line() {
+        let (tmp, mut app) = setup();
+        let path = tmp.path().join("left/a.txt").to_string_lossy().into_owned();
+        assert!(app.apply(Command::View { path, line: Some(2) }).ok);
+        let Mode::Viewer(v) = &app.mode else {
+            panic!("expected the viewer")
+        };
+        assert_eq!(v.mark, Some(1));
     }
 
     #[test]

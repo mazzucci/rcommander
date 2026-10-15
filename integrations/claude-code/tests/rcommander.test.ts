@@ -53,7 +53,10 @@ test('follows edits into the other panel by default', async ($, on) => {
   fakeRcmd(on, calls)
   on('tool.call', { tool: 'Edit' }, async () => ({ result: 'edited' }))
   await $.tool.call({ tool: 'Edit', file_path: '/p/main.rs', old_string: 'a', new_string: 'b' })
-  expect(calls).toEqual([['goto', '--side', 'other', '--', '/p/main.rs']])
+  expect(calls).toEqual([
+    ['track', '--', '/p/main.rs'],
+    ['goto', '--side', 'other', '--', '/p/main.rs'],
+  ])
 })
 
 test('diff mode sends the pre-edit content on stdin and writes no file', { options: { follow: 'diff' } }, async ($, on) => {
@@ -68,8 +71,11 @@ test('diff mode sends the pre-edit content on stdin and writes no file', { optio
   })
   on('tool.call', { tool: 'Write' }, async () => ({ result: 'written' }))
   await $.tool.call({ tool: 'Write', file_path: '/p/notes.txt', content: 'new text' })
-  expect(calls).toEqual([['diff', '--', '-', '/p/notes.txt']])
-  expect(stdins).toEqual(['old text'])
+  expect(calls).toEqual([
+    ['track', '--', '/p/notes.txt'],
+    ['diff', '--', '-', '/p/notes.txt'],
+  ])
+  expect(stdins).toEqual(['old text', 'old text'])
   expect(wrote).toBe(false)
 })
 
@@ -87,7 +93,7 @@ test('following never changes the edit result, even when rcmd fails', async ($, 
   on('tool.call', { tool: 'Edit' }, async () => ({ result: 'edited' }))
   const r = await $.tool.call({ tool: 'Edit', file_path: '/p/main.rs', old_string: 'a', new_string: 'b' })
   expect(r.result).toBe('edited')
-  expect(calls.length).toBe(1)
+  expect(calls.length).toBe(2)
 })
 
 test('the show tool reports failures and can open the viewer', async ($, on) => {
@@ -99,7 +105,26 @@ test('the show tool reports failures and can open the viewer', async ($, on) => 
   expect(missing.deny).toContain('path is required')
 })
 
-test('follow off does nothing', { options: { follow: 'off' } }, async ($, on) => {
+test('follow off still records changes', { options: { follow: 'off' } }, async ($, on) => {
+  const calls: string[][] = []
+  const stdins: (string | undefined)[] = []
+  fakeRcmd(on, calls, undefined, stdins)
+  on('fs.read', async () => ({ value: 'before' }))
+  on('tool.call', { tool: 'Edit' }, async () => ({ result: 'edited' }))
+  await $.tool.call({ tool: 'Edit', file_path: '/p/main.rs', old_string: 'a', new_string: 'b' })
+  expect(calls).toEqual([['track', '--', '/p/main.rs']])
+  expect(stdins).toEqual(['before'])
+})
+
+test('the show tool can point at a line', async ($, on) => {
+  const calls: string[][] = []
+  fakeRcmd(on, calls)
+  const r = await $.tool.call({ tool: 'mcp__rcommander__show', path: '/x/a.rs', line: 42 })
+  expect(calls).toEqual([['view', '--line', '42', '--', '/x/a.rs']])
+  expect(String(r.result)).toContain('/x/a.rs:42')
+})
+
+test('follow off and tracking off do nothing', { options: { follow: 'off', track_changes: false } }, async ($, on) => {
   const calls: string[][] = []
   fakeRcmd(on, calls)
   on('tool.call', { tool: 'Edit' }, async () => ({ result: 'edited' }))

@@ -391,10 +391,15 @@ fn draw_viewer(f: &mut Frame, area: Rect, v: &mut Viewer) {
         .skip(v.scroll)
         .take(v.page)
         .map(|(i, l)| {
-            Line::from(vec![
+            let line = Line::from(vec![
                 Span::raw(format!("{:>gutter$} ", i + 1)).fg(DIM),
                 Span::raw(l.chars().skip(v.hscroll).collect::<String>()).white(),
-            ])
+            ]);
+            if v.mark == Some(i) {
+                line.bg(CURSOR_INACTIVE)
+            } else {
+                line
+            }
         })
         .collect();
     f.render_widget(Paragraph::new(lines), inner);
@@ -621,6 +626,7 @@ fn draw_help(f: &mut Frame, area: Rect) {
         ("z", "jump with zoxide"),
         ("Alt+←/→  [  ]", "back / forward"),
         ("Ctrl+D", "hotlist (bookmarks)"),
+        ("c", "Claude's changes: files an agent edited (F2 diff, F8 forget)"),
         ("Ctrl+S  Ctrl+F3..F6", "cycle sort / sort by name, ext, date, size"),
         ("Ctrl+R  Ctrl+U", "refresh / swap panels"),
         ("F2", "diff: cursor files in both panels, or 2 selected"),

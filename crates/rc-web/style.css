@@ -577,9 +577,21 @@ button.key kbd {
 }
 
 .viewer-text {
+    position: relative;
     display: flex;
     min-width: max-content;
     min-height: 100%;
+}
+
+/* The line `rcmd ctl view --line` pointed at. */
+.viewer-text .line-mark {
+    position: absolute;
+    left: 0;
+    right: 0;
+    height: 18px;
+    background: var(--cursor);
+    opacity: 0.55;
+    pointer-events: none;
 }
 
 .viewer-text pre {
