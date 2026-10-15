@@ -40,7 +40,7 @@ impl Viewer {
     pub fn handle_key(&mut self, key: KeyEvent) -> bool {
         let max = self.lines.len().saturating_sub(self.page);
         match key.code {
-            KeyCode::Esc | KeyCode::Char('q') | KeyCode::F(3) | KeyCode::F(10) => return true,
+            KeyCode::Esc | KeyCode::Char('q' | '3') | KeyCode::F(3) | KeyCode::F(10) => return true,
             code => scroll_key(code, &mut self.scroll, &mut self.hscroll, self.page, max),
         }
         false
@@ -105,7 +105,7 @@ impl DiffView {
         let alt = key.modifiers.contains(KeyModifiers::ALT);
         let n = self.hunks().len();
         match key.code {
-            KeyCode::Esc | KeyCode::Char('q') | KeyCode::F(10) => return true,
+            KeyCode::Esc | KeyCode::Char('q' | '2') | KeyCode::F(2) | KeyCode::F(10) => return true,
             KeyCode::Char('n') if n > 0 => self.jump(self.hunk.map_or(0, |h| (h + 1).min(n - 1))),
             KeyCode::Down if alt && n > 0 => self.jump(self.hunk.map_or(0, |h| (h + 1).min(n - 1))),
             KeyCode::Char('p') if n > 0 => self.jump(self.hunk.map_or(0, |h| h.saturating_sub(1))),

@@ -8,7 +8,7 @@ use rc_core::panel::SortKey;
 use rc_core::{Location, Panel, Row, dircmp};
 use rc_vfs::Vfs;
 use std::sync::Arc;
-use std::sync::mpsc::{self, Receiver};
+use std::sync::mpsc::{self, Receiver, TryRecvError};
 
 pub const LEFT: usize = 0;
 pub const RIGHT: usize = 1;
@@ -40,7 +40,15 @@ pub enum PromptAction {
 
 pub struct Confirm {
     pub text: String,
-    pub op: FileOp,
+    pub action: ConfirmAction,
+    /// Whether Enter means yes. Off for irreversible actions, which need an explicit `y`.
+    pub enter_confirms: bool,
+}
+
+pub enum ConfirmAction {
+    Run(FileOp),
+    /// Quit even though a job is running (it is abandoned half-way).
+    Quit,
 }
 
 /// What the event loop must do outside the app (things that need the real terminal).
@@ -266,7 +274,8 @@ impl App {
         };
         self.mode = Mode::Confirm(Confirm {
             text,
-            op: FileOp::Delete { targets, permanent },
+            action: ConfirmAction::Run(FileOp::Delete { targets, permanent }),
+            enter_confirms: !permanent,
         });
     }
 
@@ -292,7 +301,8 @@ impl App {
                     let name = input.split('/').next().unwrap_or(input).to_string();
                     let loc = self.vfs.normalize(loc, Some(&base));
                     let res = self.vfs.op(&FileOp::Mkdir { location: loc }, &mut |_| {});
-                    self.finish_op("Create directory", res);
+                    self.report(&res.summary("Create directory"), res.errors.is_empty());
+                    self.refresh_all();
                     self.active_mut().focus_name(&name);
                 }
             }
@@ -342,46 +352,74 @@ impl App {
     pub fn tick(&mut self) -> bool {
         let Some(job) = &mut self.job else { return false };
         let mut changed = false;
-        let mut done = None;
-        while let Ok(msg) = job.rx.try_recv() {
-            changed = true;
-            match msg {
-                JobMsg::Progress(p) => job.current = p,
-                JobMsg::Done(res) => done = Some(res),
+        loop {
+            match job.rx.try_recv() {
+                Ok(JobMsg::Progress(p)) => {
+                    job.current = p;
+                    changed = true;
+                }
+                Ok(JobMsg::Done(res)) => {
+                    let verb = job.verb;
+                    self.job = None;
+                    self.finish_op(verb, res);
+                    return true;
+                }
+                Err(TryRecvError::Empty) => return changed,
+                // The worker died without reporting (it panicked).
+                Err(TryRecvError::Disconnected) => {
+                    let verb = job.verb;
+                    self.job = None;
+                    self.error(format!("{verb} aborted unexpectedly; check the destination"));
+                    self.refresh_all();
+                    return true;
+                }
             }
         }
-        if let Some(res) = done {
-            let verb = job.verb;
-            self.job = None;
-            self.finish_op(verb, res);
-        }
-        changed
     }
 
+    fn report(&mut self, msg: &str, ok: bool) {
+        if ok { self.info(msg) } else { self.error(msg) }
+    }
+
+    /// Show the result and refresh. The selection is kept when something failed so the
+    /// user can retry.
     fn finish_op(&mut self, verb: &str, res: OpResult) {
-        let summary = res.summary(verb);
-        if res.errors.is_empty() {
-            self.info(summary);
-        } else {
-            self.error(summary);
-        }
-        for p in &mut self.panels {
-            p.clear_selection();
+        let ok = res.errors.is_empty();
+        self.report(&res.summary(verb), ok);
+        if ok {
+            self.panels.iter_mut().for_each(Panel::clear_selection);
         }
         self.refresh_all();
     }
 
-    pub fn handle_key(&mut self, key: KeyEvent) -> Effect {
-        if key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL) {
-            return Effect::Quit;
+    /// Quit, unless that would abandon a running job: then ask first.
+    fn request_quit(&mut self) -> Effect {
+        match &self.job {
+            None => Effect::Quit,
+            Some(job) => {
+                self.mode = Mode::Confirm(Confirm {
+                    text: format!("{} is still running. Quit anyway and leave it incomplete?", job.verb),
+                    action: ConfirmAction::Quit,
+                    enter_confirms: false,
+                });
+                Effect::None
+            }
         }
+    }
+
+    pub fn handle_key(&mut self, key: KeyEvent) -> Effect {
+        let ctrl_c = key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL);
         match std::mem::replace(&mut self.mode, Mode::Normal) {
+            Mode::Normal if ctrl_c => return self.request_quit(),
             Mode::Normal => return self.normal_key(key),
+            // Ctrl+C backs out of whatever is open.
+            _ if ctrl_c => {}
             Mode::Help => {}
-            Mode::Filter => self.filter_key(key),
+            Mode::Filter => return self.filter_key(key),
             Mode::Prompt(p) => self.prompt_key(p, key),
             Mode::Confirm(c) => match key.code {
-                KeyCode::Enter | KeyCode::Char('y' | 'Y') => self.run_job(c.op),
+                KeyCode::Char('y' | 'Y') => return self.confirm(c.action),
+                KeyCode::Enter if c.enter_confirms => return self.confirm(c.action),
                 KeyCode::Esc | KeyCode::Char('n' | 'N') => {}
                 _ => self.mode = Mode::Confirm(c),
             },
@@ -399,29 +437,38 @@ impl App {
         Effect::None
     }
 
-    fn filter_key(&mut self, key: KeyEvent) {
+    fn confirm(&mut self, action: ConfirmAction) -> Effect {
+        match action {
+            ConfirmAction::Run(op) => self.run_job(op),
+            ConfirmAction::Quit => return Effect::Quit,
+        }
+        Effect::None
+    }
+
+    /// Quick filter: typing narrows the list. Any other key (F-keys, Enter, Tab, ...) ends
+    /// filter mode, keeps the filter, and acts normally, so "type, then F5" works.
+    fn filter_key(&mut self, key: KeyEvent) -> Effect {
         let mut filter = self.active_panel().filter.clone();
         match key.code {
             KeyCode::Esc => filter.clear(),
-            KeyCode::Enter => return,
             KeyCode::Backspace => {
                 filter.pop();
                 self.mode = Mode::Filter;
             }
-            KeyCode::Char(c) => {
+            KeyCode::Char(c) if !has_command_modifier(key) => {
                 filter.push(c);
                 self.mode = Mode::Filter;
             }
-            // Let the cursor move while filtering.
             KeyCode::Up | KeyCode::Down => {
-                self.active_mut()
-                    .move_cursor(if key.code == KeyCode::Up { -1 } else { 1 });
+                let delta = if key.code == KeyCode::Up { -1 } else { 1 };
+                self.active_mut().move_cursor(delta);
                 self.mode = Mode::Filter;
-                return;
+                return Effect::None;
             }
-            _ => self.mode = Mode::Filter,
+            _ => return self.normal_key(key),
         }
         self.active_mut().set_filter(&filter);
+        Effect::None
     }
 
     fn prompt_key(&mut self, mut p: Prompt, key: KeyEvent) {
@@ -436,7 +483,7 @@ impl App {
                 p.input.clear();
                 self.mode = Mode::Prompt(p);
             }
-            KeyCode::Char(c) => {
+            KeyCode::Char(c) if !has_command_modifier(key) => {
                 p.input.push(c);
                 self.mode = Mode::Prompt(p);
             }
@@ -454,7 +501,7 @@ impl App {
             other => other,
         };
         match code {
-            KeyCode::Char('q') | KeyCode::F(10) => return Effect::Quit,
+            KeyCode::Char('q') | KeyCode::F(10) => return self.request_quit(),
             KeyCode::Up => self.active_mut().move_cursor(-1),
             KeyCode::Down => self.active_mut().move_cursor(1),
             KeyCode::PageUp => self.active_mut().move_cursor(-page),
@@ -481,10 +528,14 @@ impl App {
                 PromptAction::SelectMask { select: false },
             ),
             KeyCode::Char('*') => self.active_mut().invert_selection(),
+            // First Esc clears the filter, the next one the selection.
             KeyCode::Esc => {
                 let p = self.active_mut();
-                p.clear_selection();
-                p.set_filter("");
+                if p.filter.is_empty() {
+                    p.clear_selection();
+                } else {
+                    p.set_filter("");
+                }
             }
             KeyCode::Char('/') => self.mode = Mode::Filter,
             KeyCode::Char('f') if ctrl => self.mode = Mode::Filter,
@@ -525,6 +576,11 @@ impl App {
     pub fn job_status(&self) -> Option<String> {
         self.job.as_ref().map(|j| format!("{}: {}", j.verb, j.current))
     }
+}
+
+/// Ctrl/Alt chords are commands, never text.
+fn has_command_modifier(key: KeyEvent) -> bool {
+    key.modifiers.intersects(KeyModifiers::CONTROL | KeyModifiers::ALT)
 }
 
 #[cfg(test)]
@@ -647,6 +703,93 @@ mod tests {
         assert_eq!(app.panels[LEFT].marks.get("b.txt"), Some(&dircmp::CmpMark::Orphan));
         app.handle_key(key(KeyCode::F(9)));
         assert!(app.panels[LEFT].marks.is_empty());
+    }
+
+    #[test]
+    fn quitting_during_a_job_asks_first() {
+        let (_tmp, mut app) = setup();
+        let (_tx, rx) = mpsc::channel();
+        app.job = Some(Job {
+            verb: "Copy",
+            current: String::new(),
+            rx,
+        });
+        assert_eq!(app.handle_key(key(KeyCode::Char('q'))), Effect::None);
+        assert!(matches!(app.mode, Mode::Confirm(_)));
+        assert_eq!(
+            app.handle_key(key(KeyCode::Enter)),
+            Effect::None,
+            "Enter does not confirm"
+        );
+        assert_eq!(app.handle_key(key(KeyCode::Char('y'))), Effect::Quit);
+    }
+
+    #[test]
+    fn dead_worker_clears_the_job() {
+        let (_tmp, mut app) = setup();
+        let (tx, rx) = mpsc::channel::<JobMsg>();
+        drop(tx);
+        app.job = Some(Job {
+            verb: "Copy",
+            current: String::new(),
+            rx,
+        });
+        assert!(app.tick());
+        assert!(app.job.is_none());
+        assert!(app.message.as_ref().unwrap().1);
+    }
+
+    #[test]
+    fn function_keys_work_from_the_filter() {
+        let (tmp, mut app) = setup();
+        app.handle_key(key(KeyCode::Char('/')));
+        typed(&mut app, "b.");
+        app.handle_key(key(KeyCode::Down));
+        app.handle_key(key(KeyCode::F(8)));
+        let Mode::Confirm(c) = &app.mode else {
+            panic!("expected confirm")
+        };
+        assert!(c.text.contains("b.txt"), "{}", c.text);
+        assert_eq!(app.panels[LEFT].filter, "b.", "filter is kept");
+        app.handle_key(key(KeyCode::Char('n')));
+        assert!(matches!(app.mode, Mode::Normal));
+        assert!(tmp.path().join("left/b.txt").exists());
+    }
+
+    #[test]
+    fn digits_are_text_in_prompts_and_ctrl_chords_are_not() {
+        let (tmp, mut app) = setup();
+        app.handle_key(key(KeyCode::Char('7')));
+        typed(&mut app, "2024");
+        app.handle_key(KeyEvent::new(KeyCode::Char('a'), KeyModifiers::CONTROL));
+        app.handle_key(key(KeyCode::Enter));
+        assert!(tmp.path().join("left/2024").is_dir());
+    }
+
+    #[test]
+    fn selection_beats_cursor_and_parent_row_is_inert() {
+        let (_tmp, mut app) = setup();
+        app.panels[LEFT].cursor_home();
+        app.handle_key(key(KeyCode::F(5)));
+        assert!(matches!(app.mode, Mode::Normal), "no copy of '..'");
+        app.panels[LEFT].select_mask("*.txt", true);
+        app.panels[LEFT].focus_name("sub");
+        app.handle_key(key(KeyCode::F(8)));
+        let Mode::Confirm(c) = &app.mode else {
+            panic!("expected confirm")
+        };
+        assert!(c.text.contains("2 items"), "{}", c.text);
+    }
+
+    #[test]
+    fn esc_clears_filter_before_selection() {
+        let (_tmp, mut app) = setup();
+        app.panels[LEFT].select_mask("*", true);
+        app.panels[LEFT].set_filter("a");
+        app.handle_key(key(KeyCode::Esc));
+        assert!(app.panels[LEFT].filter.is_empty() && !app.panels[LEFT].selected.is_empty());
+        app.handle_key(key(KeyCode::Esc));
+        assert!(app.panels[LEFT].selected.is_empty());
     }
 
     #[test]

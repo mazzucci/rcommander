@@ -42,7 +42,8 @@ pub fn draw(f: &mut Frame, app: &mut App) {
     match &app.mode {
         Mode::Prompt(p) => {
             let area = popup(main, 70, 5);
-            let input = format!("{}█", p.input);
+            // Keep the end of long input (where the user types) visible.
+            let input = format!("{}█", elide_start(&p.input, area.width.saturating_sub(3) as usize));
             let block = Block::bordered()
                 .border_type(BorderType::Rounded)
                 .title(p.title.as_str())
@@ -73,7 +74,9 @@ pub fn draw(f: &mut Frame, app: &mut App) {
 }
 
 fn popup(area: Rect, width_pct: u16, height: u16) -> Rect {
-    let w = (area.width * width_pct / 100).max(30).min(area.width);
+    let w = ((u32::from(area.width) * u32::from(width_pct) / 100) as u16)
+        .max(30)
+        .min(area.width);
     let h = height.min(area.height);
     Rect {
         x: area.x + (area.width - w) / 2,
@@ -113,8 +116,8 @@ fn mark_color(m: CmpMark) -> Color {
 
 fn panel_status(p: &Panel) -> String {
     let (n, size) = p.selection_summary();
-    let files = p.entries().iter().filter(|e| !e.is_dir).count();
-    let mut s = format!(" {n} of {files} selected, {} ", human_size(size));
+    let visible = p.rows().iter().filter(|r| matches!(r, Row::Entry(_))).count();
+    let mut s = format!(" {n} of {visible} selected, {} ", human_size(size));
     s += &format!("· {}{} ", p.sort.label(), if p.sort_desc { "▼" } else { "▲" });
     if !p.filter.is_empty() {
         s += &format!("· filter: {} ", p.filter);
@@ -201,9 +204,15 @@ fn draw_panel(f: &mut Frame, area: Rect, app: &mut App, side: usize) {
             }
         };
         if r == p.cursor {
-            style = style
-                .bg(cursor_bg)
-                .fg(if is_active { Color::Black } else { Color::White });
+            // Keep selected entries recognizable under the cursor.
+            let selected = p.row_entry(r).is_some_and(|e| p.is_selected(e));
+            let fg = match (selected, is_active) {
+                (true, true) => Color::Indexed(94),
+                (true, false) => Color::Yellow,
+                (false, true) => Color::Black,
+                (false, false) => Color::White,
+            };
+            style = style.bg(cursor_bg).fg(fg);
         }
         let mut cells = vec![
             mark,
@@ -260,7 +269,7 @@ fn draw_keys(f: &mut Frame, area: Rect, mode: &Mode) {
             ("7", "MkDir"),
             ("8", "Delete"),
             ("9", "CmpDirs"),
-            ("10", "Quit"),
+            ("q", "Quit"),
         ],
     };
     let spans: Vec<Span> = keys
@@ -498,6 +507,47 @@ mod tests {
         app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
         app.handle_key(KeyEvent::new(KeyCode::F(1), KeyModifiers::NONE));
         assert!(screen(&mut app).contains("quick filter"));
+    }
+
+    #[test]
+    fn extreme_terminal_sizes_do_not_panic() {
+        let tmp = tempfile::tempdir().unwrap();
+        let loc = rc_core::Location::local(tmp.path().to_string_lossy());
+        let mut app = App::new(Arc::new(rc_vfs::Vfs::new()), loc.clone(), loc);
+        for (w, h) in [(1000, 10), (10, 3), (1, 1)] {
+            for code in [KeyCode::F(7), KeyCode::Esc, KeyCode::F(1), KeyCode::Esc] {
+                let mut term = Terminal::new(TestBackend::new(w, h)).unwrap();
+                term.draw(|f| draw(f, &mut app)).unwrap();
+                app.handle_key(KeyEvent::new(code, KeyModifiers::NONE));
+            }
+        }
+    }
+
+    #[test]
+    fn long_prompt_input_shows_its_end() {
+        let tmp = tempfile::tempdir().unwrap();
+        let loc = rc_core::Location::local(tmp.path().to_string_lossy());
+        let mut app = App::new(Arc::new(rc_vfs::Vfs::new()), loc.clone(), loc);
+        app.handle_key(KeyEvent::new(KeyCode::F(7), KeyModifiers::NONE));
+        for c in format!("{}END", "x".repeat(150)).chars() {
+            app.handle_key(KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE));
+        }
+        assert!(screen(&mut app).contains("END█"));
+    }
+
+    #[test]
+    fn cursor_stays_visible_when_scrolling() {
+        let tmp = tempfile::tempdir().unwrap();
+        for i in 0..100 {
+            std::fs::write(tmp.path().join(format!("f{i:03}")), "").unwrap();
+        }
+        let loc = rc_core::Location::local(tmp.path().to_string_lossy());
+        let mut app = App::new(Arc::new(rc_vfs::Vfs::new()), loc.clone(), loc);
+        app.handle_key(KeyEvent::new(KeyCode::End, KeyModifiers::NONE));
+        assert!(screen(&mut app).contains("f099"));
+        app.handle_key(KeyEvent::new(KeyCode::Home, KeyModifiers::NONE));
+        let s = screen(&mut app);
+        assert!(s.contains("[..]") && !s.contains("f099"));
     }
 
     #[test]

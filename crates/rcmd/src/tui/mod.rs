@@ -45,8 +45,8 @@ fn event_loop(terminal: &mut DefaultTerminal, app: &mut App) -> Result<()> {
                         .args(parts)
                         .arg(&path)
                         .status();
+                    // A fresh alternate screen is blank and the next draw repaints everything.
                     *terminal = ratatui::init();
-                    terminal.clear()?;
                     if let Err(e) = status {
                         app.message = Some((format!("cannot run {editor}: {e}"), true));
                     }
