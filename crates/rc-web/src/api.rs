@@ -2,8 +2,8 @@
 
 use gloo_net::http::Request;
 use rc_core::api::{
-    ApiError, Conflicts, DiffRequest, DiffResponse, FileContent, FileOp, ForgetRequest, InitResponse, ListRequest,
-    OpResult, OpenRequest, ReadRequest,
+    ApiError, Conflicts, DiffRequest, DiffResponse, FileContent, FileOp, ForgetRequest, InitResponse, JobRequest,
+    JobStatus, ListRequest, OpResult, OpenRequest, ReadRequest,
 };
 use rc_core::{Listing, Location, Settings};
 use serde::Serialize;
@@ -120,8 +120,23 @@ pub async fn conflicts(op: &FileOp) -> Result<Conflicts, String> {
     call("conflicts", op).await
 }
 
-pub async fn op(op: FileOp) -> Result<OpResult, String> {
-    call("op", &op).await
+/// Run an operation; with a `job` id (letters, digits, `-`) [`job`] and [`cancel`]
+/// can follow and stop it.
+pub async fn op(op: FileOp, job: Option<String>) -> Result<OpResult, String> {
+    match job {
+        Some(job) => call(&format!("op?job={job}"), &op).await,
+        None => call("op", &op).await,
+    }
+}
+
+/// Progress of a running operation.
+pub async fn job(job: String) -> Result<JobStatus, String> {
+    call("job", &JobRequest { job }).await
+}
+
+/// Ask a running operation to stop.
+pub async fn cancel(job: String) -> Result<JobStatus, String> {
+    call("cancel", &JobRequest { job }).await
 }
 
 /// Open a file in the configured editor (or the system default application).

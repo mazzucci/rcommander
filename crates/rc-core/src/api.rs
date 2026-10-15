@@ -161,6 +161,23 @@ impl Progress {
     }
 }
 
+/// Names a running operation. `POST /api/op?job=ID` runs under `ID` (letters, digits and
+/// `-`, at most 64); `POST /api/job` with this body reports on it ([`JobStatus`]) and
+/// `POST /api/cancel` stops it.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct JobRequest {
+    pub job: String,
+}
+
+/// `POST /api/job` / `POST /api/cancel` → where an operation is.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct JobStatus {
+    /// False once the operation has finished (or if it never started).
+    pub running: bool,
+    /// The latest progress report, if any arrived yet.
+    pub progress: Option<Progress>,
+}
+
 /// `POST /api/conflicts` with a [`FileOp`] body → [`Conflicts`]: what a copy or move
 /// would find already in place, so the UI can ask before running it.
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]

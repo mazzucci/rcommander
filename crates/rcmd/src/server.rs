@@ -19,17 +19,19 @@ use axum::routing::get;
 use axum::routing::post;
 use axum::{Json, Router};
 use rc_core::api::{ApiError, DiffRequest, FileOp, InitResponse, ListRequest, OpenRequest, ReadRequest};
-use rc_core::api::{BrowserEvent, ChangesDirs, ForgetRequest};
+use rc_core::api::{BrowserEvent, ChangesDirs, ForgetRequest, JobRequest, JobStatus, Progress};
 use rc_core::control::{Command, Reply};
 use rc_core::{Location, Settings};
 use rc_vfs::Vfs;
 use rc_vfs::watch::DirWatcher;
 use rust_embed::RustEmbed;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, VecDeque};
 use std::convert::Infallible;
 use std::io::Read;
+use std::ops::ControlFlow;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 use tokio::sync::broadcast;
 
@@ -62,6 +64,76 @@ struct AppState {
     /// Remote-control commands and change notices on their way to connected browsers.
     events: broadcast::Sender<BrowserEvent>,
     live: LiveDirs,
+    jobs: Jobs,
+}
+
+/// Operations started with a job id, so the browser can follow and cancel them.
+#[derive(Clone, Default)]
+struct Jobs(Arc<Mutex<HashMap<String, Arc<Job>>>>);
+
+#[derive(Default)]
+struct Job {
+    progress: Mutex<Option<Progress>>,
+    cancel: AtomicBool,
+}
+
+impl Job {
+    /// The progress callback of the operation: remember the report, stop if asked to.
+    fn report(&self, p: &Progress) -> ControlFlow<()> {
+        *self.progress.lock().expect("job lock") = Some(p.clone());
+        if self.cancel.load(Ordering::Relaxed) {
+            ControlFlow::Break(())
+        } else {
+            ControlFlow::Continue(())
+        }
+    }
+}
+
+/// Removes its job from the registry when the operation ends, however it ends.
+struct JobEntry {
+    jobs: Jobs,
+    id: String,
+    job: Arc<Job>,
+}
+
+impl Drop for JobEntry {
+    fn drop(&mut self) {
+        self.jobs.0.lock().expect("jobs lock").remove(&self.id);
+    }
+}
+
+impl Jobs {
+    fn start(&self, id: String) -> Result<JobEntry, (StatusCode, String)> {
+        let valid = !id.is_empty() && id.len() <= 64 && id.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-');
+        if !valid {
+            return Err((StatusCode::BAD_REQUEST, "invalid job id".into()));
+        }
+        let mut jobs = self.0.lock().expect("jobs lock");
+        if jobs.contains_key(&id) {
+            return Err((StatusCode::CONFLICT, format!("job {id} is already running")));
+        }
+        let job = Arc::new(Job::default());
+        jobs.insert(id.clone(), job.clone());
+        Ok(JobEntry {
+            jobs: self.clone(),
+            id,
+            job,
+        })
+    }
+
+    fn status(&self, id: &str, cancel: bool) -> JobStatus {
+        let Some(job) = self.0.lock().expect("jobs lock").get(id).cloned() else {
+            return JobStatus::default();
+        };
+        if cancel {
+            job.cancel.store(true, Ordering::Relaxed);
+        }
+        let progress = job.progress.lock().expect("job lock").clone();
+        JobStatus {
+            running: true,
+            progress,
+        }
+    }
 }
 
 /// Most directories watched for live refresh: the browser shows two, the rest let
@@ -188,6 +260,7 @@ async fn serve(vfs: Arc<Vfs>, config: Config) -> Result<()> {
             settings_path: config.settings_path.map(Arc::new),
             events,
             live,
+            jobs: Jobs::default(),
         },
         addr.port(),
     );
@@ -264,6 +337,8 @@ fn router(state: AppState, port: u16) -> Router {
         .route("/diff", post(diff))
         .route("/diff_head", post(diff_head))
         .route("/op", post(op))
+        .route("/job", post(job_status))
+        .route("/cancel", post(cancel_job))
         .route("/conflicts", post(conflicts))
         .route("/changes/forget", post(forget_changes))
         .route("/open", post(open_external))
@@ -423,12 +498,34 @@ async fn conflicts(State(s): State<AppState>, Json(op): Json<FileOp>) -> Respons
     blocking(move || Ok(s.vfs.conflicts(&normalize_op(&s.vfs, op)))).await
 }
 
-async fn op(State(s): State<AppState>, Json(op): Json<FileOp>) -> Response {
+#[derive(Deserialize)]
+struct OpQuery {
+    job: Option<String>,
+}
+
+/// Run an operation; with `?job=ID` its progress can be followed and it can be cancelled.
+async fn op(State(s): State<AppState>, Query(q): Query<OpQuery>, Json(op): Json<FileOp>) -> Response {
+    let entry = match q.job.map(|id| s.jobs.start(id)).transpose() {
+        Ok(entry) => entry,
+        Err((status, msg)) => return api_error(status, msg),
+    };
     blocking(move || {
-        Ok(s.vfs
-            .op(&normalize_op(&s.vfs, op), &mut |_| std::ops::ControlFlow::Continue(())))
+        let op = normalize_op(&s.vfs, op);
+        Ok(s.vfs.op(&op, &mut |p| match &entry {
+            Some(entry) => entry.job.report(p),
+            None => ControlFlow::Continue(()),
+        }))
     })
     .await
+}
+
+async fn job_status(State(s): State<AppState>, Json(req): Json<JobRequest>) -> Json<JobStatus> {
+    Json(s.jobs.status(&req.job, false))
+}
+
+/// Ask a running operation to stop; it does at the next file or chunk.
+async fn cancel_job(State(s): State<AppState>, Json(req): Json<JobRequest>) -> Json<JobStatus> {
+    Json(s.jobs.status(&req.job, true))
 }
 
 /// Make every path of an operation absolute and clean, as the panels show them.
@@ -593,6 +690,7 @@ mod tests {
             settings_path: None,
             live: LiveDirs::new(events.clone()),
             events,
+            jobs: Jobs::default(),
         };
         router(state, PORT)
     }
@@ -661,6 +759,70 @@ mod tests {
         let (status, body) = call(app(tmp.path()), post("/api/list", req, Some("secret"), &host)).await;
         assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
         assert!(body["error"].is_string());
+    }
+
+    #[test]
+    fn jobs_report_progress_and_cancel() {
+        let jobs = Jobs::default();
+        let entry = jobs.start("job-1".into()).ok().unwrap();
+        assert!(jobs.start("job-1".into()).is_err(), "ids are unique while running");
+        assert!(jobs.start("no spaces".into()).is_err());
+        assert!(jobs.start(String::new()).is_err());
+        assert_eq!(
+            jobs.status("job-1", false),
+            JobStatus {
+                running: true,
+                progress: None
+            }
+        );
+
+        let p = Progress {
+            path: "/a/b".into(),
+            done: 5,
+            total: 10,
+        };
+        assert!(entry.job.report(&p).is_continue());
+        assert_eq!(jobs.status("job-1", false).progress, Some(p.clone()));
+        assert!(jobs.status("job-1", true).running, "cancel answers with the status");
+        assert!(
+            entry.job.report(&p).is_break(),
+            "the operation stops at its next report"
+        );
+        assert!(!jobs.status("other", true).running, "unknown jobs are not running");
+
+        drop(entry);
+        assert_eq!(
+            jobs.status("job-1", false),
+            JobStatus::default(),
+            "finished jobs are gone"
+        );
+        assert!(jobs.start("job-1".into()).is_ok(), "and the id can be used again");
+    }
+
+    #[tokio::test]
+    async fn op_runs_under_a_job_id() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().to_string_lossy().to_string();
+        let host = format!("localhost:{PORT}");
+        let mkdir = serde_json::json!({ "op": "mkdir", "location": { "kind": "local", "path": format!("{dir}/new") } });
+
+        let (status, body) = call(
+            app(tmp.path()),
+            post("/api/op?job=abc-1", mkdir.clone(), Some("secret"), &host),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["done"], 1);
+        let job = serde_json::json!({ "job": "abc-1" });
+        let (status, body) = call(app(tmp.path()), post("/api/job", job.clone(), Some("secret"), &host)).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body, serde_json::json!({ "running": false, "progress": null }));
+        let (status, _) = call(app(tmp.path()), post("/api/cancel", job.clone(), None, &host)).await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+
+        let (status, body) = call(app(tmp.path()), post("/api/op?job=a%20b", mkdir, Some("secret"), &host)).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert!(body["error"].as_str().unwrap().contains("job"));
     }
 
     #[tokio::test]
@@ -843,6 +1005,7 @@ mod tests {
             settings_path: None,
             live: LiveDirs::new(events.clone()),
             events: events.clone(),
+            jobs: Jobs::default(),
         };
         let resp = super::router(state, PORT)
             .oneshot(get("/api/events?token=secret"))
@@ -976,6 +1139,7 @@ mod tests {
             settings_path: None,
             live: live.clone(),
             events,
+            jobs: Jobs::default(),
         };
         let host = format!("127.0.0.1:{PORT}");
         let req = serde_json::json!({ "location": { "kind": "local", "path": &dir } });

@@ -491,6 +491,71 @@ button.primary kbd {
     animation: pulse 1s ease-in-out infinite alternate;
 }
 
+/* A running copy, move or delete: verb, file, bar, percent, Cancel. */
+.job {
+    display: flex;
+    flex: none;
+    align-items: center;
+    gap: 8px;
+    max-width: 45%;
+    min-width: 0;
+}
+
+.job-verb {
+    color: var(--accent);
+}
+
+.job-file {
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    color: var(--text);
+}
+
+.job-bar {
+    flex: none;
+    width: 120px;
+    height: 6px;
+    border-radius: 3px;
+    background: var(--border);
+    overflow: hidden;
+}
+
+.job-fill {
+    display: block;
+    height: 100%;
+    background: var(--accent);
+    transition: width 0.2s linear;
+}
+
+.job-pct {
+    flex: none;
+    min-width: 3.5ch;
+    text-align: right;
+    font-variant-numeric: tabular-nums;
+    color: var(--meta);
+}
+
+button.job-cancel {
+    flex: none;
+    height: 20px;
+    padding: 0 8px;
+    font-size: 12px;
+    background: transparent;
+    border: 1px solid var(--border-strong);
+    border-radius: 4px;
+    color: var(--text);
+}
+
+button.job-cancel:hover:not(:disabled) {
+    border-color: var(--del);
+    color: var(--del);
+}
+
+button.job-cancel:disabled {
+    opacity: 0.5;
+}
+
 @keyframes pulse {
     to {
         opacity: 0.35;

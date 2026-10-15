@@ -11,8 +11,11 @@ use crate::{api, dom, events};
 use leptos::ev;
 use leptos::prelude::*;
 use leptos::task::spawn_local;
-use rc_core::api::{BrowserEvent, ChangesDirs, Conflicts, DiffResponse, FileContent, FileOp, OnConflict, OpResult};
+use rc_core::api::{
+    BrowserEvent, ChangesDirs, Conflicts, DiffResponse, FileContent, FileOp, OnConflict, OpResult, Progress,
+};
 use rc_core::dircmp::{self, CmpMark};
+use rc_core::format::human_size;
 use rc_core::history::History;
 use rc_core::{Location, Panel, Row, Settings, SortKey};
 use std::collections::HashMap;
@@ -33,6 +36,22 @@ pub struct Message {
     pub text: String,
     pub error: bool,
 }
+
+/// A copy, move or delete the server is running, followed in the footer.
+#[derive(Clone)]
+pub struct Job {
+    pub id: String,
+    /// "Copying", "Moving", "Deleting".
+    pub verb: &'static str,
+    /// Latest report from the server; `None` until the first one.
+    pub progress: Option<Progress>,
+    /// Shown once the operation has run for a moment (quick ones never flash up).
+    pub shown: bool,
+    pub cancelling: bool,
+}
+
+/// How long an operation runs before its progress shows, and how often it is polled.
+const JOB_POLL: Duration = Duration::from_millis(250);
 
 /// Views that cover the panels and take over the keyboard while open.
 #[derive(Clone)]
@@ -75,6 +94,10 @@ pub struct App {
     pub message: RwSignal<Option<Message>>,
     /// Number of API requests in flight.
     pub busy: RwSignal<u32>,
+    /// Running copies, moves and deletes, oldest first.
+    pub jobs: RwSignal<Vec<Job>>,
+    /// Number of jobs started, for their ids.
+    job_seq: StoredValue<u64>,
     /// Per panel: entries that just appeared or changed on disk, highlighted briefly,
     /// with the refresh that highlighted them (a later one restarts the highlight).
     pub flash: [RwSignal<HashMap<String, u64>>; 2],
@@ -121,6 +144,8 @@ impl App {
             overlay: RwSignal::new(None),
             message: RwSignal::new(None),
             busy: RwSignal::new(0),
+            jobs: RwSignal::new(Vec::new()),
+            job_seq: StoredValue::new(0),
             flash: [RwSignal::new(HashMap::new()), RwSignal::new(HashMap::new())],
             load_seq: [StoredValue::new(0), StoredValue::new(0)],
             refresh_seq: [StoredValue::new(0), StoredValue::new(0)],
@@ -736,17 +761,94 @@ impl App {
         let verb = op.verb();
         // The panel the operation started from, even if the user switches meanwhile.
         let side = self.active_side();
-        self.request(api::op(op), move |result: OpResult| {
-            let text = result.summary(verb);
-            if result.errors.is_empty() {
-                self.info(text);
-                // As in the terminal UI: keep the selection only when something failed.
-                self.panels.iter().for_each(|p| p.update(|p| p.clear_selection()));
-            } else {
-                self.error(text);
+        let job = self.start_job(&op);
+        let fut = api::op(op, job.clone());
+        self.request(
+            async move {
+                let result = fut.await;
+                if let Some(id) = job {
+                    self.jobs.update(|jobs| jobs.retain(|j| j.id != id));
+                }
+                result
+            },
+            move |result: OpResult| {
+                let text = result.summary(verb);
+                if result.errors.is_empty() {
+                    self.info(text);
+                    // As in the terminal UI: keep the selection only when something failed.
+                    self.panels.iter().for_each(|p| p.update(|p| p.clear_selection()));
+                } else {
+                    self.error(text);
+                }
+                self.reload(side, focus);
+                self.reload(1 - side, None);
+            },
+        );
+    }
+
+    /// Register a copy, move or delete as a job and start following its progress.
+    /// Other operations are quick and run without one.
+    fn start_job(self, op: &FileOp) -> Option<String> {
+        let verb = match op {
+            FileOp::Copy { .. } => "Copying",
+            FileOp::Move { .. } => "Moving",
+            FileOp::Delete { .. } => "Deleting",
+            FileOp::Mkdir { .. } | FileOp::Rename { .. } => return None,
+        };
+        let seq = self.job_seq.get_value() + 1;
+        self.job_seq.set_value(seq);
+        // Unique across tabs and reloads talking to the same server.
+        let id = format!("{seq}-{:x}", (js_sys::Math::random() * u32::MAX as f64) as u32);
+        self.jobs.update(|jobs| {
+            jobs.push(Job {
+                id: id.clone(),
+                verb,
+                progress: None,
+                shown: false,
+                cancelling: false,
+            })
+        });
+        self.poll_job(id.clone());
+        Some(id)
+    }
+
+    /// Ask the server where the job is, again and again until it finishes.
+    fn poll_job(self, id: String) {
+        set_timeout(
+            move || {
+                if !self.jobs.with_untracked(|jobs| jobs.iter().any(|j| j.id == id)) {
+                    return;
+                }
+                spawn_local(async move {
+                    let status = api::job(id.clone()).await;
+                    self.jobs.update(|jobs| {
+                        if let Some(job) = jobs.iter_mut().find(|j| j.id == id) {
+                            job.shown = true;
+                            if let Ok(status) = status
+                                && status.progress.is_some()
+                            {
+                                job.progress = status.progress;
+                            }
+                        }
+                    });
+                    self.poll_job(id);
+                });
+            },
+            JOB_POLL,
+        );
+    }
+
+    /// The footer's Cancel button: the server stops at the next file or chunk.
+    pub fn cancel_job(self, id: String) {
+        self.jobs.update(|jobs| {
+            if let Some(job) = jobs.iter_mut().find(|j| j.id == id) {
+                job.cancelling = true;
             }
-            self.reload(side, focus);
-            self.reload(1 - side, None);
+        });
+        spawn_local(async move {
+            if let Err(e) = api::cancel(id).await {
+                self.error(e);
+            }
         });
     }
 
@@ -946,7 +1048,11 @@ pub fn Root() -> impl IntoView {
                             })
                     }}
                 </span>
-                <Show when=move || { app.busy.get() > 0 }>
+                <For each=move || app.jobs.with(|jobs| jobs.iter().filter(|j| j.shown).map(|j| j.id.clone()).collect::<Vec<_>>()) key=String::clone let:id>
+                    <JobView app id/>
+                </For>
+                // A job shows its own progress.
+                <Show when=move || { app.busy.get() > 0 && app.jobs.with(|jobs| !jobs.iter().any(|j| j.shown)) }>
                     <span class="busy">"Working…"</span>
                 </Show>
                 <nav class="keys-bar">
@@ -974,5 +1080,49 @@ pub fn Root() -> impl IntoView {
                     Overlay::Help => view! { <HelpView app/> }.into_any(),
                 })
         }}
+    }
+}
+
+/// A running operation in the footer: what, which file, how far, and a way to stop it.
+#[component]
+fn JobView(app: App, id: String) -> impl IntoView {
+    let job = {
+        let id = id.clone();
+        Memo::new(move |_| {
+            app.jobs.with(|jobs| {
+                jobs.iter()
+                    .find(|j| j.id == id)
+                    .map(|j| (j.verb, j.progress.clone(), j.cancelling))
+            })
+        })
+    };
+    let progress = move || job.get().and_then(|(_, p, _)| p);
+    let cancelling = move || job.get().is_some_and(|(_, _, c)| c);
+    // Deletes report files, not bytes: no bar for them.
+    let percent = move || progress().filter(|p| p.total > 0).map(|p| p.percent());
+    let title = move || {
+        progress().map(|p| {
+            let bytes = if p.total > 0 {
+                format!("\n{} of {}", human_size(p.done), human_size(p.total))
+            } else {
+                String::new()
+            };
+            format!("{}{bytes}", p.path)
+        })
+    };
+    view! {
+        <span class="job" title=title>
+            <span class="job-verb">{move || if cancelling() { "Cancelling…" } else { job.get().map_or("", |(v, _, _)| v) }}</span>
+            <span class="job-file">{move || progress().map(|p| p.path.rsplit('/').next().unwrap_or_default().to_string())}</span>
+            <Show when=move || percent().is_some()>
+                <span class="job-bar"><span class="job-fill" style:width=move || format!("{}%", percent().unwrap_or(0))></span></span>
+                <span class="job-pct">{move || format!("{}%", percent().unwrap_or(0))}</span>
+            </Show>
+            <button class="job-cancel" tabindex="-1" disabled=cancelling
+                on:mousedown=|ev| ev.prevent_default()
+                on:click=move |_| app.cancel_job(id.clone())>
+                "Cancel"
+            </button>
+        </span>
     }
 }
