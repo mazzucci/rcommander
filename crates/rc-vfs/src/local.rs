@@ -231,7 +231,9 @@ pub fn rename_many(dir: &Path, renames: &[(String, String)]) -> Result<usize> {
     let sources: std::collections::HashSet<&str> = renames.iter().map(|(a, _)| a.as_str()).collect();
     let mut targets = std::collections::HashSet::new();
     for (from, to) in &renames {
-        if !valid_name(from) {
+        // An existing name only has to be one entry of `dir` (it may be odd, which is
+        // often why it is being renamed).
+        if from.is_empty() || from == "." || from == ".." || from.contains('/') {
             bail!("invalid name: {from:?}");
         }
         if !valid_name(to) {
@@ -784,6 +786,11 @@ mod tests {
             .filter(|e| e.file_name().to_string_lossy().starts_with(".rcmd-rename"))
             .collect();
         assert!(leftovers.is_empty());
+        // A name with a control character can be fixed by renaming it.
+        fs::write(d.join("odd\nname"), "O").unwrap();
+        assert_eq!(rename_many(d, &r(&[("odd\nname", "odd name")])).unwrap(), 1);
+        assert_eq!(read("odd name"), "O");
+        fs::remove_file(d.join("odd name")).unwrap();
         // Unchanged names are fine and not counted.
         assert_eq!(rename_many(d, &r(&[("a", "a"), ("b", "e")])).unwrap(), 1);
     }
