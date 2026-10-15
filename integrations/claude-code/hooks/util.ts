@@ -22,9 +22,3 @@ export function describeFailure(output: string): string {
   const line = output.trim().split('\n')[0] ?? ''
   return line.replace(/^Error:\s*/, '') || 'rcmd ctl failed'
 }
-
-/** Where the pre-edit copy of `file` goes for the diff view. */
-export function snapshotPath(file: string): string {
-  const name = file.split('/').pop() || 'file'
-  return `/tmp/rcommander-claude/${name}.before`
-}

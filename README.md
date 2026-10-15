@@ -68,12 +68,12 @@ rcmd ctl select '*.rs'
 rcmd ctl message "build finished"
 ```
 
-Each instance listens on a Unix socket only your user can open (`$XDG_RUNTIME_DIR/rcommander/`, or a per-user folder in the temp dir).
+Each instance listens on a Unix socket only your user can open (`$XDG_RUNTIME_DIR/rcommander/`, or a private per-user folder in the temp dir; rcmd refuses folders it doesn't own). Commands are refused while a dialog is open, never move your focus, and `rcmd ctl diff - FILE` reads the "before" side from stdin.
 
 The **rcommander Claude Code plugin** (`integrations/claude-code`) builds on this. It adds:
 
 - a `/rc` command (`/rc goto <path>`, `/rc diff <a> <b>`, …);
-- a tool Claude can call to show you a file, directory or diff;
+- a tool Claude can call to show you a file, directory or diff (it only moves your file manager, so it runs without a permission prompt);
 - optionally following Claude's edits: after it edits a file, rcommander shows it in the other panel (`goto`, the default) or opens a diff of the change (`diff`).
 
 Install it from a Claude Code terminal session:

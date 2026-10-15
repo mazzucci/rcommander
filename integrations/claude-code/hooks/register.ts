@@ -1,6 +1,6 @@
 import type { EngineInterface, Register } from 'claude-code'
 
-import { describeFailure, snapshotPath, splitArgs, USAGE } from './util.ts'
+import { describeFailure, splitArgs, USAGE } from './util.ts'
 
 type Follow = 'off' | 'goto' | 'diff'
 
@@ -8,14 +8,22 @@ type Follow = 'off' | 'goto' | 'diff'
 const EDIT_TOOLS = ['Edit', 'Write', 'MultiEdit'] as const
 
 /** Run `rcmd ctl …`; resolves to an error message, or undefined on success. */
-async function ctl($: EngineInterface, rcmd: string, args: readonly string[]): Promise<string | undefined> {
+async function ctl(
+  $: EngineInterface,
+  rcmd: string,
+  args: readonly string[],
+  init: { stdin?: string; timeoutMs?: number } = {},
+): Promise<string | undefined> {
   try {
-    const run = await $.process.run([rcmd, 'ctl', ...args], { timeoutMs: 15_000 })
+    const run = await $.process.run([rcmd, 'ctl', '--timeout', '10', ...args], { timeoutMs: 15_000, ...init })
     return run.exitCode === 0 ? undefined : describeFailure(run.stderr || run.stdout)
   } catch {
     return `could not run \`${rcmd}\`; install rcommander or set the plugin's rcmd path`
   }
 }
+
+/** Following must never slow Claude down: give up quickly if rcmd is busy or stopped. */
+const FOLLOW = { timeoutMs: 3_000 }
 
 export const register: Register = (on, options) => {
   const rcmd = typeof options.rcmd_path === 'string' && options.rcmd_path ? options.rcmd_path : 'rcmd'
@@ -57,31 +65,32 @@ export const register: Register = (on, options) => {
   on('tool.call', { tool: 'mcp__rcommander__show' }, async ($, e) => {
     const path = typeof e.path === 'string' ? e.path : ''
     if (!path) return { deny: 'path is required' }
+    // `--` keeps paths that start with a dash from being read as options.
     const args =
       typeof e.compare_with === 'string' && e.compare_with
-        ? ['diff', path, e.compare_with]
+        ? ['diff', '--', path, e.compare_with]
         : e.view === true
-          ? ['view', path]
-          : ['goto', path]
+          ? ['view', '--', path]
+          : ['goto', '--', path]
     const error = await ctl($, rcmd, args)
-    return error ? { deny: `rcommander: ${error}` } : { result: `Shown in rcommander (${args[0]} ${args.slice(1).join(' ')}).` }
+    return error ? { deny: `rcommander: ${error}` } : { result: `Shown in rcommander (${args[0]} ${args.slice(2).join(' ')}).` }
   }).catch(() => ({ deny: 'rcommander: showing it failed.' }))
 
   if (follow === 'off') return
 
   for (const tool of EDIT_TOOLS) {
     on('tool.call', { tool }, async ($, e, next) => {
-      const file = e.file_path
-      // For a diff, keep the file as it was before the edit (empty if it is new).
-      const before = follow === 'diff' ? snapshotPath(file) : undefined
-      if (before) {
-        const old = await $.fs.read(file).catch(() => '')
-        await $.fs.write(before, typeof old === 'string' ? old : '').catch(() => undefined)
-      }
+      const file = typeof e.file_path === 'string' ? e.file_path : undefined
+      if (!file) return next(e)
+      // For a diff, keep the file as it was before the edit (empty if it is new). It goes
+      // to rcmd on stdin; nothing is written to disk here.
+      const before = follow === 'diff' ? await $.fs.read(file).then(t => (typeof t === 'string' ? t : ''), () => '') : undefined
       const ran = await next(e)
       if (ran.deny === undefined && ran.isError !== true) {
         // rcommander may not be running; following is best effort and silent.
-        await ctl($, rcmd, before ? ['diff', before, file] : ['goto', file, '--side', 'other'])
+        await (before === undefined
+          ? ctl($, rcmd, ['goto', '--side', 'other', '--', file], FOLLOW)
+          : ctl($, rcmd, ['diff', '--', '-', file], { ...FOLLOW, stdin: before }))
       }
       return ran
     })

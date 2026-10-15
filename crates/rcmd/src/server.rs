@@ -151,17 +151,8 @@ async fn serve(vfs: Arc<Vfs>, config: Config) -> Result<()> {
 
 /// Write a page that redirects to `url` into a directory only this user can read.
 fn launcher_page(url: &str) -> Result<std::path::PathBuf> {
-    use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
-    let base = dirs::runtime_dir().unwrap_or_else(std::env::temp_dir);
-    // SAFETY: getuid has no preconditions and cannot fail.
-    let uid = unsafe { libc::getuid() };
-    let dir = base.join(format!("rcommander-{uid}"));
-    std::fs::create_dir_all(&dir)?;
-    let meta = std::fs::symlink_metadata(&dir)?;
-    if !meta.is_dir() || meta.uid() != uid {
-        anyhow::bail!("{} is not a directory owned by you", dir.display());
-    }
-    std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700))?;
+    use std::os::unix::fs::OpenOptionsExt;
+    let dir = crate::control::private_dir()?;
     let page = dir.join(format!("open-{}.html", std::process::id()));
     let _ = std::fs::remove_file(&page);
     let html = format!(
@@ -177,8 +168,19 @@ fn launcher_page(url: &str) -> Result<std::path::PathBuf> {
     Ok(page)
 }
 
+/// Ctrl+C, `kill` or a closed terminal: stop cleanly so the control socket and the
+/// launcher page are removed.
 async fn shutdown_signal() {
-    let _ = tokio::signal::ctrl_c().await;
+    use tokio::signal::unix::{SignalKind, signal};
+    let (Ok(mut term), Ok(mut hup)) = (signal(SignalKind::terminate()), signal(SignalKind::hangup())) else {
+        let _ = tokio::signal::ctrl_c().await;
+        return;
+    };
+    tokio::select! {
+        _ = tokio::signal::ctrl_c() => {}
+        _ = term.recv() => {}
+        _ = hup.recv() => {}
+    }
 }
 
 fn router(state: AppState, port: u16) -> Router {
@@ -403,20 +405,21 @@ fn browser_event(vfs: &Vfs, command: Command) -> Result<BrowserEvent, String> {
 /// Server-sent events for the browser. EventSource cannot send headers, so the token
 /// comes as a query parameter here (same origin, never leaves the machine).
 async fn events(State(s): State<AppState>, Query(q): Query<HashMap<String, String>>) -> Response {
-    if q.get("token").map(String::as_str) != Some(&*s.token) {
+    if !q
+        .get("token")
+        .is_some_and(|t| same_token(t.as_bytes(), s.token.as_bytes()))
+    {
         return api_error(StatusCode::UNAUTHORIZED, "missing or invalid token");
     }
     let stream = futures_util::stream::unfold(s.events.subscribe(), |mut rx| async move {
-        loop {
-            match rx.recv().await {
-                Ok(ev) => {
-                    let event = Event::default().json_data(&ev).unwrap_or_default();
-                    return Some((Ok::<_, Infallible>(event), rx));
-                }
-                Err(broadcast::error::RecvError::Lagged(_)) => continue,
-                Err(broadcast::error::RecvError::Closed) => return None,
-            }
-        }
+        let ev = match rx.recv().await {
+            Ok(ev) => ev,
+            // Missed some events: have the browser re-read everything instead.
+            Err(broadcast::error::RecvError::Lagged(_)) => BrowserEvent::Refresh,
+            Err(broadcast::error::RecvError::Closed) => return None,
+        };
+        let event = Event::default().json_data(&ev).unwrap_or_default();
+        Some((Ok::<_, Infallible>(event), rx))
     });
     Sse::new(stream).keep_alive(KeepAlive::default()).into_response()
 }
