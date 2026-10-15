@@ -298,7 +298,15 @@ async fn edit_external(State(s): State<AppState>, Json(req): Json<OpenRequest>) 
 }
 
 async fn list(State(s): State<AppState>, Json(req): Json<ListRequest>) -> Response {
-    blocking(move || s.vfs.list(&s.vfs.normalize(req.location, None))).await
+    blocking(move || {
+        let loc = s.vfs.normalize(req.location, None);
+        if s.settings.read().expect("settings lock").shows(rc_core::Column::Git) {
+            s.vfs.list_with_git(&loc)
+        } else {
+            s.vfs.list(&loc)
+        }
+    })
+    .await
 }
 
 async fn read(State(s): State<AppState>, Json(req): Json<ReadRequest>) -> Response {

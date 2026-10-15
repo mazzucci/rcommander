@@ -7,7 +7,21 @@ use std::path::Path;
 use std::process::Command;
 
 fn git(dir: &Path, args: &[&str]) -> Option<Vec<u8>> {
-    let out = Command::new("git").arg("-C").arg(dir).args(args).output().ok()?;
+    let out = Command::new("git")
+        // Never take the index lock: a user's own `git commit` must not collide with us.
+        .arg("--no-optional-locks")
+        .arg("-C")
+        .arg(dir)
+        .args(args)
+        // Variables from the user's shell would point git at a different repository.
+        .env_remove("GIT_DIR")
+        .env_remove("GIT_WORK_TREE")
+        .env_remove("GIT_INDEX_FILE")
+        .env_remove("GIT_OBJECT_DIRECTORY")
+        .env_remove("GIT_COMMON_DIR")
+        .stdin(std::process::Stdio::null())
+        .output()
+        .ok()?;
     out.status.success().then_some(out.stdout)
 }
 
@@ -22,7 +36,7 @@ pub fn statuses(dir: &Path) -> HashMap<String, GitStatus> {
     // Paths in porcelain output are relative to the repository root.
     let Some(out) = git(
         dir,
-        &["status", "--porcelain=v1", "-z", "--untracked-files=all", "--", "."],
+        &["status", "--porcelain=v1", "-z", "--untracked-files=normal", "--", "."],
     ) else {
         return map;
     };
@@ -33,8 +47,10 @@ pub fn statuses(dir: &Path) -> HashMap<String, GitStatus> {
         }
         let (x, y) = (rec[0], rec[1]);
         let path = String::from_utf8_lossy(&rec[3..]);
-        if x == b'R' || x == b'C' {
-            records.next(); // the rename's source path follows; skip it
+        // A rename or copy, staged (X) or detected in the worktree (Y), is followed by its
+        // source path as a separate record.
+        if matches!(x, b'R' | b'C') || matches!(y, b'R' | b'C') {
+            records.next();
         }
         let Some(rest) = path.strip_prefix(&prefix) else {
             continue;
@@ -44,7 +60,8 @@ pub fn statuses(dir: &Path) -> HashMap<String, GitStatus> {
             None => (rest, false),
         };
         let status = classify(x, y);
-        let status = if inside && status == GitStatus::Deleted {
+        // A folder with something deleted or newly added inside is "modified" as a whole.
+        let status = if inside && matches!(status, GitStatus::Deleted | GitStatus::Added) {
             GitStatus::Modified
         } else {
             status
@@ -62,7 +79,7 @@ fn classify(x: u8, y: u8) -> GitStatus {
         (b'U', _) | (_, b'U') | (b'A', b'A') | (b'D', b'D') => GitStatus::Conflicted,
         (b'D', _) | (_, b'D') => GitStatus::Deleted,
         (b'A', _) => GitStatus::Added,
-        (b'R', _) | (b'C', _) => GitStatus::Renamed,
+        (b'R' | b'C', _) | (_, b'R' | b'C') => GitStatus::Renamed,
         _ => GitStatus::Modified,
     }
 }
@@ -119,5 +136,18 @@ mod tests {
 
         assert_eq!(head_content(&repo.join("changed.txt")).unwrap(), b"old\n");
         assert_eq!(head_content(&repo.join("fresh.txt")), None);
+
+        // An untracked folder shows as one entry without listing everything inside.
+        std::fs::create_dir(repo.join("newdir")).unwrap();
+        std::fs::write(repo.join("newdir/x"), "x").unwrap();
+        assert_eq!(statuses(repo).get("newdir"), Some(&GitStatus::Untracked));
+
+        // A rename git detects in the worktree is reported as one record pair.
+        std::fs::rename(repo.join("kept.txt"), repo.join("ab cd.txt")).unwrap();
+        std::fs::write(repo.join("cd.txt"), "unrelated\n").unwrap();
+        sh(repo, &["add", "-N", "ab cd.txt"]);
+        let s = statuses(repo);
+        assert_eq!(s.get("ab cd.txt"), Some(&GitStatus::Renamed), "{s:?}");
+        assert_eq!(s.get("cd.txt"), Some(&GitStatus::Untracked), "{s:?}");
     }
 }

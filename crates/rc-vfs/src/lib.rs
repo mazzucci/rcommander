@@ -72,15 +72,20 @@ impl Vfs {
     /// `/a/b/` and `/a/b` are recognized as the same place by the panel.
     pub fn list(&self, loc: &Location) -> Result<Listing> {
         match self.normalize(loc.clone(), None) {
-            Location::Local { path } => {
-                let mut listing = local::list(&path)?;
-                let status = git::statuses(Path::new(&path));
-                for e in &mut listing.entries {
-                    e.git = status.get(&e.name).copied();
-                }
-                Ok(listing)
-            }
+            Location::Local { path } => local::list(&path),
         }
+    }
+
+    /// `list` plus each entry's git status, for when the Git column is shown (it costs
+    /// two git processes per listing).
+    pub fn list_with_git(&self, loc: &Location) -> Result<Listing> {
+        let mut listing = self.list(loc)?;
+        let Location::Local { path } = &listing.location;
+        let status = git::statuses(Path::new(path));
+        for e in &mut listing.entries {
+            e.git = status.get(&e.name).copied();
+        }
+        Ok(listing)
     }
 
     /// Read up to `limit` bytes. Returns the bytes and the full size (if known).
@@ -118,6 +123,12 @@ impl Vfs {
     /// Diff a file against its committed version (git HEAD).
     pub fn diff_head(&self, loc: &Location) -> Result<DiffResponse> {
         let Location::Local { path } = loc;
+        if Path::new(path)
+            .symlink_metadata()
+            .is_ok_and(|m| m.file_type().is_symlink())
+        {
+            bail!("{path} is a symlink; git stores the link, not the file it points to");
+        }
         let Some(head) = git::head_content(Path::new(path)) else {
             bail!("{path} is not tracked by git (or has no commits)");
         };

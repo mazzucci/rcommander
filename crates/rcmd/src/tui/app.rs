@@ -187,7 +187,12 @@ impl App {
 
     /// List `loc` into panel `side`. On failure the panel stays where it was.
     fn load(&mut self, side: usize, loc: Location, focus: Option<&str>) -> bool {
-        match self.vfs.list(&loc) {
+        let listed = if self.settings.shows(Column::Git) {
+            self.vfs.list_with_git(&loc)
+        } else {
+            self.vfs.list(&loc)
+        };
+        match listed {
             Ok(listing) => {
                 if listing.location != self.panels[side].location {
                     self.scroll[side] = 0;
@@ -267,7 +272,16 @@ impl App {
             std::path::Path::new(path).exists()
         };
         if !exists(&left) || !exists(&right) {
-            return self.diff_head();
+            // No counterpart in the other panel: compare with git, explaining both if that fails.
+            let p = self.active_panel();
+            let Some(e) = p.current().filter(|e| !e.is_dir) else {
+                return;
+            };
+            match self.vfs.diff_head(&p.location.join(&e.name)) {
+                Ok(resp) => self.mode = Mode::Diff(DiffView::new(resp)),
+                Err(err) => self.error(format!("No {} in the other panel to compare with ({err:#})", e.name)),
+            }
+            return;
         }
         match self.vfs.diff(Some(&left), Some(&right)) {
             Ok(resp) => self.mode = Mode::Diff(DiffView::new(resp)),
