@@ -18,7 +18,8 @@ Runs on **Linux and macOS** (both built and tested in CI).
 - **Safe file operations**: asks before overwriting (replace, replace older, keep existing), atomic replacement so a failed or cancelled copy never damages existing files, Trash instead of delete; the terminal UI also shows byte progress and cancels with Esc.
 - **Directory compare** (F9), quick filter, selection masks, history (Alt+←/→), hotlist (Ctrl+D), zoxide jumps (terminal).
 - **Configurable columns**: permissions, owner, group, created, extension, git; hidden files; your editor for F4.
-- **Remote control** with `rcmd ctl`, and a **Claude Code plugin** so Claude can show you files and diffs, or follow its own edits.
+- **Claude's changes**: every file Claude edits is logged with its original; press `c` to list them and F2 to review each one as a diff.
+- **Remote control** with `rcmd ctl`, and a **Claude Code plugin** so Claude can show you files, lines and diffs, or follow its own edits.
 - **Two front ends, one core**: panel logic, diff engine and settings are shared, so both UIs behave the same.
 
 ## Quick start
@@ -80,6 +81,7 @@ Both UIs share the key bindings below; the few differences are marked. `F1` or `
 | `.` | show / hide hidden files |
 | `g` Ctrl+L | go to path |
 | Ctrl+D | hotlist: `a` add current folder, `d` remove, Enter or `1`..`9` go |
+| `c` | Claude's changes: files an agent edited — F2 diff against the original, F3 view, F8 forget (the files stay) |
 | `z` | jump with zoxide (terminal only) |
 | `o` | options: columns, hidden files, editor |
 | Ctrl+S, Ctrl+F3..F6 | cycle sort / sort by name, extension, date, size |
@@ -103,7 +105,9 @@ A running `rcmd` (terminal or web) can be driven from scripts:
 ```sh
 rcmd ctl goto src/main.rs --side right   # show a file in its directory
 rcmd ctl diff old.txt new.txt            # open the side-by-side diff
-rcmd ctl view README.md
+rcmd ctl view README.md --line 42       # open the viewer at a highlighted line
+printf '%s' "$OLD" | rcmd ctl track FILE  # log FILE's original for "Claude's changes"
+rcmd ctl changes [--clear]               # show (or clear) Claude's changes
 rcmd ctl select '*.rs'
 rcmd ctl message "build finished"
 ```
@@ -113,7 +117,8 @@ Each instance listens on a Unix socket only your user can open (`$XDG_RUNTIME_DI
 The **rcommander Claude Code plugin** (`integrations/claude-code`) builds on this. It adds:
 
 - a `/rc` command (`/rc goto <path>`, `/rc diff <a> <b>`, …);
-- a tool Claude can call to show you a file, directory or diff (it only moves your file manager, so it runs without a permission prompt);
+- a tool Claude can call to show you a file, a line, a directory or a diff (it only moves your file manager, so it runs without a permission prompt);
+- **Claude's changes**: before each edit it records the file's original (only the first time), so `c` in rcommander lists everything Claude touched and F2 shows each change in full (option *Record Claude's changes*);
 - optionally following Claude's edits: after it edits a file, rcommander shows it in the other panel (`goto`, the default) or opens a diff of the change (`diff`).
 
 Install it from a Claude Code terminal session:
