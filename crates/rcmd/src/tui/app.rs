@@ -1082,6 +1082,8 @@ impl App {
                 if name.starts_with('.') && !self.active_panel().show_hidden {
                     self.active_mut().toggle_hidden();
                 }
+                // A quick filter could hide it.
+                self.active_mut().set_filter("");
                 self.load(self.active, parent, Some(&name));
             }
             find::Action::View(hit) => match self.vfs.read_content(&Location::local(&hit.path)) {
@@ -1450,13 +1452,14 @@ two here
         let (tmp, mut app) = setup();
         fs::write(tmp.path().join("left/.env"), "").unwrap();
         app.panels[LEFT].toggle_hidden();
+        app.panels[LEFT].set_filter("zzz");
         assert!(!app.panels[LEFT].show_hidden);
         app.mode = Mode::Find(Box::new(Find::new(app.panels[LEFT].location.clone(), true)));
         typed(&mut app, ".env");
         app.handle_key(key(KeyCode::Enter));
         wait_find(&mut app);
         app.handle_key(key(KeyCode::Enter));
-        assert!(app.panels[LEFT].show_hidden);
+        assert!(app.panels[LEFT].show_hidden && app.panels[LEFT].filter.is_empty());
         assert_eq!(app.panels[LEFT].current().unwrap().name, ".env");
     }
 

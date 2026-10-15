@@ -349,7 +349,12 @@ fn draw_keys(f: &mut Frame, area: Rect, mode: &Mode) {
         }
         Mode::Find(f) if f.search.is_some() => &[("Esc", "Stop")],
         Mode::Find(f) if f.result.is_some() => &[("Enter", "Go to"), ("F3", "View"), ("Esc", "New search")],
-        Mode::Find(_) => &[("Enter", "Search"), ("Tab", "Next field"), ("Esc", "Close")],
+        Mode::Find(_) => &[
+            ("Enter", "Search"),
+            ("Tab", "Next field"),
+            ("Space", "Toggle"),
+            ("Esc", "Close"),
+        ],
         Mode::Diff(_) => &[
             ("Esc", "Close"),
             ("n", "Next"),
@@ -637,7 +642,7 @@ fn draw_find(f: &mut Frame, area: Rect, find: &mut Find) {
     f.render_widget(Clear, area);
     f.render_widget(block, area);
     let [fields, status, list, hint] = Layout::vertical([
-        Constraint::Length(2),
+        Constraint::Length(3),
         Constraint::Length(1),
         Constraint::Min(1),
         Constraint::Length(1),
@@ -654,10 +659,21 @@ fn draw_find(f: &mut Frame, area: Rect, find: &mut Find) {
             Span::raw(format!("{}{}", sanitize(value), if active { "█" } else { "" })).fg(TEXT),
         ])
     };
+    let hidden_active = editing && find.field == Field::Hidden;
+    let hidden = Line::from(vec![
+        Span::raw(format!(" {:<9}", "")),
+        Span::raw(format!(
+            "[{}] Search hidden files and folders",
+            if find.hidden { "x" } else { " " }
+        ))
+        .fg(if hidden_active { ACCENT } else { META }),
+    ]);
+    let hidden = if hidden_active { hidden.bold() } else { hidden };
     f.render_widget(
         Paragraph::new(vec![
             field("Name", &find.name, Field::Name),
             field("Contains", &find.contains, Field::Contains),
+            hidden,
         ]),
         fields,
     );
@@ -667,17 +683,19 @@ fn draw_find(f: &mut Frame, area: Rect, find: &mut Find) {
             .progress
             .as_ref()
             .map_or((String::new(), 0), |p| (find.relative(&p.path).to_string(), p.done));
-        Line::raw(format!(
-            " Searching {} · {n} found",
-            elide_start(&sanitize(&dir), status.width.saturating_sub(30) as usize)
-        ))
-        .fg(SELECTED)
+        let dir = elide_start(&sanitize(&dir), status.width.saturating_sub(30) as usize);
+        let at = if dir.is_empty() || dir == find.root.to_string() {
+            String::new()
+        } else {
+            format!(" {dir}")
+        };
+        Line::raw(format!(" Searching{at} · {n} found")).fg(SELECTED)
     } else if let Some(e) = &find.error {
         Line::raw(format!(" {e}")).fg(ERR)
     } else if let Some(r) = &find.result {
         let mut s = format!(" {} found", r.hits.len());
         if r.truncated {
-            s += &format!(" (stopped at {})", r.hits.len());
+            s += " (limit reached)";
         }
         if r.cancelled {
             s += " · stopped";
@@ -687,11 +705,7 @@ fn draw_find(f: &mut Frame, area: Rect, find: &mut Find) {
         }
         Line::raw(s).fg(if r.hits.is_empty() { DIM } else { OK })
     } else {
-        Line::raw(format!(
-            " In {} hidden files",
-            if find.hidden { "folders with" } else { "folders without" }
-        ))
-        .fg(DIM)
+        Line::raw("")
     };
     f.render_widget(Paragraph::new(status_line), status);
 
@@ -736,7 +750,7 @@ fn draw_find(f: &mut Frame, area: Rect, find: &mut Find) {
     } else if find.result.is_some() {
         " Enter go to · F3 view · Esc new search"
     } else {
-        " Enter search · Tab next field · Esc close"
+        " Enter search · Tab next field · Space toggle · Esc close"
     };
     f.render_widget(Paragraph::new(Line::raw(keys).fg(DIM)), hint);
 }
@@ -766,7 +780,7 @@ fn draw_help(f: &mut Frame, area: Rect) {
         ("F5  F6", "copy / move or rename"),
         ("F7  F8", "new directory / delete to Trash (Shift: permanent)"),
         ("F9", "compare directories (toggle)"),
-        ("Alt+F7  F", "find files (name mask, text inside)"),
+        ("Alt+F7  Shift+F", "find files (name mask, text inside)"),
         ("1..9", "same as F1..F9 (Mac: no fn needed)"),
         ("q  F10  Ctrl+C", "quit"),
     ];
@@ -868,12 +882,35 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let loc = rc_core::Location::local(tmp.path().to_string_lossy());
         let mut app = App::new(Arc::new(rc_vfs::Vfs::new()), loc.clone(), loc);
-        for (w, h) in [(1000, 10), (10, 3), (1, 1)] {
+        std::fs::write(tmp.path().join("hit.txt"), "a needle").unwrap();
+        let draw_at = |app: &mut App, w: u16, h: u16| {
+            let mut term = Terminal::new(TestBackend::new(w, h)).unwrap();
+            term.draw(|f| draw(f, app)).unwrap();
+        };
+        for (w, h) in [(1000, 10), (40, 6), (10, 3), (1, 1)] {
             for code in [KeyCode::F(7), KeyCode::Esc, KeyCode::F(1), KeyCode::Esc] {
-                let mut term = Terminal::new(TestBackend::new(w, h)).unwrap();
-                term.draw(|f| draw(f, &mut app)).unwrap();
+                draw_at(&mut app, w, h);
                 app.handle_key(KeyEvent::new(code, KeyModifiers::NONE));
             }
+            // Find files in every state: fields, searching, results, viewing a hit.
+            app.handle_key(KeyEvent::new(KeyCode::Char('F'), KeyModifiers::SHIFT));
+            app.handle_key(KeyEvent::new(KeyCode::Char('h'), KeyModifiers::NONE));
+            draw_at(&mut app, w, h);
+            app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+            draw_at(&mut app, w, h);
+            let start = std::time::Instant::now();
+            while matches!(&app.mode, Mode::Find(f) if f.search.is_some()) {
+                app.tick();
+                assert!(start.elapsed().as_secs() < 10);
+            }
+            draw_at(&mut app, w, h);
+            app.handle_key(KeyEvent::new(KeyCode::F(3), KeyModifiers::NONE));
+            draw_at(&mut app, w, h);
+            for _ in 0..3 {
+                app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+                draw_at(&mut app, w, h);
+            }
+            assert!(matches!(app.mode, Mode::Normal));
         }
     }
 

@@ -19,9 +19,14 @@ const MAX_TEXT: usize = 200;
 const SNIFF: usize = 8192;
 /// Content search reports progress (and can be cancelled) every this many bytes.
 const REPORT_EVERY: u64 = 4 << 20;
+/// Lines are read in pieces of at most this many bytes, so a huge file without line
+/// breaks (minified code, dumps) never sits in memory whole. A match spanning two
+/// pieces is missed.
+const MAX_LINE: u64 = 1 << 20;
 
 /// Search `req.root` (not following symlinked folders). `progress` hears about every
-/// folder and every searched file; answering `Break` stops with what was found so far.
+/// folder, every file searched for text and every few MB of a big one; answering
+/// `Break` stops with what was found so far.
 pub fn find(req: &FindRequest, progress: &mut ProgressFn) -> Result<FindResult> {
     find_limited(req, MAX_HITS, progress)
 }
@@ -49,25 +54,27 @@ pub fn find_limited(req: &FindRequest, limit: usize, progress: &mut ProgressFn) 
             res.unreadable += 1;
             continue;
         };
-        let mut entries: Vec<(String, bool)> = read
-            .filter_map(|e| {
-                let e = e.ok()?;
-                // file_type does not follow symlinks: linked folders are not entered.
-                let is_dir = e.file_type().ok()?.is_dir();
-                Some((e.file_name().to_string_lossy().into_owned(), is_dir))
-            })
-            .filter(|(name, _)| req.hidden || !name.starts_with('.'))
-            .collect();
+        let mut entries: Vec<(String, std::fs::FileType)> = Vec::new();
+        for e in read {
+            match e.and_then(|e| Ok((e.file_name().to_string_lossy().into_owned(), e.file_type()?))) {
+                Ok((name, _)) if !req.hidden && name.starts_with('.') => {}
+                Ok(entry) => entries.push(entry),
+                Err(_) => res.unreadable += 1,
+            }
+        }
         entries.sort_by(|a, b| natural_cmp(&a.0, &b.0));
         let mut subdirs = Vec::new();
-        for (name, is_dir) in entries {
+        for (name, kind) in entries {
             let path = dir.join(&name);
-            if is_dir && name != ".git" {
+            // file_type does not follow symlinks: linked folders are not entered.
+            if kind.is_dir() && name != ".git" {
                 subdirs.push(path.clone());
             }
             if !mask.as_ref().is_none_or(|m| wildcard_match(m, &name)) {
                 continue;
             }
+            // A link to a folder is shown as one (but not searched into).
+            let is_dir = kind.is_dir() || (kind.is_symlink() && path.is_dir());
             let hit = match &needle {
                 None => Some(FindHit {
                     path: path.to_string_lossy().into_owned(),
@@ -128,10 +135,17 @@ struct Needle {
 
 impl Needle {
     fn new(text: &str) -> Option<Needle> {
-        (!text.is_empty()).then(|| Needle {
-            ignore_case: !text.chars().any(char::is_uppercase),
-            text: text.to_string(),
-        })
+        (!text.is_empty())
+            .then(|| Needle {
+                ignore_case: !text.chars().any(char::is_uppercase),
+                text: text.to_lowercase(),
+            })
+            .map(|mut n| {
+                if !n.ignore_case {
+                    n.text = text.to_string();
+                }
+                n
+            })
     }
 
     fn is_in(&self, line: &str) -> bool {
@@ -151,6 +165,12 @@ fn search_file(
     res: &mut FindResult,
     progress: &mut ProgressFn,
 ) -> ControlFlow<(), Option<(usize, String)>> {
+    let report = Progress {
+        path: path.to_string_lossy().into_owned(),
+        done: res.hits.len() as u64,
+        total: 0,
+    };
+    progress(&report)?;
     // Follows symlinks; FIFOs and devices would block or never end.
     if !fs::metadata(path).is_ok_and(|m| m.is_file()) {
         return ControlFlow::Continue(None);
@@ -168,10 +188,11 @@ fn search_file(
             return ControlFlow::Continue(None);
         }
     }
-    let (mut line, mut number, mut read, mut next_report) = (Vec::new(), 0, 0u64, REPORT_EVERY);
+    // `number` counts finished lines; a long line comes in several pieces.
+    let (mut piece, mut number, mut read, mut next_report) = (Vec::new(), 0, 0u64, REPORT_EVERY);
     loop {
-        line.clear();
-        match reader.by_ref().read_until(b'\n', &mut line) {
+        piece.clear();
+        match reader.by_ref().take(MAX_LINE).read_until(b'\n', &mut piece) {
             Ok(0) => return ControlFlow::Continue(None),
             Ok(n) => read += n as u64,
             Err(_) => {
@@ -179,18 +200,15 @@ fn search_file(
                 return ControlFlow::Continue(None);
             }
         }
-        number += 1;
-        let text = String::from_utf8_lossy(&line);
+        let text = String::from_utf8_lossy(&piece);
         if needle.is_in(&text) {
-            return ControlFlow::Continue(Some((number, display_line(&text))));
+            return ControlFlow::Continue(Some((number + 1, display_line(&text))));
+        }
+        if piece.last() == Some(&b'\n') {
+            number += 1;
         }
         if read >= next_report {
             next_report += REPORT_EVERY;
-            let report = Progress {
-                path: path.to_string_lossy().into_owned(),
-                done: res.hits.len() as u64,
-                total: 0,
-            };
             progress(&report)?;
         }
     }
@@ -348,6 +366,57 @@ mod tests {
             })
             .is_err()
         );
+    }
+
+    #[test]
+    fn huge_lines_are_read_in_pieces_and_line_numbers_stay_right() {
+        let tmp = tempfile::tempdir().unwrap();
+        let big = "a".repeat(3 * MAX_LINE as usize);
+        fs::write(tmp.path().join("big.txt"), format!("{big}\nsecond\n{big}needle\n")).unwrap();
+        let r = req(tmp.path(), "", "needle", false);
+        let res = find(&r, &mut |_| ControlFlow::Continue(())).unwrap();
+        assert_eq!(res.hits[0].line, Some(3));
+        let r = req(tmp.path(), "", "second", false);
+        assert_eq!(
+            find(&r, &mut |_| ControlFlow::Continue(())).unwrap().hits[0].line,
+            Some(2)
+        );
+    }
+
+    #[test]
+    fn content_search_can_stop_between_files_of_one_folder() {
+        let tmp = tempfile::tempdir().unwrap();
+        for i in 0..50 {
+            fs::write(tmp.path().join(format!("f{i:02}.txt")), "needle").unwrap();
+        }
+        let r = req(tmp.path(), "", "needle", false);
+        let mut calls = 0;
+        let res = find(&r, &mut |_| {
+            calls += 1;
+            if calls > 5 {
+                ControlFlow::Break(())
+            } else {
+                ControlFlow::Continue(())
+            }
+        })
+        .unwrap();
+        assert!(res.cancelled && res.hits.len() < 10, "{} hits", res.hits.len());
+    }
+
+    #[test]
+    fn links_to_folders_are_shown_as_folders() {
+        let tmp = tree();
+        std::os::unix::fs::symlink(tmp.path().join("src"), tmp.path().join("link")).unwrap();
+        let res = find(&req(tmp.path(), "link", "", false), &mut |_| ControlFlow::Continue(())).unwrap();
+        assert!(res.hits[0].is_dir);
+    }
+
+    #[test]
+    fn smart_case_lowercases_the_needle_once() {
+        let n = Needle::new("straße").unwrap();
+        assert!(n.ignore_case && n.is_in("STRASSE straße") && !n.is_in("strasse"));
+        let n = Needle::new("Straße").unwrap();
+        assert!(!n.ignore_case && n.is_in("Straße") && !n.is_in("straße"));
     }
 
     #[test]

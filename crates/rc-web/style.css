@@ -1136,8 +1136,15 @@ tr.fold:hover td {
     font-weight: 600;
 }
 
-.find-results li.cursor .find-path {
+.find-results li.cursor .find-path,
+.find-results li.cursor .find-line,
+.find-results li.cursor .find-text {
     color: var(--cursor-text);
+}
+
+.find-results li.cursor .find-line,
+.find-results li.cursor .find-text {
+    opacity: 0.75;
 }
 
 .find-path {

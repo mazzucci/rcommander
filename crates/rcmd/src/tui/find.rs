@@ -14,6 +14,8 @@ use std::time::{Duration, Instant};
 pub enum Field {
     Name,
     Contains,
+    /// The "search hidden files" checkbox (Space toggles it).
+    Hidden,
 }
 
 pub struct Find {
@@ -161,21 +163,19 @@ impl Find {
         if self.result.is_some() {
             return self.results_key(key);
         }
-        let text = match self.field {
-            Field::Name => &mut self.name,
-            Field::Contains => &mut self.contains,
-        };
-        match key.code {
-            KeyCode::Esc => return Action::Close,
-            KeyCode::Enter => return Action::Start,
-            KeyCode::Tab | KeyCode::BackTab | KeyCode::Up | KeyCode::Down => {
-                self.field = match self.field {
-                    Field::Name => Field::Contains,
-                    Field::Contains => Field::Name,
-                }
-            }
-            KeyCode::Backspace => drop(text.pop()),
-            KeyCode::Char(c) if !key.modifiers.intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) => text.push(c),
+        const ORDER: [Field; 3] = [Field::Name, Field::Contains, Field::Hidden];
+        let at = ORDER.iter().position(|f| *f == self.field).unwrap_or(0);
+        let typing = !key.modifiers.intersects(KeyModifiers::CONTROL | KeyModifiers::ALT);
+        match (key.code, self.field) {
+            (KeyCode::Esc, _) => return Action::Close,
+            (KeyCode::Enter, _) => return Action::Start,
+            (KeyCode::Tab | KeyCode::Down, _) => self.field = ORDER[(at + 1) % ORDER.len()],
+            (KeyCode::BackTab | KeyCode::Up, _) => self.field = ORDER[(at + ORDER.len() - 1) % ORDER.len()],
+            (KeyCode::Char(' '), Field::Hidden) => self.hidden = !self.hidden,
+            (KeyCode::Backspace, Field::Name) => drop(self.name.pop()),
+            (KeyCode::Backspace, Field::Contains) => drop(self.contains.pop()),
+            (KeyCode::Char(c), Field::Name) if typing => self.name.push(c),
+            (KeyCode::Char(c), Field::Contains) if typing => self.contains.push(c),
             _ => {}
         }
         Action::None
@@ -253,6 +253,15 @@ mod tests {
             f.handle_key(key(KeyCode::Char(c)));
         }
         assert_eq!((f.name.as_str(), f.contains.as_str()), ("*.rs", "needle"));
+        f.handle_key(key(KeyCode::Tab));
+        f.handle_key(key(KeyCode::Char(' ')));
+        assert!(
+            f.hidden && f.contains == "needle",
+            "Space toggles hidden files on the third row"
+        );
+        f.handle_key(key(KeyCode::Char(' ')));
+        f.handle_key(key(KeyCode::Tab));
+        assert_eq!(f.field, Field::Name, "Tab wraps around");
         assert_eq!(f.handle_key(key(KeyCode::Enter)), Action::Start);
         f.start();
         wait(&mut f);

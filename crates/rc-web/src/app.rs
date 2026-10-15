@@ -476,11 +476,16 @@ impl App {
     }
 
     /// Show `name` in `folder` in the active panel, as Find's "go to" does. Hidden files
-    /// are switched on if the target is one.
+    /// are switched on if the target is one, and a quick filter is cleared.
     pub fn go_to(self, folder: Location, name: String) {
         let side = self.active_side();
         if name.starts_with('.') && !self.panels[side].with_untracked(|p| p.show_hidden) {
             self.panels[side].update(Panel::toggle_hidden);
+        }
+        // A quick filter could hide it.
+        if self.panels[side].with_untracked(|p| !p.filter.is_empty()) {
+            self.panels[side].update(|p| p.set_filter(""));
+            self.filtering.set(None);
         }
         self.load(side, folder, Some(name));
     }

@@ -29,6 +29,8 @@ pub struct FindForm {
     /// The search in flight. Owned by the app, not the dialog, so its reply and the
     /// progress timer can outlive a closed dialog.
     running: RwSignal<Option<Running>>,
+    /// What the shown results were searched with.
+    searched: StoredValue<Option<FindRequest>>,
 }
 
 impl FindForm {
@@ -42,6 +44,7 @@ impl FindForm {
             error: RwSignal::new(None),
             cursor: RwSignal::new(0),
             running: RwSignal::new(None),
+            searched: StoredValue::new(None),
         }
     }
 
@@ -109,8 +112,11 @@ pub fn FindView(app: App) -> impl IntoView {
             });
         }
     };
-    // Closing the dialog stops a search still running.
-    on_cleanup(cancel);
+    // Closing the dialog stops a search still running; its late reply is dropped.
+    on_cleanup(move || {
+        cancel();
+        running.set(None);
+    });
 
     let poll = move |job: String| {
         fn again(running: RwSignal<Option<Running>>, job: String) {
@@ -136,17 +142,20 @@ pub fn FindView(app: App) -> impl IntoView {
         again(running, job);
     };
 
+    let request = move || {
+        Some(FindRequest {
+            root: form.root.get_untracked()?,
+            name: form.name.get_untracked().trim().to_string(),
+            contains: form.contains.get_untracked(),
+            hidden: form.hidden.get_untracked(),
+        })
+    };
     let search = move || {
         if running.with_untracked(Option::is_some) {
             return;
         }
-        let Some(root) = form.root.get_untracked() else { return };
-        let req = FindRequest {
-            root,
-            name: form.name.get_untracked().trim().to_string(),
-            contains: form.contains.get_untracked(),
-            hidden: form.hidden.get_untracked(),
-        };
+        let Some(req) = request() else { return };
+        form.searched.set_value(Some(req.clone()));
         let n = seq.get_value() + 1;
         seq.set_value(n);
         let job = format!("find-{n}-{:x}", (js_sys::Math::random() * u32::MAX as f64) as u32);
@@ -159,8 +168,12 @@ pub fn FindView(app: App) -> impl IntoView {
         form.cursor.set(0);
         poll(job.clone());
         spawn_local(async move {
-            let result = api::find(req, job).await;
-            running.try_set(None);
+            let result = api::find(req, job.clone()).await;
+            // Only the search in flight counts (not one stopped by closing the dialog).
+            if running.with_untracked(|r| r.as_ref().is_none_or(|r| r.job != job)) {
+                return;
+            }
+            running.set(None);
             match result {
                 Ok(r) => {
                     let any = !r.hits.is_empty();
@@ -213,7 +226,9 @@ pub fn FindView(app: App) -> impl IntoView {
             "Escape" => app.find_open.set(false),
             "Tab" => dom::trap_tab(dialog, &ev),
             "Enter" | " " if dom::is_button(ev.target()) => return,
-            "Enter" if in_field => search(),
+            // Enter in a field searches, unless these exact results are already shown
+            // (e.g. Enter pressed again right after they arrived): then it goes to the hit.
+            "Enter" if in_field && (hits_len() == 0 || form.searched.get_value() != request()) => search(),
             "Enter" => {
                 if let Some(hit) = current() {
                     go_to(hit);
@@ -246,7 +261,12 @@ pub fn FindView(app: App) -> impl IntoView {
                 .unwrap_or(&dir)
                 .trim_start_matches('/')
                 .to_string();
-            return view! { <span class="find-status busy">{format!("Searching {rel} · {n} found")}</span> }.into_any();
+            let at = if rel.is_empty() {
+                String::new()
+            } else {
+                format!(" {rel}")
+            };
+            return view! { <span class="find-status busy">{format!("Searching{at} · {n} found")}</span> }.into_any();
         }
         if let Some(e) = form.error.get() {
             return view! { <span class="find-status error">{e}</span> }.into_any();
@@ -263,7 +283,7 @@ pub fn FindView(app: App) -> impl IntoView {
             };
             let mut s = format!("{} found", r.hits.len());
             if r.truncated {
-                s += &format!(" (stopped at {})", r.hits.len());
+                s += " (limit reached)";
             }
             if r.cancelled {
                 s += " · stopped";
