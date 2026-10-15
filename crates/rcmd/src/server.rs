@@ -10,6 +10,7 @@
 
 use anyhow::{Context, Result};
 use axum::extract::Query;
+use axum::extract::rejection::QueryRejection;
 use axum::extract::{Request, State};
 use axum::http::{HeaderMap, StatusCode, Uri, header};
 use axum::middleware::{self, Next};
@@ -32,7 +33,7 @@ use std::io::Read;
 use std::ops::ControlFlow;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex, RwLock};
+use std::sync::{Arc, Mutex, PoisonError, RwLock};
 use tokio::sync::broadcast;
 
 /// Built front end (`trunk build` in crates/rc-web). Embedded in release builds, read from
@@ -80,7 +81,7 @@ struct Job {
 impl Job {
     /// The progress callback of the operation: remember the report, stop if asked to.
     fn report(&self, p: &Progress) -> ControlFlow<()> {
-        *self.progress.lock().expect("job lock") = Some(p.clone());
+        *self.progress.lock().unwrap_or_else(PoisonError::into_inner) = Some(p.clone());
         if self.cancel.load(Ordering::Relaxed) {
             ControlFlow::Break(())
         } else {
@@ -98,7 +99,11 @@ struct JobEntry {
 
 impl Drop for JobEntry {
     fn drop(&mut self) {
-        self.jobs.0.lock().expect("jobs lock").remove(&self.id);
+        self.jobs
+            .0
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .remove(&self.id);
     }
 }
 
@@ -108,7 +113,7 @@ impl Jobs {
         if !valid {
             return Err((StatusCode::BAD_REQUEST, "invalid job id".into()));
         }
-        let mut jobs = self.0.lock().expect("jobs lock");
+        let mut jobs = self.0.lock().unwrap_or_else(PoisonError::into_inner);
         if jobs.contains_key(&id) {
             return Err((StatusCode::CONFLICT, format!("job {id} is already running")));
         }
@@ -122,13 +127,13 @@ impl Jobs {
     }
 
     fn status(&self, id: &str, cancel: bool) -> JobStatus {
-        let Some(job) = self.0.lock().expect("jobs lock").get(id).cloned() else {
+        let Some(job) = self.0.lock().unwrap_or_else(PoisonError::into_inner).get(id).cloned() else {
             return JobStatus::default();
         };
         if cancel {
             job.cancel.store(true, Ordering::Relaxed);
         }
-        let progress = job.progress.lock().expect("job lock").clone();
+        let progress = job.progress.lock().unwrap_or_else(PoisonError::into_inner).clone();
         JobStatus {
             running: true,
             progress,
@@ -504,7 +509,11 @@ struct OpQuery {
 }
 
 /// Run an operation; with `?job=ID` its progress can be followed and it can be cancelled.
-async fn op(State(s): State<AppState>, Query(q): Query<OpQuery>, Json(op): Json<FileOp>) -> Response {
+async fn op(State(s): State<AppState>, q: Result<Query<OpQuery>, QueryRejection>, Json(op): Json<FileOp>) -> Response {
+    let q = match q {
+        Ok(Query(q)) => q,
+        Err(e) => return api_error(StatusCode::BAD_REQUEST, e.body_text()),
+    };
     let entry = match q.job.map(|id| s.jobs.start(id)).transpose() {
         Ok(entry) => entry,
         Err((status, msg)) => return api_error(status, msg),

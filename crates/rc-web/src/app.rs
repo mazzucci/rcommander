@@ -595,6 +595,9 @@ impl App {
 
     /// F5 / F6: ask for the destination, prefilled with the other panel's location.
     fn ask_transfer(self, is_move: bool) {
+        if self.refuse_second_job() {
+            return;
+        }
         let Some((sources, label)) = self.targets() else { return };
         let dest = self.panels[1 - self.active_side()].with_untracked(|p| p.location.to_string());
         let verb = if is_move { "Move" } else { "Copy" };
@@ -647,6 +650,9 @@ impl App {
     }
 
     fn ask_delete(self, permanent: bool) {
+        if self.refuse_second_job() {
+            return;
+        }
         let Some((targets, label)) = self.targets() else { return };
         let title = if permanent {
             format!("Permanently delete {label}? This cannot be undone.")
@@ -761,6 +767,9 @@ impl App {
         let verb = op.verb();
         // The panel the operation started from, even if the user switches meanwhile.
         let side = self.active_side();
+        if self.job_kind(&op).is_some() && self.refuse_second_job() {
+            return;
+        }
         let job = self.start_job(&op);
         let fut = api::op(op, job.clone());
         self.request(
@@ -773,9 +782,10 @@ impl App {
             },
             move |result: OpResult| {
                 let text = result.summary(verb);
-                if result.errors.is_empty() {
+                // As in the terminal UI: keep the selection when something failed or the
+                // operation was cancelled, so the rest can be retried.
+                if result.errors.is_empty() && !result.cancelled {
                     self.info(text);
-                    // As in the terminal UI: keep the selection only when something failed.
                     self.panels.iter().for_each(|p| p.update(|p| p.clear_selection()));
                 } else {
                     self.error(text);
@@ -786,15 +796,29 @@ impl App {
         );
     }
 
+    /// Copies, moves and deletes run as jobs (with progress, one at a time, as in the
+    /// terminal UI); other operations are quick and run without one.
+    fn job_kind(self, op: &FileOp) -> Option<&'static str> {
+        match op {
+            FileOp::Copy { .. } => Some("Copying"),
+            FileOp::Move { .. } => Some("Moving"),
+            FileOp::Delete { .. } => Some("Deleting"),
+            FileOp::Mkdir { .. } | FileOp::Rename { .. } => None,
+        }
+    }
+
+    /// True (with a message) while a copy, move or delete is still running.
+    fn refuse_second_job(self) -> bool {
+        let running = self.jobs.with_untracked(|jobs| !jobs.is_empty());
+        if running {
+            self.error("Another operation is still running");
+        }
+        running
+    }
+
     /// Register a copy, move or delete as a job and start following its progress.
-    /// Other operations are quick and run without one.
     fn start_job(self, op: &FileOp) -> Option<String> {
-        let verb = match op {
-            FileOp::Copy { .. } => "Copying",
-            FileOp::Move { .. } => "Moving",
-            FileOp::Delete { .. } => "Deleting",
-            FileOp::Mkdir { .. } | FileOp::Rename { .. } => return None,
-        };
+        let verb = self.job_kind(op)?;
         let seq = self.job_seq.get_value() + 1;
         self.job_seq.set_value(seq);
         // Unique across tabs and reloads talking to the same server.
@@ -840,16 +864,36 @@ impl App {
 
     /// The footer's Cancel button: the server stops at the next file or chunk.
     pub fn cancel_job(self, id: String) {
-        self.jobs.update(|jobs| {
-            if let Some(job) = jobs.iter_mut().find(|j| j.id == id) {
-                job.cancelling = true;
-            }
-        });
+        let set_cancelling = move |id: &str, on: bool| {
+            self.jobs.update(|jobs| {
+                if let Some(job) = jobs.iter_mut().find(|j| j.id == id) {
+                    job.cancelling = on;
+                }
+            })
+        };
+        set_cancelling(&id, true);
         spawn_local(async move {
-            if let Err(e) = api::cancel(id).await {
-                self.error(e);
+            match api::cancel(id.clone()).await {
+                Ok(status) if status.running => {}
+                // Not running on the server (just finished, or not started yet): if it
+                // is still listed here, let the user try again.
+                Ok(_) => set_cancelling(&id, false),
+                Err(e) => {
+                    set_cancelling(&id, false);
+                    self.error(e);
+                }
             }
         });
+    }
+
+    /// Esc with nothing else to clear: stop the running operation.
+    fn cancel_running_job(self) -> bool {
+        let running = self
+            .jobs
+            .with_untracked(|jobs| jobs.last().filter(|j| !j.cancelling).map(|j| j.id.clone()));
+        let Some(id) = running else { return false };
+        self.cancel_job(id);
+        true
     }
 
     /// F9: mark files by comparing both panels; pressing again clears the marks.
@@ -968,13 +1012,18 @@ impl App {
             (false, "Delete") if self.in_changes() => self.ask_forget(),
             (false, "Delete") => self.ask_delete(shift),
             (false, "c") => self.show_changes(),
-            (false, "Escape") => panel.update(|p| {
-                if p.filter.is_empty() {
-                    p.clear_selection();
-                } else {
-                    p.set_filter("");
+            (false, "Escape") => {
+                let idle = panel.with_untracked(|p| p.filter.is_empty() && p.selected.is_empty());
+                if !(idle && self.cancel_running_job()) {
+                    panel.update(|p| {
+                        if p.filter.is_empty() {
+                            p.clear_selection();
+                        } else {
+                            p.set_filter("");
+                        }
+                    })
                 }
-            }),
+            }
             (false, "/") | (true, "f") => self.filtering.set(Some(side)),
             (false, ".") => panel.update(Panel::toggle_hidden),
             (false, "g") | (true, "l") => self.editing_path.set(Some(side)),
@@ -1012,7 +1061,17 @@ const FKEYS: [(u8, &str); 9] = [
 pub fn Root() -> impl IntoView {
     let app = App::new();
     let keys = window_event_listener(ev::keydown, move |ev| app.handle_key(&ev));
-    on_cleanup(move || keys.remove());
+    // Closing or reloading the page loses sight of a running operation: ask first, as
+    // the terminal UI does before quitting.
+    let unload = window_event_listener(ev::beforeunload, move |ev| {
+        if app.jobs.with_untracked(|jobs| !jobs.is_empty()) {
+            ev.prevent_default();
+        }
+    });
+    on_cleanup(move || {
+        keys.remove();
+        unload.remove();
+    });
     // The tab title is the active panel's location.
     Effect::new(move |_| {
         let path = app.panels[app.active.get()].with(|p| p.location.to_string());
@@ -1103,7 +1162,7 @@ fn JobView(app: App, id: String) -> impl IntoView {
     let title = move || {
         progress().map(|p| {
             let bytes = if p.total > 0 {
-                format!("\n{} of {}", human_size(p.done), human_size(p.total))
+                format!("\n{} of {}", human_size(p.done.min(p.total)), human_size(p.total))
             } else {
                 String::new()
             };
@@ -1115,10 +1174,12 @@ fn JobView(app: App, id: String) -> impl IntoView {
             <span class="job-verb">{move || if cancelling() { "Cancelling…" } else { job.get().map_or("", |(v, _, _)| v) }}</span>
             <span class="job-file">{move || progress().map(|p| p.path.rsplit('/').next().unwrap_or_default().to_string())}</span>
             <Show when=move || percent().is_some()>
-                <span class="job-bar"><span class="job-fill" style:width=move || format!("{}%", percent().unwrap_or(0))></span></span>
+                <span class="job-bar" role="progressbar" aria-valuemin="0" aria-valuemax="100" aria-valuenow=move || percent().unwrap_or(0)>
+                    <span class="job-fill" style:width=move || format!("{}%", percent().unwrap_or(0))></span>
+                </span>
                 <span class="job-pct">{move || format!("{}%", percent().unwrap_or(0))}</span>
             </Show>
-            <button class="job-cancel" tabindex="-1" disabled=cancelling
+            <button class="job-cancel" tabindex="-1" title="Cancel (Esc)" disabled=cancelling
                 on:mousedown=|ev| ev.prevent_default()
                 on:click=move |_| app.cancel_job(id.clone())>
                 "Cancel"

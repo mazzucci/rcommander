@@ -15,7 +15,10 @@ const KEYS: &[(&str, &str)] = &[
     ("Tab", "switch panel"),
     ("Space  Insert", "select / deselect"),
     ("+  -  *", "select by mask, deselect by mask, invert"),
-    ("Esc", "clear filter, then selection"),
+    (
+        "Esc",
+        "clear filter, then selection, then cancel a running copy/move/delete",
+    ),
     ("/  Ctrl+F", "quick filter"),
     (".", "show / hide hidden files"),
     ("g  Ctrl+L", "go to path"),

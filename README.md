@@ -15,7 +15,7 @@ Runs on **Linux and macOS** (both built and tested in CI).
 - **Side-by-side diff** (F2) with inline highlights, folded unchanged regions and change navigation; Shift+F2 diffs against git `HEAD`.
 - **Git aware**: a status column (modified, added, untracked, …) using git without taking its index lock.
 - **Live refresh**: folders re-read themselves when files change, and changed rows light up.
-- **Safe file operations**: asks before overwriting (replace, replace older, keep existing), atomic replacement so a failed or cancelled copy never damages existing files, Trash instead of delete; the terminal UI also shows byte progress and cancels with Esc.
+- **Safe file operations**: asks before overwriting (replace, replace older, keep existing), atomic replacement so a failed or cancelled copy never damages existing files, Trash instead of delete; both UIs show byte progress and cancel with Esc.
 - **Directory compare** (F9), quick filter, selection masks, history (Alt+←/→), hotlist (Ctrl+D), zoxide jumps (terminal).
 - **Configurable columns**: permissions, owner, group, created, extension, git; hidden files; your editor for F4.
 - **Claude's changes**: every file Claude edits is logged with its original; press `c` to list them and F2 to review each one as a diff.
@@ -76,7 +76,7 @@ Both UIs share the key bindings below; the few differences are marked. `F1` or `
 | Tab | switch panel |
 | Space / Insert | select / deselect |
 | `+` `-` `*` | select by mask, deselect by mask, invert selection |
-| Esc | clear filter, then selection |
+| Esc | clear filter, then selection, then cancel a running copy, move or delete |
 | `/` Ctrl+F | quick filter |
 | `.` | show / hide hidden files |
 | `g` Ctrl+L | go to path |
@@ -90,7 +90,7 @@ Both UIs share the key bindings below; the few differences are marked. `F1` or `
 | F2 | diff the files under both cursors (or two selected); against git HEAD if the other panel has no such file — `n`/`p` next/previous change, `f` fold |
 | Shift+F2 | diff the file against git HEAD |
 | F3 / F4 | view / edit (terminal: the editor from options, else `$VISUAL`/`$EDITOR`; browser: the GUI editor from options, else the default application) |
-| F5 / F6 | copy / move or rename; asks before overwriting: `o` replace existing, `u` replace older, `s` keep existing (folders are merged); terminal: byte progress, Esc cancels |
+| F5 / F6 | copy / move or rename; asks before overwriting: `o` replace existing, `u` replace older, `s` keep existing (folders are merged); shows byte progress, Esc cancels |
 | F7 / F8, Delete | new directory / delete to Trash (Shift+F8: permanent) |
 | F9 | compare directories (toggle) |
 | `1`..`9` | same as F1..F9, so Mac laptops don't need the fn key |
