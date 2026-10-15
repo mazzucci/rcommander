@@ -1,6 +1,7 @@
 [workspace]
 resolver = "3"
-members = ["crates/rc-core", "crates/rc-vfs", "crates/rcmd"]
+members = ["crates/rc-core", "crates/rc-vfs", "crates/rcmd", "crates/rc-web"]
+# rc-web is wasm-only; build it with trunk (see README).
 default-members = ["crates/rc-core", "crates/rc-vfs", "crates/rcmd"]
 
 [workspace.package]
