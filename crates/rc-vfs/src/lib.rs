@@ -9,7 +9,7 @@ pub mod watch;
 
 use anyhow::{Result, bail};
 use local::Copied;
-use rc_core::api::{DiffResponse, FileContent, FileOp, OpResult};
+use rc_core::api::{Conflicts, DiffResponse, FileContent, FileOp, OpResult, Progress};
 use rc_core::{Listing, Location, diff};
 use std::path::{Path, PathBuf};
 
@@ -137,55 +137,101 @@ impl Vfs {
         Ok(diff_contents(format!("HEAD:{name}"), head, path.clone(), current))
     }
 
-    /// Run a file operation. `progress` is called with each path as it is processed.
-    pub fn op(&self, op: &FileOp, progress: &mut dyn FnMut(&str)) -> OpResult {
+    /// Where each source of a copy/move ends up, or an error message.
+    fn destinations(sources: &[Location], dest: &Location) -> Result<Vec<(PathBuf, PathBuf)>, String> {
+        let Location::Local { path: dest_path } = dest;
+        let into_dir = Path::new(dest_path).is_dir();
+        if !into_dir && sources.len() > 1 {
+            return Err(format!("{dest_path} is not a directory"));
+        }
+        sources
+            .iter()
+            .map(|src| {
+                let Location::Local { path } = src;
+                let name = src.file_name().ok_or_else(|| format!("cannot copy or move {src}"))?;
+                let target = if into_dir {
+                    Path::new(dest_path).join(name)
+                } else {
+                    PathBuf::from(dest_path)
+                };
+                Ok((PathBuf::from(path), target))
+            })
+            .collect()
+    }
+
+    /// What a copy/move would find already at its destinations.
+    pub fn conflicts(&self, op: &FileOp) -> Conflicts {
+        let (FileOp::Copy { sources, dest, .. } | FileOp::Move { sources, dest, .. }) = op else {
+            return Conflicts::default();
+        };
+        let pairs = Self::destinations(sources, dest).unwrap_or_default();
+        let existing = pairs
+            .iter()
+            .filter(|(src, target)| target.symlink_metadata().is_ok() && !local::same_file(src, target))
+            .map(|(_, target)| target.to_string_lossy().into_owned())
+            .collect();
+        Conflicts {
+            existing,
+            items: sources.len(),
+        }
+    }
+
+    /// Run a file operation. `progress` hears about every file and every copied chunk;
+    /// answering `Break` cancels (a partly copied file is removed).
+    pub fn op(&self, op: &FileOp, progress: &mut local::ProgressFn) -> OpResult {
         let mut res = OpResult::default();
         let record = |res: &mut OpResult, what: &str, r: Result<Copied>| match r {
             Ok(Copied::Done) => res.done += 1,
             Ok(Copied::Skipped) => res.skipped.push(what.to_string()),
+            Err(e) if e.is::<local::Cancelled>() => res.cancelled = true,
             Err(e) => res.errors.push(format!("{e:#}")),
         };
         match op {
             FileOp::Copy {
                 sources,
                 dest,
-                overwrite,
+                on_conflict,
             }
             | FileOp::Move {
                 sources,
                 dest,
-                overwrite,
+                on_conflict,
             } => {
                 let is_move = matches!(op, FileOp::Move { .. });
-                let Location::Local { path: dest_path } = dest;
-                let into_dir = Path::new(dest_path).is_dir();
-                if !into_dir && sources.len() > 1 {
-                    res.errors.push(format!("{dest_path} is not a directory"));
-                    return res;
-                }
-                for src in sources {
-                    let Some(name) = src.file_name() else {
-                        res.errors.push(format!("cannot {} {src}", op.verb().to_lowercase()));
-                        continue;
-                    };
-                    let dest = if into_dir {
-                        Path::new(dest_path).join(name)
-                    } else {
-                        PathBuf::from(dest_path)
-                    };
-                    let Location::Local { path } = src;
+                let pairs = match Self::destinations(sources, dest) {
+                    Ok(p) => p,
+                    Err(e) => {
+                        res.errors.push(e);
+                        return res;
+                    }
+                };
+                let total = pairs.iter().map(|(src, _)| local::total_size(src)).sum();
+                let mut done = 0;
+                for (src, target) in pairs {
                     let r = if is_move {
-                        local::move_item(Path::new(path), &dest, *overwrite, progress)
+                        local::move_item(&src, &target, *on_conflict, &mut done, total, progress)
                     } else {
-                        local::copy(Path::new(path), &dest, *overwrite, progress)
+                        local::copy(&src, &target, *on_conflict, &mut done, total, progress)
                     };
-                    record(&mut res, &dest.to_string_lossy(), r);
+                    record(&mut res, &target.to_string_lossy(), r);
+                    if res.cancelled {
+                        break;
+                    }
                 }
             }
             FileOp::Delete { targets, permanent } => {
                 for t in targets {
                     let Location::Local { path } = t;
-                    progress(path);
+                    if progress(&Progress {
+                        path: path.clone(),
+                        done: 0,
+                        total: 0,
+                    })
+                    .is_break()
+                    {
+                        res.cancelled = true;
+                        break;
+                    }
                     let r = if *permanent {
                         local::remove(Path::new(path))
                     } else {
@@ -326,6 +372,8 @@ fn trash_context() -> trash::TrashContext {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rc_core::api::OnConflict;
+    use std::ops::ControlFlow;
 
     #[cfg(unix)]
     #[test]
@@ -395,16 +443,16 @@ mod tests {
             &FileOp::Mkdir {
                 location: Location::local(p("d")),
             },
-            &mut |_| {},
+            &mut |_| ControlFlow::Continue(()),
         );
         assert_eq!(r.done, 1);
         let r = vfs.op(
             &FileOp::Copy {
                 sources: vec![Location::local(p("a.txt")), Location::local(p("b.txt"))],
                 dest: Location::local(p("d")),
-                overwrite: false,
+                on_conflict: OnConflict::Skip,
             },
-            &mut |_| {},
+            &mut |_| ControlFlow::Continue(()),
         );
         assert_eq!((r.done, r.errors.len()), (2, 0));
         // Single source + non-existing destination = rename.
@@ -412,9 +460,9 @@ mod tests {
             &FileOp::Move {
                 sources: vec![Location::local(p("d/a.txt"))],
                 dest: Location::local(p("d/c.txt")),
-                overwrite: false,
+                on_conflict: OnConflict::Skip,
             },
-            &mut |_| {},
+            &mut |_| ControlFlow::Continue(()),
         );
         assert_eq!(r.done, 1);
         assert!(Path::new(&p("d/c.txt")).exists());
@@ -423,7 +471,7 @@ mod tests {
                 targets: vec![Location::local(p("d"))],
                 permanent: true,
             },
-            &mut |_| {},
+            &mut |_| ControlFlow::Continue(()),
         );
         assert_eq!(r.done, 1);
     }

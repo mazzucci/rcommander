@@ -65,12 +65,14 @@ pub enum FileOp {
     Copy {
         sources: Vec<Location>,
         dest: Location,
-        overwrite: bool,
+        #[serde(default)]
+        on_conflict: OnConflict,
     },
     Move {
         sources: Vec<Location>,
         dest: Location,
-        overwrite: bool,
+        #[serde(default)]
+        on_conflict: OnConflict,
     },
     /// `permanent: false` moves to the system trash.
     Delete {
@@ -98,6 +100,43 @@ impl FileOp {
     }
 }
 
+/// What to do when a copy or move finds something already at the destination.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum OnConflict {
+    /// Leave existing files alone.
+    #[default]
+    Skip,
+    Overwrite,
+    /// Replace only files the source has a newer version of.
+    IfNewer,
+}
+
+/// Progress of a running operation, in bytes of file content.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct Progress {
+    /// The file being processed.
+    pub path: String,
+    pub done: u64,
+    pub total: u64,
+}
+
+impl Progress {
+    pub fn percent(&self) -> u8 {
+        (self.done.min(self.total) * 100).checked_div(self.total).unwrap_or(0) as u8
+    }
+}
+
+/// `POST /api/conflicts` with a [`FileOp`] body → [`Conflicts`]: what a copy or move
+/// would find already in place, so the UI can ask before running it.
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct Conflicts {
+    /// Destination paths that already exist.
+    pub existing: Vec<String>,
+    /// Number of top-level items the operation covers.
+    pub items: usize,
+}
+
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct OpResult {
     /// Number of top-level items processed successfully.
@@ -105,6 +144,9 @@ pub struct OpResult {
     /// Destination paths that already existed and were left alone.
     pub skipped: Vec<String>,
     pub errors: Vec<String>,
+    /// The user stopped the operation part-way.
+    #[serde(default)]
+    pub cancelled: bool,
 }
 
 impl OpResult {
@@ -112,6 +154,9 @@ impl OpResult {
         let mut s = format!("{verb}: {} done", self.done);
         if !self.skipped.is_empty() {
             s += &format!(", {} skipped (already exist)", self.skipped.len());
+        }
+        if self.cancelled {
+            s += ", then cancelled";
         }
         if let Some(e) = self.errors.first() {
             s += &format!(", {} failed: {e}", self.errors.len());
@@ -173,7 +218,7 @@ mod tests {
         let op = FileOp::Copy {
             sources: vec![Location::local("/a")],
             dest: Location::local("/b"),
-            overwrite: false,
+            on_conflict: OnConflict::Skip,
         };
         let json = serde_json::to_value(&op).unwrap();
         assert_eq!(
@@ -182,7 +227,7 @@ mod tests {
                 "op": "copy",
                 "sources": [{ "kind": "local", "path": "/a" }],
                 "dest": { "kind": "local", "path": "/b" },
-                "overwrite": false
+                "on_conflict": "skip"
             })
         );
         let back: FileOp = serde_json::from_value(json).unwrap();

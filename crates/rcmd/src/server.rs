@@ -191,6 +191,7 @@ fn router(state: AppState, port: u16) -> Router {
         .route("/diff", post(diff))
         .route("/diff_head", post(diff_head))
         .route("/op", post(op))
+        .route("/conflicts", post(conflicts))
         .route("/open", post(open_external))
         .route("/edit", post(edit_external))
         .route("/settings", post(save_settings))
@@ -326,42 +327,51 @@ async fn diff_head(State(s): State<AppState>, Json(req): Json<ReadRequest>) -> R
     blocking(move || s.vfs.diff_head(&s.vfs.normalize(req.location, None))).await
 }
 
+async fn conflicts(State(s): State<AppState>, Json(op): Json<FileOp>) -> Response {
+    blocking(move || Ok(s.vfs.conflicts(&normalize_op(&s.vfs, op)))).await
+}
+
 async fn op(State(s): State<AppState>, Json(op): Json<FileOp>) -> Response {
     blocking(move || {
-        let n = |l: Location| s.vfs.normalize(l, None);
-        let all = |v: Vec<Location>| v.into_iter().map(n).collect();
-        let op = match op {
-            FileOp::Copy {
-                sources,
-                dest,
-                overwrite,
-            } => FileOp::Copy {
-                sources: all(sources),
-                dest: n(dest),
-                overwrite,
-            },
-            FileOp::Move {
-                sources,
-                dest,
-                overwrite,
-            } => FileOp::Move {
-                sources: all(sources),
-                dest: n(dest),
-                overwrite,
-            },
-            FileOp::Delete { targets, permanent } => FileOp::Delete {
-                targets: all(targets),
-                permanent,
-            },
-            FileOp::Mkdir { location } => FileOp::Mkdir { location: n(location) },
-            FileOp::Rename { from, to } => FileOp::Rename {
-                from: n(from),
-                to: n(to),
-            },
-        };
-        Ok(s.vfs.op(&op, &mut |_| {}))
+        Ok(s.vfs
+            .op(&normalize_op(&s.vfs, op), &mut |_| std::ops::ControlFlow::Continue(())))
     })
     .await
+}
+
+/// Make every path of an operation absolute and clean, as the panels show them.
+fn normalize_op(vfs: &Vfs, op: FileOp) -> FileOp {
+    let n = |l: Location| vfs.normalize(l, None);
+    let all = |v: Vec<Location>| v.into_iter().map(n).collect();
+    match op {
+        FileOp::Copy {
+            sources,
+            dest,
+            on_conflict,
+        } => FileOp::Copy {
+            sources: all(sources),
+            dest: n(dest),
+            on_conflict,
+        },
+        FileOp::Move {
+            sources,
+            dest,
+            on_conflict,
+        } => FileOp::Move {
+            sources: all(sources),
+            dest: n(dest),
+            on_conflict,
+        },
+        FileOp::Delete { targets, permanent } => FileOp::Delete {
+            targets: all(targets),
+            permanent,
+        },
+        FileOp::Mkdir { location } => FileOp::Mkdir { location: n(location) },
+        FileOp::Rename { from, to } => FileOp::Rename {
+            from: n(from),
+            to: n(to),
+        },
+    }
 }
 
 async fn open_external(State(s): State<AppState>, Json(req): Json<OpenRequest>) -> Response {

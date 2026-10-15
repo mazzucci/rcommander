@@ -88,6 +88,30 @@ pub fn draw(f: &mut Frame, app: &mut App) {
         Mode::Help => draw_help(f, main),
         Mode::Options(o) => draw_options(f, main, o, &app.settings),
         Mode::Hotlist(cursor) => draw_hotlist(f, main, *cursor, &app.settings.bookmarks),
+        Mode::Conflict(c) => {
+            let area = popup(main, 64, 5);
+            let block = Block::bordered()
+                .border_type(BorderType::Rounded)
+                .border_style(Style::new().fg(RULE))
+                .title(Line::raw(" Already exists ").fg(SELECTED).bold());
+            let what = match c.existing.as_slice() {
+                [one] => format!("{} already exists.", one.rsplit('/').next().unwrap_or(one)),
+                many => format!("{} items already exist at the destination.", many.len()),
+            };
+            let key = |k: &'static str, label: &'static str| [Span::raw(k).fg(ACCENT).bold(), Span::raw(label).fg(DIM)];
+            let choices: Vec<Span> = [
+                key("o", " overwrite   "),
+                key("n", " only if newer   "),
+                key("s", " skip   "),
+                key("Esc", " cancel"),
+            ]
+            .into_iter()
+            .flatten()
+            .collect();
+            let text = vec![Line::raw(what).fg(TEXT), Line::raw(""), Line::from(choices)];
+            f.render_widget(Clear, area);
+            f.render_widget(Paragraph::new(text).alignment(Alignment::Center).block(block), area);
+        }
         _ => {}
     }
 }
