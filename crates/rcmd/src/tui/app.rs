@@ -141,10 +141,12 @@ pub struct App {
     /// Entries that changed in a live refresh, highlighted briefly.
     pub flash: [HashMap<String, Instant>; 2],
     history: [History; 2],
-    /// Git statuses computed off the UI thread: (panel, request id, folder, statuses).
-    git_tx: Sender<(usize, u64, Location, HashMap<String, GitStatus>)>,
-    git_rx: Receiver<(usize, u64, Location, HashMap<String, GitStatus>)>,
-    git_seq: [u64; 2],
+    /// Git statuses computed off the UI thread: (requesting panel, folder, statuses).
+    git_tx: Sender<(usize, Location, HashMap<String, GitStatus>)>,
+    git_rx: Receiver<(usize, Location, HashMap<String, GitStatus>)>,
+    /// Per panel: a git worker is running, and the newest request waiting behind it.
+    git_busy: [bool; 2],
+    git_pending: [Option<Location>; 2],
 }
 
 /// How long a changed row stays highlighted after a live refresh.
@@ -191,7 +193,8 @@ impl App {
             history: [History::default(), History::default()],
             git_tx,
             git_rx,
-            git_seq: [0, 0],
+            git_busy: [false, false],
+            git_pending: [None, None],
         };
         app.load(LEFT, left, None);
         app.load(RIGHT, right, None);
@@ -231,7 +234,8 @@ impl App {
             Ok(mut listing) => {
                 if self.settings.shows(Column::Git) {
                     if listing.location == self.panels[side].location {
-                        // Keep the letters we had until fresh ones arrive (no flicker).
+                        // Keep the letters we had until fresh ones arrive (no flicker). They
+                        // may be off for one git run (a reverted file still shows M).
                         let previous: HashMap<&str, GitStatus> = self.panels[side]
                             .entries()
                             .iter()
@@ -267,28 +271,47 @@ impl App {
         }
     }
 
-    /// Compute git statuses for a panel's folder on a worker thread.
+    /// Compute git statuses for a panel's folder on a worker thread. At most one runs per
+    /// panel; while it does, only the newest further request is kept, so a burst of
+    /// refreshes (a build writing files) costs at most two git runs per panel.
     fn request_git(&mut self, side: usize, loc: &Location) {
-        self.git_seq[side] += 1;
-        let (seq, tx, loc) = (self.git_seq[side], self.git_tx.clone(), loc.clone());
+        if self.git_busy[side] {
+            self.git_pending[side] = Some(loc.clone());
+            return;
+        }
+        self.git_busy[side] = true;
+        let (tx, loc) = (self.git_tx.clone(), loc.clone());
         std::thread::spawn(move || {
             let Location::Local { path } = &loc;
             let statuses = rc_vfs::git::statuses(std::path::Path::new(path));
-            let _ = tx.send((side, seq, loc, statuses));
+            let _ = tx.send((side, loc, statuses));
         });
     }
 
-    /// Apply git statuses that arrived, if the panel still shows that folder and no newer
-    /// request is pending.
+    /// Apply git statuses that arrived to whichever panel shows that folder (panels may
+    /// have been swapped or moved on meanwhile), then start the queued request, if any.
     fn tick_git(&mut self) -> bool {
         let mut changed = false;
-        while let Ok((side, seq, loc, statuses)) = self.git_rx.try_recv() {
-            if seq == self.git_seq[side] && self.panels[side].location == loc {
-                self.panels[side].set_git_statuses(&statuses);
-                changed = true;
+        while let Ok((side, loc, statuses)) = self.git_rx.try_recv() {
+            self.git_busy[side] = false;
+            for panel in &mut self.panels {
+                if panel.location == loc {
+                    changed |= panel.set_git_statuses(&statuses);
+                }
+            }
+            if let Some(next) = self.git_pending[side].take() {
+                self.request_git(side, &next);
             }
         }
         changed
+    }
+
+    /// Fetch git statuses for both panels (e.g. after turning the Git column on).
+    fn request_git_both(&mut self) {
+        for side in [LEFT, RIGHT] {
+            let loc = self.panels[side].location.clone();
+            self.request_git(side, &loc);
+        }
     }
 
     /// Alt+← / Alt+→: step through the panel's history.
@@ -961,7 +984,12 @@ impl App {
                         }
                     }
                 }
-                i => self.settings.toggle_column(Column::ALL[i]),
+                i => {
+                    self.settings.toggle_column(Column::ALL[i]);
+                    if Column::ALL[i] == Column::Git && self.settings.shows(Column::Git) {
+                        self.request_git_both();
+                    }
+                }
             },
             _ => {}
         }
@@ -1657,6 +1685,11 @@ mod tests {
                 .git,
             Some(rc_core::GitStatus::Modified)
         );
+        // A burst of refreshes runs at most one git per panel, queueing only the newest.
+        for _ in 0..20 {
+            app.refresh(LEFT);
+        }
+        assert!(app.git_busy[LEFT] && app.git_pending[LEFT].is_some());
         // A refresh keeps the letters until the new ones arrive, so the column doesn't flicker.
         app.refresh(LEFT);
         assert!(

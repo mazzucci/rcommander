@@ -251,12 +251,19 @@ impl Panel {
         self.version
     }
 
-    /// Fill in git statuses, computed after the listing (off the UI thread).
-    pub fn set_git_statuses(&mut self, statuses: &HashMap<String, crate::GitStatus>) {
+    /// Fill in git statuses, computed after the listing (off the UI thread). Returns
+    /// whether anything changed.
+    pub fn set_git_statuses(&mut self, statuses: &HashMap<String, crate::GitStatus>) -> bool {
+        let mut changed = false;
         for e in &mut self.entries {
-            e.git = statuses.get(&e.name).copied();
+            let status = statuses.get(&e.name).copied();
+            changed |= e.git != status;
+            e.git = status;
         }
-        self.version += 1;
+        if changed {
+            self.version += 1;
+        }
+        changed
     }
 
     /// Replace the directory-compare marks.
