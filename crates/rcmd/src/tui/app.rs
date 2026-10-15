@@ -31,6 +31,8 @@ pub struct Options {
     pub cursor: usize,
     /// Text being typed into the editor field, if it is being edited.
     pub editing: Option<String>,
+    /// Settings when the dialog opened, restored on Esc.
+    original: Settings,
 }
 
 pub const HIDDEN_ROW: usize = Column::ALL.len();
@@ -448,6 +450,7 @@ impl App {
             Mode::Normal if ctrl_c => return self.request_quit(),
             Mode::Normal => return self.normal_key(key),
             // Ctrl+C backs out of whatever is open.
+            Mode::Options(o) if ctrl_c => self.revert_options(o),
             _ if ctrl_c => {}
             Mode::Help => {}
             Mode::Filter => return self.filter_key(key),
@@ -488,9 +491,13 @@ impl App {
             self.mode = Mode::Options(o);
             return;
         }
+        // Same model as the browser dialog: changes preview live, Enter saves, Esc reverts.
         match key.code {
-            KeyCode::Esc | KeyCode::Char('q' | 'o') => {
-                self.save_settings();
+            KeyCode::Esc => return self.revert_options(o),
+            KeyCode::Enter if o.cursor != EDITOR_ROW => {
+                if self.settings != o.original {
+                    self.save_settings();
+                }
                 return;
             }
             KeyCode::Up => o.cursor = o.cursor.saturating_sub(1),
@@ -511,6 +518,15 @@ impl App {
             _ => {}
         }
         self.mode = Mode::Options(o);
+    }
+
+    fn revert_options(&mut self, o: Options) {
+        self.settings = o.original;
+        for p in &mut self.panels {
+            if p.show_hidden != self.settings.show_hidden {
+                p.toggle_hidden();
+            }
+        }
     }
 
     fn save_settings(&mut self) {
@@ -641,6 +657,7 @@ impl App {
                 self.mode = Mode::Options(Options {
                     cursor: 0,
                     editing: None,
+                    original: self.settings.clone(),
                 })
             }
             KeyCode::F(2) => self.diff(),
@@ -900,17 +917,28 @@ mod tests {
         for _ in 0..3 {
             app.handle_key(key(KeyCode::Down));
         }
-        app.handle_key(key(KeyCode::Enter));
+        app.handle_key(key(KeyCode::Char(' ')));
         assert!(!app.settings.show_hidden && !app.panels[LEFT].show_hidden);
         // Editor row: typing '1' is text, not a function key.
         app.handle_key(key(KeyCode::Down));
-        app.handle_key(key(KeyCode::Enter));
+        app.handle_key(key(KeyCode::Char(' ')));
         typed(&mut app, "nano1");
         app.handle_key(key(KeyCode::Enter));
         assert_eq!(app.settings.editor, "nano1");
-        app.handle_key(key(KeyCode::Esc));
+        app.handle_key(key(KeyCode::Up));
+        app.handle_key(key(KeyCode::Enter));
         assert!(matches!(app.mode, Mode::Normal));
         assert_eq!(rc_vfs::settings::load_from(&cfg).unwrap(), app.settings);
+
+        // Esc reverts whatever changed since the dialog opened, including hidden files.
+        app.handle_key(key(KeyCode::Char('o')));
+        for _ in 0..HIDDEN_ROW {
+            app.handle_key(key(KeyCode::Down));
+        }
+        app.handle_key(key(KeyCode::Char(' ')));
+        assert!(app.panels[LEFT].show_hidden);
+        app.handle_key(key(KeyCode::Esc));
+        assert!(!app.settings.show_hidden && !app.panels[LEFT].show_hidden);
 
         app.panels[LEFT].focus_name("a.txt");
         let Effect::Edit { editor, .. } = app.handle_key(key(KeyCode::F(4))) else {

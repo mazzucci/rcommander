@@ -4,6 +4,9 @@
 //! header is not loopback (DNS-rebinding protection), and requires a random per-run token
 //! (`X-RC-Token`) on every API call. The token is handed to the browser in the URL fragment,
 //! which is never sent over the network.
+//!
+//! Whoever holds the token can do what the user can: read, write and delete their files,
+//! and run the configured editor command. Treat it like a shell session.
 
 use anyhow::{Context, Result};
 use axum::extract::{Request, State};
@@ -235,6 +238,10 @@ async fn init(State(s): State<AppState>) -> Json<InitResponse> {
 
 async fn save_settings(State(s): State<AppState>, Json(settings): Json<Settings>) -> Response {
     blocking(move || {
+        let settings = settings.normalized();
+        if let Some(program) = settings.gui_editor.split_whitespace().next() {
+            rc_vfs::check_program(program)?;
+        }
         if let Some(path) = &s.settings_path {
             rc_vfs::settings::save_to(path, &settings)?;
         }
@@ -246,7 +253,7 @@ async fn save_settings(State(s): State<AppState>, Json(settings): Json<Settings>
 
 async fn edit_external(State(s): State<AppState>, Json(req): Json<OpenRequest>) -> Response {
     blocking(move || {
-        let editor = s.settings.read().expect("settings lock").editor.clone();
+        let editor = s.settings.read().expect("settings lock").gui_editor.clone();
         s.vfs.edit_external(&s.vfs.normalize(req.location, None), &editor)?;
         Ok(serde_json::json!({}))
     })
@@ -513,11 +520,26 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn settings_are_normalized_and_editors_checked() {
+        let tmp = tempfile::tempdir().unwrap();
+        let host = format!("127.0.0.1:{PORT}");
+        let router = app(tmp.path());
+        let body = serde_json::json!({ "columns": ["size", "owner", "size"], "gui_editor": "no-such-editor-xyz" });
+        let (status, _) = call(router.clone(), post("/api/settings", body, Some("secret"), &host)).await;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+        let body = serde_json::json!({ "columns": ["owner", "size", "size"] });
+        let (status, saved) = call(router, post("/api/settings", body, Some("secret"), &host)).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(saved["columns"], serde_json::json!(["size", "owner"]));
+    }
+
+    #[tokio::test]
     async fn settings_round_trip_through_init() {
         let tmp = tempfile::tempdir().unwrap();
         let host = format!("127.0.0.1:{PORT}");
         let router = app(tmp.path());
         let body = serde_json::json!({ "columns": ["permissions"], "show_hidden": false, "editor": "code" });
+        // `editor` is the terminal command and is not checked; `gui_editor` is.
         let (status, saved) = call(router.clone(), post("/api/settings", body, Some("secret"), &host)).await;
         assert_eq!(status, StatusCode::OK);
         assert_eq!(saved["editor"], "code");

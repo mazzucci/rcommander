@@ -27,6 +27,9 @@ pub fn load_from(path: &std::path::Path) -> Result<Settings> {
 }
 
 pub fn save_to(path: &std::path::Path, settings: &Settings) -> Result<()> {
+    // Write through a symlinked settings file (dotfile managers) instead of replacing it.
+    let resolved = std::fs::canonicalize(path).ok();
+    let path = resolved.as_deref().unwrap_or(path);
     if let Some(dir) = path.parent() {
         std::fs::create_dir_all(dir)?;
     }
@@ -62,6 +65,16 @@ mod tests {
         assert_eq!(load_from(&p).unwrap(), s);
         let text = std::fs::read_to_string(&p).unwrap();
         assert!(text.contains("permissions") && text.contains("code --wait"), "{text}");
+        #[cfg(unix)]
+        {
+            let real = tmp.path().join("real.toml");
+            let link = tmp.path().join("link.toml");
+            std::fs::write(&real, "").unwrap();
+            std::os::unix::fs::symlink(&real, &link).unwrap();
+            save_to(&link, &s).unwrap();
+            assert!(std::fs::symlink_metadata(&link).unwrap().file_type().is_symlink());
+            assert_eq!(load_from(&real).unwrap(), s);
+        }
         std::fs::write(&p, "columns = 3").unwrap();
         assert!(load_from(&p).is_err());
     }

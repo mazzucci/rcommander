@@ -25,7 +25,7 @@ pub fn OptionsView(app: App) -> impl IntoView {
 
     let save = move || {
         let mut settings = draft.get_untracked();
-        settings.editor = settings.editor.trim().to_string();
+        settings.gui_editor = settings.gui_editor.trim().to_string();
         app.save_settings(settings);
     };
     let cancel = move || {
@@ -100,8 +100,8 @@ pub fn OptionsView(app: App) -> impl IntoView {
                         class="modal-input"
                         spellcheck="false"
                         placeholder="Empty: open with the system default app"
-                        prop:value=move || draft.with(|s| s.editor.clone())
-                        on:input=move |ev| draft.update(|s| s.editor = event_target_value(&ev))
+                        prop:value=move || draft.with(|s| s.gui_editor.clone())
+                        on:input=move |ev| draft.update(|s| s.gui_editor = event_target_value(&ev))
                     />
                 </label>
                 <div class="opt-note">

@@ -161,11 +161,7 @@ fn draw_panel(f: &mut Frame, area: Rect, app: &mut App, side: usize) {
     let scroll = *scroll;
 
     // Optional columns that fit while leaving the name at least 12 characters.
-    let mut columns: Vec<Column> = app.settings.visible_columns().collect();
-    let needed = |cols: &[Column]| cols.iter().map(|c| c.width() + 1).sum::<u16>() + 2 + 12;
-    while !columns.is_empty() && inner.width < needed(&columns) {
-        columns.pop();
-    }
+    let columns = app.settings.fit_columns(inner.width, 12, 2);
 
     let cursor_bg = if is_active { CURSOR_ACTIVE } else { CURSOR_INACTIVE };
     let cell = |text: String, c: Column| {
@@ -468,7 +464,14 @@ fn draw_options(f: &mut Frame, area: Rect, o: &Options, settings: &Settings) {
     };
     row(EDITOR_ROW, format!("Editor (F4): {editor}"));
     lines.push(Line::raw(""));
-    lines.push(Line::raw(" ↑↓ move · Space/Enter toggle or edit · Esc save & close").fg(DIM));
+    lines.push(
+        Line::raw(if o.editing.is_some() {
+            " Enter keep · Esc discard the edit"
+        } else {
+            " ↑↓ move · Space toggle/edit · Enter save · Esc cancel · columns that don't fit are hidden"
+        })
+        .fg(DIM),
+    );
     let area = popup(area, 60, lines.len() as u16 + 2);
     f.render_widget(Clear, area);
     f.render_widget(

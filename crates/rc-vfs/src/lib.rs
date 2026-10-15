@@ -5,7 +5,7 @@
 pub mod local;
 pub mod settings;
 
-use anyhow::Result;
+use anyhow::{Result, bail};
 use local::Copied;
 use rc_core::api::{DiffResponse, FileContent, FileOp, OpResult};
 use rc_core::{Listing, Location, diff};
@@ -220,22 +220,57 @@ impl Vfs {
         Ok(open::that_detached(path)?)
     }
 
-    /// Open in `editor` (a command line such as `code` or `subl -n`) without waiting for
-    /// it; an empty editor falls back to the system default application. Meant for GUI
-    /// editors: there is no terminal to run `vim` in.
+    /// Open a file in `editor` (a command line such as `code` or `subl -n`) without
+    /// waiting for it; an empty editor falls back to the system default application.
+    /// Meant for GUI editors: there is no terminal to run `vim` in. The editor runs fully
+    /// detached: no inherited stdio, its own process group, and reaped when it exits.
     pub fn edit_external(&self, loc: &Location, editor: &str) -> Result<()> {
+        let Location::Local { path } = loc;
+        if Path::new(path).is_dir() {
+            bail!("{path} is a folder");
+        }
         let mut parts = editor.split_whitespace();
         let Some(program) = parts.next() else {
             return self.open_external(loc);
         };
-        let Location::Local { path } = loc;
-        std::process::Command::new(program)
-            .args(parts)
+        check_program(program)?;
+        let mut cmd = std::process::Command::new(program);
+        cmd.args(parts)
             .arg(path)
             .stdin(std::process::Stdio::null())
-            .spawn()
-            .map_err(|e| anyhow::anyhow!("cannot run `{editor}`: {e}"))?;
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null());
+        #[cfg(unix)]
+        std::os::unix::process::CommandExt::process_group(&mut cmd, 0);
+        let mut child = cmd.spawn().map_err(|e| anyhow::anyhow!("cannot run `{editor}`: {e}"))?;
+        std::thread::spawn(move || child.wait());
         Ok(())
+    }
+}
+
+/// Fail unless `program` names an executable file, directly or on `PATH`.
+pub fn check_program(program: &str) -> Result<()> {
+    let is_exec = |p: &Path| {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            p.metadata()
+                .is_ok_and(|m| m.is_file() && m.permissions().mode() & 0o111 != 0)
+        }
+        #[cfg(not(unix))]
+        {
+            p.is_file()
+        }
+    };
+    let found = if program.contains('/') {
+        is_exec(Path::new(program))
+    } else {
+        std::env::var_os("PATH").is_some_and(|paths| std::env::split_paths(&paths).any(|d| is_exec(&d.join(program))))
+    };
+    if found {
+        Ok(())
+    } else {
+        bail!("editor `{program}` not found")
     }
 }
 
@@ -255,6 +290,39 @@ fn trash_context() -> trash::TrashContext {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn edit_runs_the_editor_detached_and_rejects_folders() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = tempfile::tempdir().unwrap();
+        let script = tmp.path().join("ed");
+        let marker = tmp.path().join("argv");
+        std::fs::write(&script, format!("#!/bin/sh\necho \"$@\" > {}\n", marker.display())).unwrap();
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let file = tmp.path().join("a b.txt");
+        std::fs::write(&file, "x").unwrap();
+        let vfs = Vfs::new();
+        let editor = format!("{} --flag", script.display());
+        vfs.edit_external(&Location::local(file.to_string_lossy()), &editor)
+            .unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while !marker.exists() && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        assert_eq!(
+            std::fs::read_to_string(&marker).unwrap().trim(),
+            format!("--flag {}", file.display())
+        );
+        assert!(
+            vfs.edit_external(&Location::local(tmp.path().to_string_lossy()), &editor)
+                .is_err()
+        );
+        assert!(
+            vfs.edit_external(&Location::local(file.to_string_lossy()), "no-such-editor-xyz")
+                .is_err()
+        );
+    }
 
     #[test]
     fn normalize_paths() {

@@ -54,11 +54,42 @@ impl Column {
     /// Width in characters (terminal) or a hint for the browser.
     pub fn width(self) -> u16 {
         match self {
-            Column::Ext => 5,
+            Column::Ext => 8,
             Column::Size => 7,
             Column::Modified | Column::Created => 16,
             Column::Permissions => 10,
-            Column::Owner | Column::Group => 9,
+            Column::Owner | Column::Group => 10,
+        }
+    }
+
+    /// Parse the settings-file name of a column (`"permissions"`).
+    pub fn from_name(name: &str) -> Option<Column> {
+        Column::ALL.into_iter().find(|c| c.name() == name)
+    }
+
+    /// The settings-file name of a column.
+    pub fn name(self) -> &'static str {
+        match self {
+            Column::Ext => "ext",
+            Column::Size => "size",
+            Column::Modified => "modified",
+            Column::Created => "created",
+            Column::Permissions => "permissions",
+            Column::Owner => "owner",
+            Column::Group => "group",
+        }
+    }
+
+    /// When a panel is too narrow, columns are hidden in this order (highest first).
+    fn drop_priority(self) -> u8 {
+        match self {
+            Column::Created => 6,
+            Column::Group => 5,
+            Column::Owner => 4,
+            Column::Ext => 3,
+            Column::Modified => 2,
+            Column::Permissions => 1,
+            Column::Size => 0,
         }
     }
 
@@ -95,13 +126,31 @@ impl Column {
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Settings {
-    /// Visible optional columns (shown in [`Column::ALL`] order).
+    /// Visible optional columns (shown in [`Column::ALL`] order). Unknown names in the
+    /// file (from a newer or older version) are ignored.
+    #[serde(deserialize_with = "lenient_columns")]
     pub columns: Vec<Column>,
     /// Show dot-files when a panel opens. `.` toggles per session.
     pub show_hidden: bool,
-    /// Command used by F4 (Edit), e.g. `vim`, `nano`, `code --wait`. Empty means
-    /// `$VISUAL`/`$EDITOR` in the terminal and the system default app in the browser.
+    /// Terminal UI F4 (Edit) command, e.g. `vim`, `nano`, `hx`. Empty means
+    /// `$VISUAL`, then `$EDITOR`, then `vi`.
     pub editor: String,
+    /// Browser UI F4 command, which runs without a terminal: a GUI editor such as `code`,
+    /// `zed` or `open -t`. Empty means the system default application.
+    pub gui_editor: String,
+}
+
+/// Longest editor command accepted.
+pub const MAX_EDITOR_LEN: usize = 1024;
+
+fn lenient_columns<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Vec<Column>, D::Error> {
+    let names = Vec::<String>::deserialize(d)?;
+    let mut settings = Settings {
+        columns: names.iter().filter_map(|n| Column::from_name(n)).collect(),
+        ..Settings::default()
+    };
+    settings.columns = settings.visible_columns().collect();
+    Ok(settings.columns)
 }
 
 impl Default for Settings {
@@ -110,6 +159,7 @@ impl Default for Settings {
             columns: vec![Column::Size, Column::Modified],
             show_hidden: true,
             editor: String::new(),
+            gui_editor: String::new(),
         }
     }
 }
@@ -133,6 +183,40 @@ impl Settings {
     pub fn visible_columns(&self) -> impl Iterator<Item = Column> + '_ {
         Column::ALL.into_iter().filter(|c| self.shows(*c))
     }
+
+    /// The visible columns that fit in `width` characters next to a name column of at
+    /// least `min_name` (each column takes its width plus one space; `fixed` is any other
+    /// space the row needs). The least important columns are dropped first.
+    pub fn fit_columns(&self, width: u16, min_name: u16, fixed: u16) -> Vec<Column> {
+        let mut cols: Vec<Column> = self.visible_columns().collect();
+        let needed = |cols: &[Column]| cols.iter().map(|c| c.width() + 1).sum::<u16>() + min_name + fixed;
+        while !cols.is_empty() && width < needed(&cols) {
+            let worst = cols
+                .iter()
+                .enumerate()
+                .max_by_key(|(_, c)| c.drop_priority())
+                .map(|(i, _)| i);
+            if let Some(i) = worst {
+                cols.remove(i);
+            }
+        }
+        cols
+    }
+
+    /// Canonical form for saving: columns deduplicated in display order, editor commands
+    /// trimmed and bounded.
+    pub fn normalized(mut self) -> Self {
+        self.columns = Column::ALL.into_iter().filter(|c| self.columns.contains(c)).collect();
+        for e in [&mut self.editor, &mut self.gui_editor] {
+            *e = e
+                .trim()
+                .chars()
+                .filter(|c| !c.is_control())
+                .take(MAX_EDITOR_LEN)
+                .collect();
+        }
+        self
+    }
 }
 
 #[cfg(test)]
@@ -150,6 +234,37 @@ mod tests {
         );
         s.toggle_column(Column::Size);
         assert!(!s.shows(Column::Size));
+    }
+
+    #[test]
+    fn narrow_panels_drop_the_least_important_columns() {
+        let s = Settings {
+            columns: Column::ALL.to_vec(),
+            ..Settings::default()
+        };
+        let all = s.fit_columns(500, 12, 2);
+        assert_eq!(all.len(), Column::ALL.len());
+        let some = s.fit_columns(60, 12, 2);
+        assert!(
+            some.contains(&Column::Size) && some.contains(&Column::Permissions),
+            "{some:?}"
+        );
+        assert!(!some.contains(&Column::Created));
+        assert!(s.fit_columns(10, 12, 2).is_empty());
+    }
+
+    #[test]
+    fn unknown_and_duplicate_columns_are_tolerated() {
+        let s: Settings = serde_json::from_str(r#"{"columns":["owner","bogus","size","size"]}"#).unwrap();
+        assert_eq!(s.columns, [Column::Size, Column::Owner]);
+        let n = Settings {
+            columns: vec![Column::Owner, Column::Size, Column::Owner],
+            editor: "  vim\n".into(),
+            ..Settings::default()
+        }
+        .normalized();
+        assert_eq!(n.columns, [Column::Size, Column::Owner]);
+        assert_eq!(n.editor, "vim");
     }
 
     #[test]
