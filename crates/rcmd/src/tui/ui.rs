@@ -239,7 +239,11 @@ fn draw_panel(f: &mut Frame, area: Rect, app: &mut App, side: usize) {
                     .iter()
                     .map(|&c| {
                         let v = cell(c.text(e, utc_offset), c);
-                        if selected { v } else { v.style(Style::new().fg(META)) }
+                        match (c, e.git) {
+                            (Column::Git, Some(g)) => v.style(Style::new().fg(Color::Indexed(g.color().1)).bold()),
+                            _ if selected => v,
+                            _ => v.style(Style::new().fg(META)),
+                        }
                     })
                     .collect();
                 (mark, name, values, style)
@@ -554,6 +558,7 @@ fn draw_help(f: &mut Frame, area: Rect) {
         ("Ctrl+S  Ctrl+F3..F6", "cycle sort / sort by name, ext, date, size"),
         ("Ctrl+R  Ctrl+U", "refresh / swap panels"),
         ("F2", "diff: cursor files in both panels, or 2 selected"),
+        ("Shift+F2", "diff the file against git HEAD"),
         ("F3  F4", "view / edit (editor set in options, else $EDITOR)"),
         ("F5  F6", "copy / move or rename"),
         ("F7  F8", "new directory / delete to Trash (Shift: permanent)"),

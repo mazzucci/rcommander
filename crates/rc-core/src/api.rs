@@ -53,6 +53,9 @@ pub struct DiffResponse {
     pub note: Option<String>,
 }
 
+/// `POST /api/diff_head` with a [`ReadRequest`] body → [`DiffResponse`] of the file
+/// against its committed (git HEAD) version.
+///
 /// `POST /api/op` → [`OpResult`].
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(tag = "op", rename_all = "snake_case")]
