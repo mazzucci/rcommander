@@ -1,7 +1,7 @@
 //! Local filesystem listing and file operations.
 
 use anyhow::{Context, Result, bail};
-use rc_core::api::{OnConflict, Progress};
+use rc_core::api::{FolderSummary, OnConflict, Progress};
 use rc_core::{Entry, Listing, Location};
 use std::fs;
 use std::io::{Read, Write};
@@ -167,6 +167,43 @@ impl std::error::Error for Cancelled {}
 
 /// Reports bytes as they are copied; `Break` cancels the operation.
 pub type ProgressFn<'a> = dyn FnMut(&Progress) -> ControlFlow<()> + 'a;
+
+/// Entries counted for a folder summary before giving up (a huge folder must not
+/// stall every cursor move).
+const SUMMARY_LIMIT: usize = 100_000;
+
+/// What `path` holds directly: folders, files, hidden ones, total file size.
+pub fn summarize(path: &str) -> Result<FolderSummary> {
+    let mut sum = FolderSummary {
+        location: Location::local(path),
+        folders: 0,
+        files: 0,
+        hidden: 0,
+        size: 0,
+        partial: false,
+    };
+    let read = fs::read_dir(path).with_context(|| format!("cannot read {path}"))?;
+    for (i, entry) in read.enumerate() {
+        if i == SUMMARY_LIMIT {
+            sum.partial = true;
+            break;
+        }
+        let Ok(entry) = entry else { continue };
+        if entry.file_name().to_string_lossy().starts_with('.') {
+            sum.hidden += 1;
+        }
+        // Links count as what they point to, as the panels show them.
+        match fs::metadata(entry.path()) {
+            Ok(m) if m.is_dir() => sum.folders += 1,
+            Ok(m) => {
+                sum.files += 1;
+                sum.size += m.len();
+            }
+            Err(_) => sum.files += 1,
+        }
+    }
+    Ok(sum)
+}
 
 /// Total size of the regular files under `path` (symlinks not followed).
 pub fn total_size(path: &Path) -> u64 {

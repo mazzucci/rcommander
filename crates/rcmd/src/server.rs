@@ -339,6 +339,7 @@ fn router(state: AppState, port: u16) -> Router {
         .route("/init", post(init))
         .route("/list", post(list))
         .route("/read", post(read))
+        .route("/preview", post(preview))
         .route("/diff", post(diff))
         .route("/diff_head", post(diff_head))
         .route("/op", post(op))
@@ -469,6 +470,11 @@ async fn list(State(s): State<AppState>, Json(req): Json<ListRequest>) -> Respon
 
 async fn read(State(s): State<AppState>, Json(req): Json<ReadRequest>) -> Response {
     blocking(move || s.vfs.read_content(&s.vfs.normalize(req.location, None))).await
+}
+
+/// Quick View. Unlike `list`, previewing a folder does not watch it.
+async fn preview(State(s): State<AppState>, Json(req): Json<ReadRequest>) -> Response {
+    blocking(move || s.vfs.preview(&s.vfs.normalize(req.location, None))).await
 }
 
 async fn diff(State(s): State<AppState>, Json(req): Json<DiffRequest>) -> Response {
@@ -892,6 +898,36 @@ mod tests {
         let (status, body) = call(app(tmp.path()), post("/api/find", req, Some("secret"), &host)).await;
         assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
         assert!(body["error"].as_str().unwrap().contains("not a folder"));
+    }
+
+    #[tokio::test]
+    async fn preview_files_and_folders() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(tmp.path().join("a.txt"), "hi\n").unwrap();
+        let dir = tmp.path().to_string_lossy().to_string();
+        let host = format!("localhost:{PORT}");
+        let req = |p: String| serde_json::json!({ "location": { "kind": "local", "path": p } });
+        let (status, body) = call(
+            app(tmp.path()),
+            post("/api/preview", req(format!("{dir}/a.txt")), Some("secret"), &host),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(
+            (body["kind"].as_str(), body["text"].as_str()),
+            (Some("file"), Some("hi\n"))
+        );
+        let (_, body) = call(
+            app(tmp.path()),
+            post("/api/preview", req(dir.clone()), Some("secret"), &host),
+        )
+        .await;
+        assert_eq!(
+            (body["kind"].as_str(), body["files"].as_u64()),
+            (Some("folder"), Some(1))
+        );
+        let (status, _) = call(app(tmp.path()), post("/api/preview", req(dir), None, &host)).await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
     }
 
     #[tokio::test]

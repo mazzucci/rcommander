@@ -3,7 +3,7 @@
 use gloo_net::http::Request;
 use rc_core::api::{
     ApiError, Conflicts, DiffRequest, DiffResponse, FileContent, FileOp, FindRequest, FindResult, ForgetRequest,
-    InitResponse, JobRequest, JobStatus, ListRequest, OpResult, OpenRequest, ReadRequest,
+    InitResponse, JobRequest, JobStatus, ListRequest, OpResult, OpenRequest, Preview, ReadRequest,
 };
 use rc_core::{Listing, Location, Settings};
 use serde::Serialize;
@@ -98,6 +98,11 @@ pub async fn diff(left: Location, right: Location) -> Result<DiffResponse, Strin
         },
     )
     .await
+}
+
+/// Quick View: the beginning of a file, or a folder summary.
+pub async fn preview(location: Location) -> Result<Preview, String> {
+    call("preview", &ReadRequest { location }).await
 }
 
 /// Diff where either side may be missing (shown as empty, "does not exist").
