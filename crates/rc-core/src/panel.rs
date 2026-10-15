@@ -232,9 +232,14 @@ impl Panel {
         self.rebuild_keep_cursor();
     }
 
+    /// Narrow the list to names containing `filter`. While filtering, the cursor moves off
+    /// ".." to the first match so Enter/F-keys act on what was searched for.
     pub fn set_filter(&mut self, filter: &str) {
         self.filter = filter.to_string();
         self.rebuild_keep_cursor();
+        if !self.filter.is_empty() && self.current_row() == Some(Row::Parent) && self.rows.len() > 1 {
+            self.cursor = 1;
+        }
     }
 
     pub fn toggle_hidden(&mut self) {
@@ -451,6 +456,14 @@ mod tests {
         let names: Vec<&str> = p.targets().iter().map(|e| e.name.as_str()).collect();
         assert_eq!(names, ["b2.rs", "b10.rs"]);
         assert_eq!(p.selection_summary(), (2, 55));
+    }
+
+    #[test]
+    fn filtering_moves_cursor_to_first_match() {
+        let mut p = panel();
+        p.cursor_home();
+        p.set_filter("read");
+        assert_eq!(p.current().unwrap().name, "README.md");
     }
 
     #[test]
