@@ -3,11 +3,13 @@
 //! `rcmd [LEFT] [RIGHT]` starts the terminal UI; `rcmd web [LEFT] [RIGHT]` serves the
 //! browser UI on 127.0.0.1 and opens it.
 
+mod control;
 mod server;
 mod tui;
 
 use clap::{Parser, Subcommand};
 use rc_core::Location;
+use rc_core::control::{Command as RemoteCommand, Side};
 use rc_vfs::Vfs;
 use std::sync::Arc;
 
@@ -30,6 +32,14 @@ struct Dirs {
 
 #[derive(Subcommand)]
 enum Command {
+    /// Control a running rcmd (terminal or web), e.g. from scripts or Claude Code.
+    Ctl {
+        /// Target a specific instance (default: the most recently started).
+        #[arg(long, global = true)]
+        pid: Option<u32>,
+        #[command(subcommand)]
+        action: CtlAction,
+    },
     /// Serve the browser UI on 127.0.0.1 and open it.
     Web {
         #[command(flatten)]
@@ -43,6 +53,80 @@ enum Command {
         #[arg(long)]
         browser: Option<String>,
     },
+}
+
+#[derive(Subcommand)]
+enum CtlAction {
+    /// Show a directory, or a file's directory with the cursor on the file.
+    Goto {
+        path: String,
+        #[arg(long, value_enum, default_value_t = SideArg::Active)]
+        side: SideArg,
+    },
+    /// Open the side-by-side diff of two files.
+    Diff { left: String, right: String },
+    /// Open a file in the viewer.
+    View { path: String },
+    /// Select entries matching a mask such as '*.rs'.
+    Select {
+        mask: String,
+        #[arg(long, value_enum, default_value_t = SideArg::Active)]
+        side: SideArg,
+    },
+    /// Re-read both panels.
+    Refresh,
+    /// Show a message in the status bar.
+    Message { text: String },
+}
+
+#[derive(Clone, Copy, clap::ValueEnum)]
+enum SideArg {
+    Active,
+    Other,
+    Left,
+    Right,
+}
+
+impl From<SideArg> for Side {
+    fn from(s: SideArg) -> Side {
+        match s {
+            SideArg::Active => Side::Active,
+            SideArg::Other => Side::Other,
+            SideArg::Left => Side::Left,
+            SideArg::Right => Side::Right,
+        }
+    }
+}
+
+/// Paths are resolved against the caller's directory, not the instance's.
+fn absolute(path: &str) -> String {
+    let Location::Local { path } = Vfs::new().normalize(Location::local(path), None);
+    path
+}
+
+fn ctl(action: CtlAction, pid: Option<u32>) -> anyhow::Result<()> {
+    let command = match action {
+        CtlAction::Goto { path, side } => RemoteCommand::Goto {
+            path: absolute(&path),
+            side: side.into(),
+        },
+        CtlAction::Diff { left, right } => RemoteCommand::Diff {
+            left: absolute(&left),
+            right: absolute(&right),
+        },
+        CtlAction::View { path } => RemoteCommand::View { path: absolute(&path) },
+        CtlAction::Select { mask, side } => RemoteCommand::Select {
+            mask,
+            side: side.into(),
+        },
+        CtlAction::Refresh => RemoteCommand::Refresh,
+        CtlAction::Message { text } => RemoteCommand::Message { text },
+    };
+    let reply = control::send(&command, pid)?;
+    match reply.error {
+        None if reply.ok => Ok(()),
+        err => anyhow::bail!(err.unwrap_or_else(|| "failed".into())),
+    }
 }
 
 impl Dirs {
@@ -59,6 +143,7 @@ fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
     let vfs = Arc::new(Vfs::new());
     match cli.command {
+        Some(Command::Ctl { pid, action }) => ctl(action, pid),
         None => {
             let (left, right) = cli.dirs.locations();
             let settings = rc_vfs::settings::load()?;

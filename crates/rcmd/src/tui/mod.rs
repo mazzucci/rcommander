@@ -12,6 +12,18 @@ use ratatui::crossterm::event::{self, Event, KeyEventKind};
 use std::time::Duration;
 
 pub fn run(mut app: App) -> Result<()> {
+    // Remote control is optional: without a socket the app still works.
+    let control = crate::control::listen();
+    let _listener = match control {
+        Ok((listener, rx)) => {
+            app.control = Some(rx);
+            Some(listener)
+        }
+        Err(e) => {
+            app.message = Some((format!("remote control unavailable: {e:#}"), true));
+            None
+        }
+    };
     let mut terminal = ratatui::init();
     let result = event_loop(&mut terminal, &mut app);
     ratatui::restore();
