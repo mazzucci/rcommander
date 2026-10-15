@@ -82,6 +82,18 @@ pub fn compare(left: &[Entry], right: &[Entry]) -> (HashMap<String, CmpMark>, Ha
     (lm, rm)
 }
 
+/// Names of entries in `after` that are new or differ (size, mtime or kind) from
+/// `before`: what live refresh highlights.
+pub fn changed_since(before: &[Entry], after: &[Entry]) -> Vec<String> {
+    let key = |e: &Entry| (e.size, e.modified, e.is_dir);
+    let old: HashMap<&str, _> = before.iter().map(|e| (e.name.as_str(), key(e))).collect();
+    after
+        .iter()
+        .filter(|e| old.get(e.name.as_str()) != Some(&key(e)))
+        .map(|e| e.name.clone())
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -105,5 +117,12 @@ mod tests {
         assert_eq!(r["b"], CmpMark::Newer);
         assert_eq!(l["only_l"], CmpMark::Orphan);
         assert_eq!(r["only_r"], CmpMark::Orphan);
+    }
+
+    #[test]
+    fn changed_since_reports_new_and_modified() {
+        let before = [Entry::file("same", 1), Entry::file("grows", 1), Entry::file("gone", 1)];
+        let after = [Entry::file("same", 1), Entry::file("grows", 2), Entry::file("new", 1)];
+        assert_eq!(changed_since(&before, &after), ["grows", "new"]);
     }
 }

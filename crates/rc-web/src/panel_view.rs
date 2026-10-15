@@ -2,7 +2,8 @@
 
 use crate::app::App;
 use crate::dom;
-use leptos::html::{Div, Input};
+use leptos::ev;
+use leptos::html::{Div, Input, Span};
 use leptos::prelude::*;
 use rc_core::dircmp::CmpMark;
 use rc_core::format::human_size;
@@ -45,40 +46,69 @@ fn column_class(c: Column) -> &'static str {
 }
 
 fn cell_class(c: Column) -> String {
-    format!("{}{}", column_class(c), if c.right_aligned() { " right" } else { "" })
+    format!(
+        "{}{}",
+        column_class(c),
+        if c.right_aligned() { " align-right" } else { "" }
+    )
 }
 
-/// Grid track list for the mark, name and the given optional columns.
+/// Narrowest the name column gets before optional columns are dropped, in characters.
+const MIN_NAME: u16 = 12;
+/// Characters each row needs besides the name and the optional columns: the mark column,
+/// the icon and paddings.
+const FIXED: u16 = 6;
+
+/// Grid track list for the mark, name and the given optional columns. Each optional
+/// column is its `width()` in characters plus padding, about one character, which is
+/// what `Settings::fit_columns` assumes.
 fn grid_columns(columns: &[Column]) -> String {
     let widths: String = columns
         .iter()
         .map(|c| format!(" calc({}ch + 8px)", c.width()))
         .collect();
-    format!("--cols: 14px minmax(8ch, 1fr){widths}")
-}
-
-fn mark_class(mark: Option<CmpMark>) -> &'static str {
-    match mark {
-        None => "",
-        Some(CmpMark::Orphan) => "m-orphan",
-        Some(CmpMark::Newer) => "m-newer",
-        Some(CmpMark::Older) => "m-older",
-        Some(CmpMark::Different) => "m-diff",
-        Some(CmpMark::Same) => "m-same",
-    }
+    format!("--cols: 14px minmax({MIN_NAME}ch, 1fr){widths}")
 }
 
 #[component]
 pub fn PanelView(app: App, side: usize) -> impl IntoView {
     let panel = app.panels[side];
+    let flash = app.flash[side];
     let is_active = Memo::new(move |_| app.active.get() == side);
     let cursor = Memo::new(move |_| panel.with(|p| p.cursor));
     let selected = Memo::new(move |_| panel.with(|p| p.selected.clone()));
-    let columns = Memo::new(move |_| app.settings.with(|s| s.visible_columns().collect::<Vec<_>>()));
     let rows = Memo::new(move |_| panel.with(|p| (0..p.len()).map(|i| row_data(p, i)).collect::<Vec<_>>()));
 
-    // Keep the cursor row visible. Effects run after the DOM update, so the row exists.
+    // Optional columns that fit the panel's width, least important dropped first.
     let list_ref = NodeRef::<Div>::new();
+    let probe = NodeRef::<Span>::new();
+    let width_chars = RwSignal::new(None::<u16>);
+    let measure = move || {
+        let (Some(list), Some(probe)) = (list_ref.get_untracked(), probe.get_untracked()) else {
+            return;
+        };
+        // The probe holds ten digits in the row font: one `ch` is a tenth of it.
+        let ch = f64::from(probe.offset_width()) / 10.0;
+        if ch > 0.0 {
+            width_chars.set(Some((f64::from(list.client_width()) / ch) as u16));
+        }
+    };
+    Effect::new(move |_| {
+        if list_ref.get().is_some() {
+            measure();
+        }
+    });
+    let resize = window_event_listener(ev::resize, move |_| measure());
+    on_cleanup(move || resize.remove());
+    let columns = Memo::new(move |_| {
+        let width = width_chars.get();
+        app.settings.with(|s| match width {
+            Some(width) => s.fit_columns(width, MIN_NAME, FIXED),
+            None => s.visible_columns().collect(),
+        })
+    });
+
+    // Keep the cursor row visible. Effects run after the DOM update, so the row exists.
     Effect::new(move |_| {
         let c = cursor.get();
         rows.track();
@@ -90,10 +120,11 @@ pub fn PanelView(app: App, side: usize) -> impl IntoView {
     let row_view = move |i: usize, r: RowData, columns: &[Column]| {
         let RowData { entry, mark } = r;
         let name = entry.as_ref().map(|e| e.name.clone()).unwrap_or_default();
-        let label = match &entry {
-            None => "[..]".to_string(),
-            Some(e) if e.is_dir => format!("[{}]", e.name),
-            Some(e) => e.name.clone(),
+        let label = entry.as_ref().map_or_else(|| "..".to_string(), |e| e.name.clone());
+        let kind = match &entry {
+            None => "up",
+            Some(e) if e.is_dir => "dir",
+            Some(_) => "file",
         };
         // Symlinks show where they point, as in the terminal UI.
         let link = entry
@@ -103,25 +134,29 @@ pub fn PanelView(app: App, side: usize) -> impl IntoView {
         let cells = columns
             .iter()
             .map(|&c| {
-                let text = match &entry {
-                    Some(e) => c.text(e, utc_offset),
-                    None => String::new(),
-                };
-                // Git status letters use the shared palette.
+                let text = entry.as_ref().map(|e| c.text(e, utc_offset)).unwrap_or_default();
+                // Git status letters use the palette shared with the terminal UI.
                 let color = match (c, entry.as_ref().and_then(|e| e.git)) {
-                    (Column::Git, Some(g)) => format!("color:{};font-weight:600", g.color().0),
+                    (Column::Git, Some(g)) => format!("color:{}", g.color().0),
                     _ => String::new(),
                 };
                 view! { <span class=cell_class(c) style=color>{text}</span> }
             })
             .collect_view();
+        let flashing = {
+            let name = name.clone();
+            move || flash.with(|f| f.contains(&name))
+        };
         view! {
             <div
-                class=format!("row {}", mark_class(mark))
-                class:dir=entry.as_ref().is_none_or(|e| e.is_dir)
+                class=format!("row {kind}")
+                // Compare marks color the mark and, unless "same", the name.
+                class:marked=mark.is_some_and(|m| m != CmpMark::Same)
+                style=mark.map(|m| format!("--mark:{}", m.color().0))
                 class:hidden=entry.as_ref().is_some_and(|e| e.hidden)
                 class:cursor=move || cursor.get() == i
                 class:selected=move || selected.with(|s| s.contains(&name))
+                class:flash=flashing
                 on:mousedown=move |_| panel.update(|p| p.cursor = i)
                 on:dblclick=move |_| app.enter(side)
             >
@@ -154,6 +189,18 @@ pub fn PanelView(app: App, side: usize) -> impl IntoView {
         }
     };
 
+    // Shown in place of rows when there is nothing but "..".
+    let empty = move || {
+        panel.with(|p| {
+            let nothing = !p.location.to_string().is_empty() && p.rows().iter().all(|r| matches!(r, Row::Parent));
+            nothing.then_some(if p.filter.is_empty() {
+                "Empty folder · F7 new folder"
+            } else {
+                "Nothing matches the filter"
+            })
+        })
+    };
+
     view! {
         <div
             class="panel"
@@ -172,7 +219,9 @@ pub fn PanelView(app: App, side: usize) -> impl IntoView {
                     let columns = columns.get();
                     rows.get().into_iter().enumerate().map(|(i, r)| row_view(i, r, &columns)).collect_view()
                 }}
+                {move || empty().map(|text| view! { <div class="list-empty">{text}</div> })}
             </div>
+            <span class="ch-probe" node_ref=probe aria-hidden="true">"0000000000"</span>
             <StatusLine app side/>
         </div>
     }
