@@ -21,6 +21,17 @@ pub enum CmpMark {
 }
 
 impl CmpMark {
+    /// The shared palette: hex for the browser, 256-color index for terminals.
+    pub fn color(self) -> (&'static str, u8) {
+        match self {
+            CmpMark::Orphan => ("#4fd1e8", 80),
+            CmpMark::Newer => ("#3fb950", 71),
+            CmpMark::Older => ("#d29a5a", 173),
+            CmpMark::Different => ("#f85149", 203),
+            CmpMark::Same => ("#8b949e", 245),
+        }
+    }
+
     pub fn symbol(self) -> char {
         match self {
             CmpMark::Orphan => '+',

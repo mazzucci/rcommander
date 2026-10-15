@@ -112,7 +112,7 @@ impl Column {
         let time = |t: Option<i64>| t.map(|t| format_time(t, utc_offset(t))).unwrap_or_default();
         match self {
             Column::Ext => e.extension().to_string(),
-            Column::Size if e.is_dir => "<DIR>".to_string(),
+            Column::Size if e.is_dir => "—".to_string(),
             Column::Size => e.size.map(human_size).unwrap_or_default(),
             Column::Modified => time(e.modified),
             Column::Created => time(e.created),
