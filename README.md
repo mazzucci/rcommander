@@ -1,8 +1,49 @@
 # rcommander
 
-A Total Commander-style dual-pane file manager written in Rust, with a terminal UI and a browser UI (Rust compiled to WebAssembly).
+A fast, keyboard-driven, Total Commander-style dual-pane file manager written in Rust, with a **terminal UI** and a **browser UI** (Rust compiled to WebAssembly) that share one core. It is made to work alongside coding agents: Claude Code can point you at files and diffs, and panels refresh live as files change.
 
-Runs on **Linux and macOS** (both are built and tested in CI). Deleting moves files to the system Trash (freedesktop trash on Linux, NSFileManager on macOS).
+Runs on **Linux and macOS** (both built and tested in CI).
+
+| Terminal (`rcmd`) | Browser (`rcmd web`) |
+|---|---|
+| ![Terminal UI: two panels with git status and directory compare](docs/screenshots/tui-panels.png) | ![Browser UI, dark theme](docs/screenshots/web-panels-dark.png) |
+| ![Terminal UI: side-by-side diff](docs/screenshots/tui-diff.png) | ![Browser UI: side-by-side diff, light theme](docs/screenshots/web-diff-light.png) |
+
+## Features
+
+- **Two panels, keyboard first**: Total Commander keys (F3 view, F5 copy, F6 move, F7 mkdir, F8 delete, Tab, Insert…), with digits as F-key aliases for Mac keyboards.
+- **Side-by-side diff** (F2) with inline highlights, folded unchanged regions and change navigation; Shift+F2 diffs against git `HEAD`.
+- **Git aware**: a status column (modified, added, untracked, …) using git without taking its index lock.
+- **Live refresh**: folders re-read themselves when files change, and changed rows light up.
+- **Safe file operations**: asks before overwriting (replace, replace older, keep existing), atomic replacement so a failed or cancelled copy never damages existing files, Trash instead of delete; the terminal UI also shows byte progress and cancels with Esc.
+- **Directory compare** (F9), quick filter, selection masks, history (Alt+←/→), hotlist (Ctrl+D), zoxide jumps (terminal).
+- **Configurable columns**: permissions, owner, group, created, extension, git; hidden files; your editor for F4.
+- **Remote control** with `rcmd ctl`, and a **Claude Code plugin** so Claude can show you files and diffs, or follow its own edits.
+- **Two front ends, one core**: panel logic, diff engine and settings are shared, so both UIs behave the same.
+
+## Quick start
+
+**Requirements:** Rust 1.85 or newer (`rustup`), a C linker (Xcode Command Line Tools on macOS, `build-essential` or equivalent on Linux), and `git` on your PATH for the Git column. [zoxide](https://github.com/ajeetdsouza/zoxide) is optional (`z` in the terminal UI); [trunk](https://trunk-rs.github.io/trunk/) is needed only for the browser UI.
+
+Terminal UI only:
+
+```sh
+git clone https://github.com/mazzucci/rcommander && cd rcommander
+cargo install --path crates/rcmd          # then run: rcmd
+```
+
+Terminal **and** browser UI: build the front end first, so it is embedded in the binary.
+
+```sh
+rustup target add wasm32-unknown-unknown
+cargo install trunk --locked
+(cd crates/rc-web && trunk build --release)
+cargo install --path crates/rcmd --force  # then: rcmd, or rcmd web
+```
+
+If `rcmd web` says it was *compiled without the web front end*, run the second block (with `--force`).
+
+Settings live in `~/.config/rcommander/settings.toml` on Linux and `~/Library/Application Support/rcommander/settings.toml` on macOS; press `o` in either UI to change them, or point `RCOMMANDER_CONFIG` at another file.
 
 ## Layout
 
@@ -15,22 +56,13 @@ Runs on **Linux and macOS** (both are built and tested in CI). Deleting moves fi
 
 ## Usage
 
-Terminal UI:
-
 ```sh
-cargo run --release -p rcmd -- [LEFT_DIR] [RIGHT_DIR]
+rcmd [LEFT_DIR] [RIGHT_DIR]                # terminal UI; defaults: current directory, home
+rcmd web [LEFT_DIR] [RIGHT_DIR]            # browser UI, opens your default browser
+rcmd web --browser "Google Chrome"         # pick a browser; --no-open just prints the URL; --port N
 ```
 
-Browser UI (opens your default browser; `--browser "Google Chrome"` to pick one, `--no-open` to just print the URL):
-
-```sh
-rustup target add wasm32-unknown-unknown
-cargo install trunk --locked                       # or download a release binary
-(cd crates/rc-web && trunk build --release)        # builds crates/rc-web/dist
-cargo run --release -p rcmd -- web [LEFT_DIR] [RIGHT_DIR]
-```
-
-Release builds embed the built front end, so the resulting `rcmd` binary is self-contained. The server listens on 127.0.0.1 only and every API call needs the random token from the URL it prints.
+The browser UI's server listens on 127.0.0.1 only, and every API call needs the random token from the URL it opens.
 
 Both UIs share the key bindings below; the few differences are marked. `F1` or `?` shows them in the app.
 
@@ -56,8 +88,8 @@ Both UIs share the key bindings below; the few differences are marked. `F1` or `
 | F2 | diff the files under both cursors (or two selected); against git HEAD if the other panel has no such file — `n`/`p` next/previous change, `f` fold |
 | Shift+F2 | diff the file against git HEAD |
 | F3 / F4 | view / edit (terminal: the editor from options, else `$VISUAL`/`$EDITOR`; browser: the GUI editor from options, else the default application) |
-| F5 / F6 | copy / move or rename; asks before overwriting (overwrite, only if newer, skip) |
-| F7 / F8 | new directory / delete to Trash (Shift+F8: permanent) |
+| F5 / F6 | copy / move or rename; asks before overwriting: `o` replace existing, `u` replace older, `s` keep existing (folders are merged); terminal: byte progress, Esc cancels |
+| F7 / F8, Delete | new directory / delete to Trash (Shift+F8: permanent) |
 | F9 | compare directories (toggle) |
 | `1`..`9` | same as F1..F9, so Mac laptops don't need the fn key |
 | `q` F10 Ctrl+C | quit (terminal only) |
@@ -104,4 +136,6 @@ cargo fmt --all
 
 Every change goes through a feature branch → code review → pull request → CI (fmt, clippy and tests on Linux and macOS; the wasm32 front end built with trunk and served by a release binary) → merge.
 
-Building from source needs a Rust toolchain (`rustup`) and a C linker (Xcode Command Line Tools on macOS, `build-essential` or equivalent on Linux).
+## License
+
+[MIT](LICENSE)
