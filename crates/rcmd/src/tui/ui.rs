@@ -12,16 +12,25 @@ use rc_core::Settings;
 use rc_core::diff::{DiffRow, RowKind, Side, Visible};
 use rc_core::dircmp::CmpMark;
 use rc_core::format::human_size;
-use rc_core::{Column, Panel, Row};
+use rc_core::{Column, Panel, Row, SortKey};
 
-const CURSOR_ACTIVE: Color = Color::Cyan;
-const CURSOR_INACTIVE: Color = Color::Indexed(238);
+// Palette (256-color indices so it also works in macOS Terminal.app).
+const ACCENT: Color = Color::Indexed(75);
+const TEXT: Color = Color::Indexed(252);
+const META: Color = Color::Indexed(246);
+const DIM: Color = Color::Indexed(244);
+const RULE: Color = Color::Indexed(238);
+const DIR: Color = Color::Indexed(111);
+const SELECTED: Color = Color::Indexed(221);
+const CURSOR_ACTIVE: Color = Color::Indexed(24);
+const CURSOR_INACTIVE: Color = Color::Indexed(236);
+const OK: Color = Color::Indexed(114);
+const ERR: Color = Color::Indexed(203);
 const DEL_BG: Color = Color::Indexed(52);
 const DEL_STRONG: Color = Color::Indexed(124);
 const INS_BG: Color = Color::Indexed(22);
 const INS_STRONG: Color = Color::Indexed(28);
-const CHG_BG: Color = Color::Indexed(17);
-const DIM: Color = Color::Indexed(244);
+const HATCH: Color = Color::Indexed(237);
 
 pub fn draw(f: &mut Frame, app: &mut App) {
     let [main, message, keys] =
@@ -47,8 +56,8 @@ pub fn draw(f: &mut Frame, app: &mut App) {
             let input = format!("{}█", elide_start(&p.input, area.width.saturating_sub(3) as usize));
             let block = Block::bordered()
                 .border_type(BorderType::Rounded)
-                .title(p.title.as_str())
-                .cyan();
+                .border_style(Style::new().fg(ACCENT))
+                .title(Line::raw(format!(" {} ", p.title)).fg(TEXT).bold());
             f.render_widget(Clear, area);
             f.render_widget(
                 Paragraph::new(vec![Line::raw(""), Line::raw(input).white()]).block(block),
@@ -59,12 +68,18 @@ pub fn draw(f: &mut Frame, app: &mut App) {
             let area = popup(main, 60, 5);
             let block = Block::bordered()
                 .border_type(BorderType::Rounded)
-                .title("Confirm")
-                .red();
+                .border_style(Style::new().fg(RULE))
+                .title(Line::raw(" Confirm ").fg(ERR).bold());
+            let yes = if c.enter_confirms { "Enter/y" } else { "y" };
             let text = vec![
-                Line::raw(c.text.as_str()).white(),
+                Line::raw(c.text.as_str()).fg(TEXT),
                 Line::raw(""),
-                Line::raw("[Enter/y] yes    [Esc/n] no").fg(DIM),
+                Line::from(vec![
+                    Span::raw(yes).fg(ACCENT).bold(),
+                    Span::raw(" yes    ").fg(DIM),
+                    Span::raw("Esc/n").fg(ACCENT).bold(),
+                    Span::raw(" no").fg(DIM),
+                ]),
             ];
             f.render_widget(Clear, area);
             f.render_widget(Paragraph::new(text).alignment(Alignment::Center).block(block), area);
@@ -107,25 +122,32 @@ fn utc_offset(secs: i64) -> i64 {
 }
 
 fn mark_color(m: CmpMark) -> Color {
-    match m {
-        CmpMark::Orphan => Color::Green,
-        CmpMark::Newer => Color::LightMagenta,
-        CmpMark::Older => Color::Blue,
-        CmpMark::Different => Color::Red,
-        CmpMark::Same => DIM,
-    }
+    Color::Indexed(m.color().1)
 }
 
-fn panel_status(p: &Panel) -> String {
+/// Bottom line of a panel. Only what differs from the defaults is mentioned.
+fn panel_status(p: &Panel, settings: &Settings) -> String {
     let (n, size) = p.selection_summary();
     let visible = p.rows().iter().filter(|r| matches!(r, Row::Entry(_))).count();
-    let mut s = format!(" {n} of {visible} selected, {} ", human_size(size));
-    s += &format!("· {}{} ", p.sort.label(), if p.sort_desc { "▼" } else { "▲" });
-    if !p.filter.is_empty() {
-        s += &format!("· filter: {} ", p.filter);
+    let plural = |n: usize, word: &str| format!("{n} {word}{}", if n == 1 { "" } else { "s" });
+    let mut s = match (n, size) {
+        (0, _) => format!(" {} ", plural(visible, "item")),
+        // Only directories selected: their size is unknown, so don't print "0".
+        (n, 0) => format!(" {n} of {visible} selected "),
+        (n, size) => format!(" {n} of {visible} selected · {} ", human_size(size)),
+    };
+    if p.sort != SortKey::Name || p.sort_desc {
+        s += &format!("· {} {} ", p.sort.label(), if p.sort_desc { "↓" } else { "↑" });
     }
-    if p.show_hidden {
-        s += "· hidden shown ";
+    if !p.filter.is_empty() {
+        s += &format!("· filter “{}” ", p.filter);
+    }
+    if p.show_hidden != settings.show_hidden {
+        s += if p.show_hidden {
+            "· hidden shown "
+        } else {
+            "· hidden off "
+        };
     }
     s
 }
@@ -134,23 +156,25 @@ fn draw_panel(f: &mut Frame, area: Rect, app: &mut App, side: usize) {
     let is_active = side == app.active;
     let filtering = is_active && matches!(app.mode, Mode::Filter);
     let p = &app.panels[side];
-    let border = if is_active { Color::Cyan } else { Color::Indexed(240) };
+    let border = if is_active { ACCENT } else { RULE };
     let title = elide_start(&format!(" {} ", p.location), area.width.saturating_sub(4) as usize);
     let status = if filtering {
         format!(" filter: {}█ ", p.filter)
     } else {
-        panel_status(p)
+        panel_status(p, &app.settings)
     };
     let block = Block::bordered()
         .border_type(BorderType::Rounded)
         .border_style(Style::new().fg(border))
         .title(Line::raw(title).bold().fg(if is_active { Color::White } else { DIM }))
-        .title_bottom(Line::raw(status).fg(if filtering { Color::Yellow } else { DIM }));
+        .title_bottom(Line::raw(status).fg(if filtering { SELECTED } else { DIM }));
     let inner = block.inner(area);
     f.render_widget(block, area);
+    let [header_area, rule_area, list_area] =
+        Layout::vertical([Constraint::Length(1), Constraint::Length(1), Constraint::Min(0)]).areas(inner);
 
-    // Header row + list; keep the cursor inside the visible window.
-    let height = inner.height.saturating_sub(1) as usize;
+    // Keep the cursor inside the visible window.
+    let height = list_area.height as usize;
     app.page = height.saturating_sub(1).max(1);
     let scroll = &mut app.scroll[side];
     if p.cursor < *scroll {
@@ -176,29 +200,17 @@ fn draw_panel(f: &mut Frame, area: Rect, app: &mut App, side: usize) {
         let (mark, name, values, mut style) = match p.rows()[r] {
             Row::Parent => (
                 Cell::from(" "),
-                "[..]".to_string(),
-                columns
-                    .iter()
-                    .map(|&c| {
-                        cell(
-                            if c == Column::Size {
-                                "<UP>".into()
-                            } else {
-                                String::new()
-                            },
-                            c,
-                        )
-                    })
-                    .collect::<Vec<_>>(),
-                Style::new().fg(Color::White).bold(),
+                "..".to_string(),
+                columns.iter().map(|&c| cell(String::new(), c)).collect::<Vec<_>>(),
+                Style::new().fg(DIR).bold(),
             ),
             Row::Entry(_) => {
                 let e = p.row_entry(r).expect("entry row");
                 let mark = p.marks.get(&e.name).copied();
                 let mut style = if e.is_dir {
-                    Style::new().fg(Color::White).bold()
+                    Style::new().fg(DIR).bold()
                 } else {
-                    Style::new().fg(Color::Gray)
+                    Style::new().fg(TEXT)
                 };
                 if e.hidden {
                     style = style.fg(DIM);
@@ -207,10 +219,10 @@ fn draw_panel(f: &mut Frame, area: Rect, app: &mut App, side: usize) {
                     style = style.fg(mark_color(m));
                 }
                 if p.is_selected(e) {
-                    style = style.fg(Color::Yellow).bold();
+                    style = style.fg(SELECTED).bold();
                 }
                 let mut name = if e.is_dir {
-                    format!("[{}]", e.name)
+                    format!("{}/", e.name)
                 } else {
                     e.name.clone()
                 };
@@ -220,20 +232,26 @@ fn draw_panel(f: &mut Frame, area: Rect, app: &mut App, side: usize) {
                 let mark = mark.map_or(Cell::from(" "), |m| {
                     Cell::from(m.symbol().to_string()).style(Style::new().fg(mark_color(m)))
                 });
-                let values = columns.iter().map(|&c| cell(c.text(e, utc_offset), c)).collect();
+                // Metadata stays quiet so names stand out (selection still colors it).
+                let selected = p.is_selected(e);
+                let values = columns
+                    .iter()
+                    .map(|&c| {
+                        let v = cell(c.text(e, utc_offset), c);
+                        if selected { v } else { v.style(Style::new().fg(META)) }
+                    })
+                    .collect();
                 (mark, name, values, style)
             }
         };
         if r == p.cursor {
             // Keep selected entries recognizable under the cursor.
             let selected = p.row_entry(r).is_some_and(|e| p.is_selected(e));
-            let fg = match (selected, is_active) {
-                (true, true) => Color::Indexed(94),
-                (true, false) => Color::Yellow,
-                (false, true) => Color::Black,
-                (false, false) => Color::White,
-            };
+            let fg = if selected { SELECTED } else { Color::White };
             style = style.bg(cursor_bg).fg(fg);
+            if is_active {
+                style = style.add_modifier(Modifier::BOLD);
+            }
         }
         let cells = [mark, Cell::from(name)].into_iter().chain(values);
         TableRow::new(cells).style(style)
@@ -251,20 +269,34 @@ fn draw_panel(f: &mut Frame, area: Rect, app: &mut App, side: usize) {
                 c.title().to_string()
             }
         }));
-    let table = Table::new(rows, widths)
-        .header(TableRow::new(header).style(Style::new().fg(Color::Cyan).bold()))
+    let widths: Vec<Constraint> = widths.collect();
+    let no_rows: [TableRow; 0] = [];
+    let header = Table::new(no_rows, widths.clone())
+        .header(TableRow::new(header).style(Style::new().fg(DIM)))
         .column_spacing(1);
-    f.render_widget(table, inner);
+    f.render_widget(header, header_area);
+    f.render_widget(Paragraph::new("─".repeat(rule_area.width as usize)).fg(RULE), rule_area);
+    let only_parent = p.rows().iter().all(|r| matches!(r, Row::Parent));
+    if only_parent && list_area.height > 2 {
+        let text = if p.filter.is_empty() {
+            "Empty folder · F7 new folder"
+        } else {
+            "Nothing matches the filter"
+        };
+        let [_, middle, _] =
+            Layout::vertical([Constraint::Fill(1), Constraint::Length(1), Constraint::Fill(1)]).areas(list_area);
+        f.render_widget(Paragraph::new(text).fg(DIM).alignment(Alignment::Center), middle);
+    }
+    f.render_widget(Table::new(rows, widths).column_spacing(1), list_area);
 }
 
 fn draw_message(f: &mut Frame, area: Rect, app: &App) {
     let line = if let Some(job) = app.job_status() {
-        Line::raw(format!(" ⏳ {job}")).yellow()
+        Line::raw(format!(" ⏳ {job}")).fg(SELECTED)
     } else if let Some((msg, is_err)) = &app.message {
-        let l = Line::raw(format!(" {msg}"));
-        if *is_err { l.red() } else { l.green() }
+        Line::raw(format!(" {msg}")).fg(if *is_err { ERR } else { OK })
     } else {
-        Line::raw(" F1/? help").fg(DIM)
+        Line::raw(" ? help · o options").fg(DIM)
     };
     f.render_widget(Paragraph::new(line), area);
 }
@@ -297,8 +329,8 @@ fn draw_keys(f: &mut Frame, area: Rect, mode: &Mode) {
         .iter()
         .flat_map(|(k, label)| {
             [
-                Span::raw(format!(" {k}")).white().bold(),
-                Span::raw(format!("{label:<7}")).black().on_cyan(),
+                Span::raw(format!(" {k} ")).fg(ACCENT).bold(),
+                Span::raw(format!("{label} ")).fg(DIM),
             ]
         })
         .collect();
@@ -308,8 +340,8 @@ fn draw_keys(f: &mut Frame, area: Rect, mode: &Mode) {
 fn draw_viewer(f: &mut Frame, area: Rect, v: &mut Viewer) {
     let block = Block::bordered()
         .border_type(BorderType::Rounded)
-        .title(v.title.as_str())
-        .cyan();
+        .border_style(Style::new().fg(ACCENT))
+        .title(Line::raw(format!(" {} ", v.title)).fg(TEXT).bold());
     let inner = block.inner(area);
     f.render_widget(block, area);
     v.page = inner.height as usize;
@@ -347,9 +379,9 @@ fn draw_diff(f: &mut Frame, area: Rect, d: &mut DiffView) {
     };
     let block = Block::bordered()
         .border_type(BorderType::Rounded)
-        .title(Line::raw(" Diff ").bold())
-        .title(Line::raw(format!(" {summary} ")).right_aligned())
-        .cyan();
+        .border_style(Style::new().fg(ACCENT))
+        .title(Line::raw(" Diff ").fg(TEXT).bold())
+        .title(Line::raw(format!(" {summary} ")).fg(DIM).right_aligned());
     let inner = block.inner(area);
     f.render_widget(block, area);
 
@@ -375,8 +407,24 @@ fn draw_diff(f: &mut Frame, area: Rect, d: &mut DiffView) {
             Visible::Row(i) => {
                 let row = &result.rows[i];
                 let marker = current == Some(i);
-                left.push(side_line(row, row.left.as_ref(), true, gutter, d.hscroll, marker));
-                right.push(side_line(row, row.right.as_ref(), false, gutter, d.hscroll, marker));
+                left.push(side_line(
+                    row,
+                    row.left.as_ref(),
+                    true,
+                    gutter,
+                    d.hscroll,
+                    marker,
+                    lb.width as usize,
+                ));
+                right.push(side_line(
+                    row,
+                    row.right.as_ref(),
+                    false,
+                    gutter,
+                    d.hscroll,
+                    marker,
+                    rb.width as usize,
+                ));
             }
             Visible::Fold { n, .. } => {
                 let fold = Line::raw(format!("⋯ {n} unchanged line{}", if n == 1 { "" } else { "s" }))
@@ -402,6 +450,7 @@ fn side_line<'a>(
     gutter: usize,
     hscroll: usize,
     current: bool,
+    width: usize,
 ) -> Line<'a> {
     let (bg, strong) = match (row.kind, is_left) {
         (RowKind::Equal, _) => (None, None),
@@ -410,13 +459,12 @@ fn side_line<'a>(
     };
     let marker = if current { "▶" } else { " " };
     let Some(side) = side else {
-        // The other side has lines here; show an empty band so rows stay aligned.
-        let filler = Style::new().bg(if row.kind == RowKind::Equal {
-            Color::Reset
-        } else {
-            CHG_BG
-        });
-        return Line::from(Span::raw(format!("{marker}{:gutter$} ", ""))).style(filler);
+        // The other side has lines here: hatch the gap so rows stay aligned.
+        let hatch = "╱".repeat(width.saturating_sub(gutter + 2));
+        return Line::from(vec![
+            Span::raw(format!("{marker}{:gutter$} ", "")),
+            Span::raw(hatch).fg(HATCH),
+        ]);
     };
     let mut spans = vec![Span::raw(format!("{marker}{:>gutter$} ", side.line_no)).fg(DIM)];
     let mut skip = hscroll;
@@ -444,7 +492,7 @@ fn side_line<'a>(
 
 fn draw_options(f: &mut Frame, area: Rect, o: &Options, settings: &Settings) {
     let check = |on: bool| if on { "[x]" } else { "[ ]" };
-    let mut lines = vec![Line::raw(" Columns").cyan().bold()];
+    let mut lines = vec![Line::raw(" Columns").fg(ACCENT).bold()];
     let mut row = |i: usize, text: String| {
         let line = Line::raw(format!("  {text}"));
         lines.push(if i == o.cursor {
@@ -478,8 +526,8 @@ fn draw_options(f: &mut Frame, area: Rect, o: &Options, settings: &Settings) {
         Paragraph::new(lines).block(
             Block::bordered()
                 .border_type(BorderType::Rounded)
-                .title(" Options ")
-                .cyan(),
+                .border_style(Style::new().fg(ACCENT))
+                .title(Line::raw(" Options ").fg(TEXT).bold()),
         ),
         area,
     );
@@ -512,7 +560,7 @@ fn draw_help(f: &mut Frame, area: Rect) {
         .iter()
         .map(|(k, v)| {
             Line::from(vec![
-                Span::raw(format!(" {k:<22}")).cyan().bold(),
+                Span::raw(format!(" {k:<22}")).fg(ACCENT).bold(),
                 Span::raw(*v).white(),
             ])
         })
@@ -523,8 +571,8 @@ fn draw_help(f: &mut Frame, area: Rect) {
         Paragraph::new(lines).block(
             Block::bordered()
                 .border_type(BorderType::Rounded)
-                .title(" Keys ")
-                .cyan(),
+                .border_style(Style::new().fg(ACCENT))
+                .title(Line::raw(" Keys ").fg(TEXT).bold()),
         ),
         area,
     );
@@ -557,7 +605,7 @@ mod tests {
         let mut app = App::new(Arc::new(rc_vfs::Vfs::new()), loc.clone(), loc);
 
         let s = screen(&mut app);
-        assert!(s.contains("[dir]") && s.contains("a.txt") && s.contains("<DIR>"), "{s}");
+        assert!(s.contains("dir/") && s.contains("a.txt") && s.contains("—"), "{s}");
         assert!(s.contains("Copy"), "function key bar");
 
         app.panels[0].focus_name("a.txt");
@@ -612,7 +660,7 @@ mod tests {
         assert!(screen(&mut app).contains("f099"));
         app.handle_key(KeyEvent::new(KeyCode::Home, KeyModifiers::NONE));
         let s = screen(&mut app);
-        assert!(s.contains("[..]") && !s.contains("f099"));
+        assert!(s.contains(" .. ") && !s.contains("f099"));
     }
 
     #[test]
