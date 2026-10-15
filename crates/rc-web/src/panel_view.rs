@@ -130,15 +130,28 @@ pub fn PanelView(app: App, side: usize) -> impl IntoView {
     });
 
     // Keep the cursor row visible (by position: off-screen rows are not in the DOM).
+    // The window signal moves first, so the cursor row is rendered in this update; the
+    // DOM scroll follows right away, or after the render if the list is still growing.
     Effect::new(move |_| {
         let c = cursor.get() as i32;
-        let _ = rows.get();
+        rows.with(|_| ());
+        view_height.with(|_| ());
         let Some(list) = list_ref.get() else { return };
-        let (top, height, scrolled) = (c * ROW_HEIGHT, list.client_height(), list.scroll_top());
-        if top < scrolled {
-            list.set_scroll_top(top);
+        let (top, height, scrolled) = (c * ROW_HEIGHT, list.client_height(), scroll_top.get_untracked());
+        let target = if top < scrolled {
+            top
         } else if top + ROW_HEIGHT > scrolled + height {
-            list.set_scroll_top(top + ROW_HEIGHT - height);
+            top + ROW_HEIGHT - height
+        } else {
+            return;
+        };
+        scroll_top.set(target);
+        if target <= list.scroll_height() - height {
+            list.set_scroll_top(target);
+        } else {
+            // The list grows in this update (new listing, hidden files shown…): scroll
+            // once it has, or the browser would clamp to the old height.
+            request_animation_frame(move || list.set_scroll_top(target));
         }
     });
 

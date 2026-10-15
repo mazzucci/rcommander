@@ -274,6 +274,9 @@ button.primary kbd {
 
 .list {
     position: relative;
+    /* Rows are virtualized: the browser must not "anchor" the scroll position to a row
+       that moves when the window of rendered rows shifts, or it scrolls on its own. */
+    overflow-anchor: none;
     flex: 1;
     min-height: 0;
     overflow-x: hidden;
