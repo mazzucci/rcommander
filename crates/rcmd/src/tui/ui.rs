@@ -31,6 +31,7 @@ const DEL_STRONG: Color = Color::Indexed(124);
 const INS_BG: Color = Color::Indexed(22);
 const INS_STRONG: Color = Color::Indexed(28);
 const HATCH: Color = Color::Indexed(237);
+const FLASH_BG: Color = Color::Indexed(23);
 
 pub fn draw(f: &mut Frame, app: &mut App) {
     let [main, message, keys] =
@@ -244,6 +245,10 @@ fn draw_panel(f: &mut Frame, area: Rect, app: &mut App, side: usize) {
                 (mark, name, values, style)
             }
         };
+        // Rows that just changed on disk light up briefly.
+        if p.row_entry(r).is_some_and(|e| app.flash[side].contains_key(&e.name)) {
+            style = style.bg(FLASH_BG);
+        }
         if r == p.cursor {
             // Keep selected entries recognizable under the cursor.
             let selected = p.row_entry(r).is_some_and(|e| p.is_selected(e));

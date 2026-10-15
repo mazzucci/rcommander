@@ -9,9 +9,12 @@ use rc_core::control::{Command, Reply};
 use rc_core::panel::SortKey;
 use rc_core::{Column, Location, Panel, Row, Settings, dircmp};
 use rc_vfs::Vfs;
+use rc_vfs::watch::DirWatcher;
+use std::collections::{BTreeSet, HashMap};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::mpsc::{self, Receiver, TryRecvError};
+use std::time::{Duration, Instant};
 
 pub const LEFT: usize = 0;
 pub const RIGHT: usize = 1;
@@ -107,7 +110,18 @@ pub struct App {
     settings_path: Option<PathBuf>,
     /// Remote-control requests from `rcmd ctl` (see `control.rs`).
     pub control: Option<Receiver<Request>>,
+    /// Live refresh: the watcher, the directories it reports, and what it watches now
+    /// (canonical paths, which is what the OS reports).
+    watcher: Option<DirWatcher>,
+    changes: Option<Receiver<PathBuf>>,
+    watching: [Option<PathBuf>; 2],
+    watched_locations: [Location; 2],
+    /// Entries that changed in a live refresh, highlighted briefly.
+    pub flash: [HashMap<String, Instant>; 2],
 }
+
+/// How long a changed row stays highlighted after a live refresh.
+pub const FLASH: Duration = Duration::from_millis(1500);
 
 impl App {
     #[cfg(test)]
@@ -140,6 +154,11 @@ impl App {
             settings,
             settings_path,
             control: None,
+            watcher: None,
+            changes: None,
+            watching: [None, None],
+            watched_locations: [Location::local(""), Location::local("")],
+            flash: [HashMap::new(), HashMap::new()],
         };
         app.load(LEFT, left, None);
         app.load(RIGHT, right, None);
@@ -172,6 +191,8 @@ impl App {
             Ok(listing) => {
                 if listing.location != self.panels[side].location {
                     self.scroll[side] = 0;
+                    // Highlights belong to the directory they were made in.
+                    self.flash[side].clear();
                 }
                 self.panels[side].set_listing(listing, focus);
                 true
@@ -399,7 +420,76 @@ impl App {
             let _ = req.reply.send(reply);
             changed = true;
         }
+        changed |= self.tick_watch();
         self.tick_job() || changed
+    }
+
+    /// Start live refresh: panels re-read their directory when it changes on disk.
+    pub fn enable_live_refresh(&mut self) -> anyhow::Result<()> {
+        let (tx, rx) = mpsc::channel();
+        self.watcher = Some(DirWatcher::new(move |dir| {
+            let _ = tx.send(dir);
+        })?);
+        self.changes = Some(rx);
+        Ok(())
+    }
+
+    /// Keep the watcher on the panels' directories and refresh panels that changed.
+    fn tick_watch(&mut self) -> bool {
+        let Some(watcher) = &mut self.watcher else { return false };
+        // Resolve symlinks only when a panel moved, not on every tick (a stalled network
+        // mount would block the UI).
+        let locations = self.panels.each_ref().map(|p| p.location.clone());
+        if locations != self.watched_locations {
+            let dirs = locations.each_ref().map(|l| {
+                let Location::Local { path } = l;
+                std::fs::canonicalize(path).ok()
+            });
+            watcher.set(dirs.iter().flatten().map(PathBuf::as_path));
+            self.watching = dirs;
+            self.watched_locations = locations;
+        }
+        let changed: BTreeSet<PathBuf> = self
+            .changes
+            .as_ref()
+            .map(|rx| rx.try_iter().collect())
+            .unwrap_or_default();
+        // The directory itself may have been deleted and recreated, which drops its watch.
+        for dir in self.watching.iter().flatten().filter(|d| changed.contains(*d)) {
+            watcher.rewatch(dir);
+        }
+        let mut redraw = false;
+        for side in [LEFT, RIGHT] {
+            if self.watching[side].as_ref().is_some_and(|d| changed.contains(d)) {
+                self.live_refresh(side);
+                redraw = true;
+            }
+        }
+        // Redraw while highlights are fading out.
+        let now = Instant::now();
+        for flash in &mut self.flash {
+            let before = flash.len();
+            flash.retain(|_, t| now.duration_since(*t) < FLASH);
+            redraw |= flash.len() != before;
+        }
+        redraw
+    }
+
+    /// Refresh one panel and remember which entries are new or changed.
+    fn live_refresh(&mut self, side: usize) {
+        let key = |e: &rc_core::Entry| (e.size, e.modified, e.is_dir);
+        let before: HashMap<String, _> = self.panels[side]
+            .entries()
+            .iter()
+            .map(|e| (e.name.clone(), key(e)))
+            .collect();
+        self.refresh(side);
+        let now = Instant::now();
+        for e in self.panels[side].entries() {
+            if before.get(&e.name) != Some(&key(e)) {
+                self.flash[side].insert(e.name.clone(), now);
+            }
+        }
     }
 
     /// Carry out a remote-control command.
@@ -1087,6 +1177,29 @@ mod tests {
         assert!(matches!(app.mode, Mode::Prompt(_)));
         assert!(app.apply(Command::Message { text: "hi".into() }).ok);
         assert_eq!(app.message.as_ref().unwrap().0, "hi");
+    }
+
+    #[test]
+    fn live_refresh_picks_up_new_files_and_flashes_them() {
+        let (tmp, mut app) = setup();
+        app.enable_live_refresh().unwrap();
+        app.panels[LEFT].focus_name("b.txt");
+        app.tick();
+        std::thread::sleep(Duration::from_millis(100));
+        std::fs::write(tmp.path().join("left/new.txt"), "x").unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while Instant::now() < deadline && !app.panels[LEFT].entries().iter().any(|e| e.name == "new.txt") {
+            app.tick();
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert!(app.panels[LEFT].entries().iter().any(|e| e.name == "new.txt"));
+        assert!(app.flash[LEFT].contains_key("new.txt"));
+        assert!(!app.flash[LEFT].contains_key("a.txt"));
+        assert_eq!(app.panels[LEFT].current().unwrap().name, "b.txt", "cursor kept");
+        // Leaving the directory drops its highlights.
+        app.panels[LEFT].focus_name("sub");
+        app.handle_key(key(KeyCode::Enter));
+        assert!(app.flash[LEFT].is_empty());
     }
 
     #[test]

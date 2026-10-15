@@ -24,6 +24,9 @@ pub fn run(mut app: App) -> Result<()> {
             None
         }
     };
+    if let Err(e) = app.enable_live_refresh() {
+        app.message = Some((format!("live refresh unavailable: {e:#}"), true));
+    }
     let mut terminal = ratatui::init();
     let result = event_loop(&mut terminal, &mut app);
     ratatui::restore();
