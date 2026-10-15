@@ -9,7 +9,7 @@ use crate::{api, dom};
 use leptos::ev;
 use leptos::prelude::*;
 use leptos::task::spawn_local;
-use rc_core::api::{DiffResponse, FileContent, FileOp, OpResult};
+use rc_core::api::{DiffResponse, FileContent, FileOp, OnConflict, OpResult};
 use rc_core::dircmp::{self, CmpMark};
 use rc_core::{Location, Panel, Row, Settings, SortKey};
 use std::collections::HashMap;
@@ -334,13 +334,13 @@ impl App {
                     FileOp::Move {
                         sources,
                         dest,
-                        overwrite: false,
+                        on_conflict: OnConflict::Skip,
                     }
                 } else {
                     FileOp::Copy {
                         sources,
                         dest,
-                        overwrite: false,
+                        on_conflict: OnConflict::Skip,
                     }
                 };
                 self.run_op(op, None);

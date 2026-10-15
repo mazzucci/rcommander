@@ -88,6 +88,33 @@ pub fn draw(f: &mut Frame, app: &mut App) {
         Mode::Help => draw_help(f, main),
         Mode::Options(o) => draw_options(f, main, o, &app.settings),
         Mode::Hotlist(cursor) => draw_hotlist(f, main, *cursor, &app.settings.bookmarks),
+        Mode::Conflict(c) => {
+            let area = popup(main, 64, 5);
+            let block = Block::bordered()
+                .border_type(BorderType::Rounded)
+                .border_style(Style::new().fg(RULE))
+                .title(Line::raw(" Already exists ").fg(SELECTED).bold());
+            let folders = c.existing.iter().filter(|p| std::path::Path::new(p).is_dir()).count();
+            let name = |p: &String| p.rsplit('/').next().unwrap_or(p).to_string();
+            let what = match c.existing.as_slice() {
+                [one] if folders == 1 => format!("Folder {} already exists; its contents will be merged.", name(one)),
+                [one] => format!("{} already exists.", name(one)),
+                many => format!("{} items already exist at the destination.", many.len()),
+            };
+            let key = |k: &'static str, label: &'static str| [Span::raw(k).fg(ACCENT).bold(), Span::raw(label).fg(DIM)];
+            let choices: Vec<Span> = [
+                key("o", " replace existing   "),
+                key("u", " replace older   "),
+                key("s", " keep existing   "),
+                key("Esc", " cancel"),
+            ]
+            .into_iter()
+            .flatten()
+            .collect();
+            let text = vec![Line::raw(what).fg(TEXT), Line::raw(""), Line::from(choices)];
+            f.render_widget(Clear, area);
+            f.render_widget(Paragraph::new(text).alignment(Alignment::Center).block(block), area);
+        }
         _ => {}
     }
 }
@@ -302,7 +329,7 @@ fn draw_panel(f: &mut Frame, area: Rect, app: &mut App, side: usize) {
 
 fn draw_message(f: &mut Frame, area: Rect, app: &App) {
     let line = if let Some(job) = app.job_status() {
-        Line::raw(format!(" ⏳ {job}")).fg(SELECTED)
+        Line::raw(format!(" {job}")).fg(SELECTED)
     } else if let Some((msg, is_err)) = &app.message {
         Line::raw(format!(" {msg}")).fg(if *is_err { ERR } else { OK })
     } else {

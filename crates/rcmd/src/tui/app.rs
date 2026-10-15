@@ -5,15 +5,19 @@ use super::views::{DiffView, Viewer};
 use crate::control::Request;
 use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use rc_core::api::{FileOp, OpResult};
+use rc_core::api::{OnConflict, Progress};
 use rc_core::control::{Command, Reply};
+use rc_core::format::human_size;
 use rc_core::history::History;
 use rc_core::panel::SortKey;
 use rc_core::{Column, Location, Panel, Row, Settings, dircmp};
 use rc_vfs::Vfs;
 use rc_vfs::watch::DirWatcher;
 use std::collections::{BTreeSet, HashMap};
+use std::ops::ControlFlow;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, TryRecvError};
 use std::time::{Duration, Instant};
 
@@ -32,6 +36,7 @@ pub enum Mode {
     Options(Options),
     /// The hotlist (bookmarks); the number is the cursor row.
     Hotlist(usize),
+    Conflict(ConflictPrompt),
 }
 
 /// The options dialog: one row per optional column, then "show hidden", then the editor.
@@ -89,13 +94,21 @@ pub enum Effect {
 /// A file operation running on a worker thread.
 pub struct Job {
     pub verb: &'static str,
-    pub current: String,
+    pub progress: Option<Progress>,
     rx: Receiver<JobMsg>,
+    /// Set to stop the worker at its next progress report.
+    cancel: Arc<AtomicBool>,
 }
 
 enum JobMsg {
-    Progress(String),
+    Progress(Progress),
     Done(OpResult),
+}
+
+/// A copy/move that would replace existing files, waiting for the user's choice.
+pub struct ConflictPrompt {
+    pub op: FileOp,
+    pub existing: Vec<String>,
 }
 
 pub struct App {
@@ -459,22 +472,24 @@ impl App {
                 if let Some(loc) = Location::resolve_input(input, &base) {
                     let name = input.split('/').next().unwrap_or(input).to_string();
                     let loc = self.vfs.normalize(loc, Some(&base));
-                    let res = self.vfs.op(&FileOp::Mkdir { location: loc }, &mut |_| {});
+                    let res = self.vfs.op(&FileOp::Mkdir { location: loc }, &mut |_| {
+                        std::ops::ControlFlow::Continue(())
+                    });
                     self.report(&res.summary("Create directory"), res.errors.is_empty());
                     self.refresh_all();
                     self.active_mut().focus_name(&name);
                 }
             }
             PromptAction::Copy(sources) | PromptAction::Move(sources) if input.is_empty() => drop(sources),
-            PromptAction::Copy(sources) => self.run_job(FileOp::Copy {
+            PromptAction::Copy(sources) => self.start_transfer(FileOp::Copy {
                 sources,
                 dest: self.dest(input, &base),
-                overwrite: false,
+                on_conflict: OnConflict::Skip,
             }),
-            PromptAction::Move(sources) => self.run_job(FileOp::Move {
+            PromptAction::Move(sources) => self.start_transfer(FileOp::Move {
                 sources,
                 dest: self.dest(input, &base),
-                overwrite: false,
+                on_conflict: OnConflict::Skip,
             }),
         }
     }
@@ -485,6 +500,48 @@ impl App {
     }
 
     /// Run a (possibly long) file operation on a worker thread; `tick` collects the result.
+    /// Run a copy/move, first asking what to do if it would meet existing files.
+    fn start_transfer(&mut self, op: FileOp) {
+        if self.job.is_some() {
+            self.error("Another operation is still running");
+            return;
+        }
+        let existing = self.vfs.conflicts(&op).existing;
+        if existing.is_empty() {
+            self.run_job(op);
+        } else {
+            self.mode = Mode::Conflict(ConflictPrompt { op, existing });
+        }
+    }
+
+    fn conflict_key(&mut self, c: ConflictPrompt, key: KeyEvent) {
+        // 'n' is "no" everywhere else, so it cancels here too; "only newer" is 'u' (update).
+        let policy = match key.code {
+            KeyCode::Char('o' | 'O') => OnConflict::Overwrite,
+            KeyCode::Char('u' | 'U') => OnConflict::IfNewer,
+            KeyCode::Char('s' | 'S') => OnConflict::Skip,
+            KeyCode::Esc | KeyCode::Char('n' | 'N') => return,
+            _ => {
+                self.mode = Mode::Conflict(c);
+                return;
+            }
+        };
+        let op = match c.op {
+            FileOp::Copy { sources, dest, .. } => FileOp::Copy {
+                sources,
+                dest,
+                on_conflict: policy,
+            },
+            FileOp::Move { sources, dest, .. } => FileOp::Move {
+                sources,
+                dest,
+                on_conflict: policy,
+            },
+            other => other,
+        };
+        self.run_job(op);
+    }
+
     fn run_job(&mut self, op: FileOp) {
         if self.job.is_some() {
             self.error("Another operation is still running");
@@ -493,17 +550,29 @@ impl App {
         let (tx, rx) = mpsc::channel();
         let vfs = Arc::clone(&self.vfs);
         let verb = op.verb();
+        let cancel = Arc::new(AtomicBool::new(false));
+        let stop = Arc::clone(&cancel);
         std::thread::spawn(move || {
             let progress_tx = tx.clone();
-            let res = vfs.op(&op, &mut |path| {
-                let _ = progress_tx.send(JobMsg::Progress(path.to_string()));
+            let mut last: Option<Instant> = None;
+            let res = vfs.op(&op, &mut |p| {
+                if stop.load(Ordering::Relaxed) {
+                    return ControlFlow::Break(());
+                }
+                // Many small files would flood the UI; a few updates a second suffice.
+                if last.is_none_or(|t| t.elapsed() >= Duration::from_millis(50)) {
+                    last = Some(Instant::now());
+                    let _ = progress_tx.send(JobMsg::Progress(p.clone()));
+                }
+                ControlFlow::Continue(())
             });
             let _ = tx.send(JobMsg::Done(res));
         });
         self.job = Some(Job {
             verb,
-            current: String::new(),
+            progress: None,
             rx,
+            cancel,
         });
     }
 
@@ -658,7 +727,7 @@ impl App {
         loop {
             match job.rx.try_recv() {
                 Ok(JobMsg::Progress(p)) => {
-                    job.current = p;
+                    job.progress = Some(p);
                     changed = true;
                 }
                 Ok(JobMsg::Done(res)) => {
@@ -687,7 +756,8 @@ impl App {
     /// Show the result and refresh. The selection is kept when something failed so the
     /// user can retry.
     fn finish_op(&mut self, verb: &str, res: OpResult) {
-        let ok = res.errors.is_empty();
+        // A cancelled operation keeps the selection too, so the rest can be retried.
+        let ok = res.errors.is_empty() && !res.cancelled;
         self.report(&res.summary(verb), ok);
         if ok {
             self.panels.iter_mut().for_each(Panel::clear_selection);
@@ -739,6 +809,7 @@ impl App {
             }
             Mode::Options(o) => self.options_key(o, key),
             Mode::Hotlist(cursor) => self.hotlist_key(cursor, key),
+            Mode::Conflict(c) => self.conflict_key(c, key),
         }
         Effect::None
     }
@@ -935,6 +1006,13 @@ impl App {
                 PromptAction::SelectMask { select: false },
             ),
             KeyCode::Char('*') => self.active_mut().invert_selection(),
+            // Esc stops a running copy/move first.
+            KeyCode::Esc if self.job.is_some() => {
+                if let Some(job) = &self.job {
+                    job.cancel.store(true, Ordering::Relaxed);
+                }
+                self.info("Cancelling…");
+            }
             // First Esc clears the filter, the next one the selection.
             KeyCode::Esc => {
                 let p = self.active_mut();
@@ -995,7 +1073,27 @@ impl App {
 
     /// Status line for the job in progress, if any.
     pub fn job_status(&self) -> Option<String> {
-        self.job.as_ref().map(|j| format!("{}: {}", j.verb, j.current))
+        let job = self.job.as_ref()?;
+        if job.cancel.load(Ordering::Relaxed) {
+            return Some(format!("Cancelling {}…", job.verb.to_lowercase()));
+        }
+        let Some(p) = &job.progress else {
+            return Some(format!("{}…  (Esc cancels)", job.verb));
+        };
+        let name = p.path.rsplit('/').next().unwrap_or(&p.path);
+        if p.total == 0 {
+            return Some(format!("{}: {name}  (Esc cancels)", job.verb));
+        }
+        let filled = usize::from(p.percent()) / 5;
+        Some(format!(
+            "{} {:>3}% {}{} {} of {} · {name}  (Esc cancels)",
+            job.verb,
+            p.percent(),
+            "█".repeat(filled),
+            "░".repeat(20 - filled),
+            human_size(p.done.min(p.total)),
+            human_size(p.total),
+        ))
     }
 }
 
@@ -1157,8 +1255,9 @@ mod tests {
         let (_tx, rx) = mpsc::channel();
         app.job = Some(Job {
             verb: "Copy",
-            current: String::new(),
+            progress: None,
             rx,
+            cancel: Arc::default(),
         });
         assert_eq!(app.handle_key(key(KeyCode::Char('q'))), Effect::None);
         assert!(matches!(app.mode, Mode::Confirm(_)));
@@ -1177,8 +1276,9 @@ mod tests {
         drop(tx);
         app.job = Some(Job {
             verb: "Copy",
-            current: String::new(),
+            progress: None,
             rx,
+            cancel: Arc::default(),
         });
         assert!(app.tick());
         assert!(app.job.is_none());
@@ -1465,6 +1565,67 @@ mod tests {
         app.handle_key(KeyEvent::new(KeyCode::Char('d'), KeyModifiers::CONTROL));
         app.handle_key(key(KeyCode::Char('d')));
         assert!(app.settings.bookmarks.is_empty());
+    }
+
+    #[test]
+    fn copy_asks_about_existing_files() {
+        let (tmp, mut app) = setup();
+        // a.txt exists on both sides with different content.
+        app.panels[LEFT].focus_name("a.txt");
+        app.handle_key(key(KeyCode::F(5)));
+        app.handle_key(key(KeyCode::Enter));
+        let Mode::Conflict(c) = &app.mode else {
+            panic!("expected a conflict prompt")
+        };
+        assert_eq!(c.existing.len(), 1);
+        // 'n' means no, as in every other dialog.
+        app.handle_key(key(KeyCode::Char('n')));
+        assert!(matches!(app.mode, Mode::Normal) && app.job.is_none());
+        app.handle_key(key(KeyCode::F(5)));
+        app.handle_key(key(KeyCode::Enter));
+        app.handle_key(key(KeyCode::Char('s')));
+        wait_job(&mut app);
+        assert_eq!(
+            fs::read_to_string(tmp.path().join("right/a.txt")).unwrap(),
+            "one\nTWO\n",
+            "skipped"
+        );
+        app.panels[LEFT].focus_name("a.txt");
+        app.handle_key(key(KeyCode::F(5)));
+        app.handle_key(key(KeyCode::Enter));
+        app.handle_key(key(KeyCode::Char('o')));
+        wait_job(&mut app);
+        assert_eq!(
+            fs::read_to_string(tmp.path().join("right/a.txt")).unwrap(),
+            "one\ntwo\n",
+            "overwritten"
+        );
+        // No conflict: runs straight away.
+        app.panels[LEFT].focus_name("b.txt");
+        app.handle_key(key(KeyCode::F(5)));
+        app.handle_key(key(KeyCode::Enter));
+        assert!(app.job.is_some());
+        wait_job(&mut app);
+    }
+
+    #[test]
+    fn esc_cancels_a_running_job() {
+        let (_tmp, mut app) = setup();
+        let (_tx, rx) = mpsc::channel();
+        app.job = Some(Job {
+            verb: "Copy",
+            progress: None,
+            rx,
+            cancel: Arc::default(),
+        });
+        app.panels[LEFT].select_mask("*", true);
+        app.handle_key(key(KeyCode::Esc));
+        assert!(app.job.as_ref().unwrap().cancel.load(Ordering::Relaxed));
+        assert!(app.job_status().unwrap().starts_with("Cancelling"));
+        assert!(
+            !app.panels[LEFT].selected.is_empty(),
+            "Esc cancelled instead of clearing the selection"
+        );
     }
 
     #[test]
