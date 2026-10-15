@@ -6,6 +6,7 @@ pub mod diff;
 pub mod dircmp;
 mod entry;
 pub mod format;
+pub mod history;
 mod location;
 pub mod panel;
 pub mod settings;
