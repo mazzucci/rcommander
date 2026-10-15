@@ -293,6 +293,13 @@ impl Vfs {
                 };
                 record(&mut res, &to.to_string(), r.map(|_| Copied::Done));
             }
+            FileOp::RenameMany { folder, renames } => {
+                let Location::Local { path } = folder;
+                match local::rename_many(Path::new(path), renames) {
+                    Ok(n) => res.done = n,
+                    Err(e) => res.errors.push(format!("{e:#}")),
+                }
+            }
         }
         res
     }

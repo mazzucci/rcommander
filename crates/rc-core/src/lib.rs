@@ -9,6 +9,7 @@ pub mod format;
 pub mod history;
 mod location;
 pub mod panel;
+pub mod rename;
 pub mod settings;
 
 pub use diff::{DiffResult, diff_text};

@@ -603,6 +603,10 @@ fn normalize_op(vfs: &Vfs, op: FileOp) -> FileOp {
             from: n(from),
             to: n(to),
         },
+        FileOp::RenameMany { folder, renames } => FileOp::RenameMany {
+            folder: n(folder),
+            renames,
+        },
     }
 }
 

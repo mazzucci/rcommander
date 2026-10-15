@@ -103,7 +103,7 @@ pub struct DiffResponse {
 /// against its committed (git HEAD) version.
 ///
 /// `POST /api/op` → [`OpResult`].
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "op", rename_all = "snake_case")]
 pub enum FileOp {
     /// Like `cp`: if `dest` is an existing directory the sources go inside it; otherwise
@@ -132,6 +132,13 @@ pub enum FileOp {
         from: Location,
         to: Location,
     },
+    /// Rename many entries of one folder at once (old name, new name). Swaps and chains
+    /// (a → b, b → c) work; nothing is renamed if a new name is invalid, repeated, or
+    /// taken by an entry that stays.
+    RenameMany {
+        folder: Location,
+        renames: Vec<(String, String)>,
+    },
 }
 
 impl FileOp {
@@ -159,6 +166,7 @@ impl FileOp {
             FileOp::Delete { .. } => "Delete",
             FileOp::Mkdir { .. } => "Create directory",
             FileOp::Rename { .. } => "Rename",
+            FileOp::RenameMany { .. } => "Rename",
         }
     }
 }

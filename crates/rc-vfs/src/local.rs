@@ -138,6 +138,60 @@ mod owners {
     }
 }
 
+/// Rename entries of `dir` (old name, new name) as one batch: first every entry moves to
+/// a temporary name, then to its new one, so swaps and chains work. Everything is checked
+/// first; if a step fails, what was done is undone as far as possible. Returns how many
+/// entries got a new name.
+pub fn rename_many(dir: &Path, renames: &[(String, String)]) -> Result<usize> {
+    let renames: Vec<&(String, String)> = renames.iter().filter(|(a, b)| a != b).collect();
+    let valid = |n: &str| !n.is_empty() && n != "." && n != ".." && !n.contains(['/', '\0']);
+    let sources: std::collections::HashSet<&str> = renames.iter().map(|(a, _)| a.as_str()).collect();
+    let mut targets = std::collections::HashSet::new();
+    for (from, to) in &renames {
+        if !valid(from) || !valid(to) {
+            bail!("invalid name: {to:?}");
+        }
+        if !targets.insert(to.as_str()) {
+            bail!("two entries would be named {to}");
+        }
+        dir.join(from)
+            .symlink_metadata()
+            .with_context(|| format!("cannot rename {from}"))?;
+        // Same file under another name = a case-only rename on a case-insensitive disk.
+        let target = dir.join(to);
+        if !sources.contains(to.as_str()) && target.symlink_metadata().is_ok() && !same_file(&dir.join(from), &target) {
+            bail!("{to} already exists");
+        }
+    }
+    let temp = |i: usize| dir.join(format!(".rcmd-rename-{}-{i}", std::process::id()));
+    // Phase 1: everything out of the way.
+    for (i, (from, _)) in renames.iter().enumerate() {
+        if let Err(e) = fs::rename(dir.join(from), temp(i)) {
+            for (j, (from, _)) in renames[..i].iter().enumerate().rev() {
+                let _ = fs::rename(temp(j), dir.join(from));
+            }
+            return Err(e).with_context(|| format!("cannot rename {from}"));
+        }
+    }
+    // Phase 2: into place. On failure the rest go back to their old names.
+    for (i, (_, to)) in renames.iter().enumerate() {
+        if let Err(e) = fs::rename(temp(i), dir.join(to)) {
+            let mut lost = Vec::new();
+            for (j, (from, _)) in renames.iter().enumerate().skip(i) {
+                if fs::rename(temp(j), dir.join(from)).is_err() {
+                    lost.push(temp(j).display().to_string());
+                }
+            }
+            let mut msg = format!("cannot rename to {to}: {e}; {i} renamed, the rest kept their names");
+            if !lost.is_empty() {
+                msg += &format!(" (left as {})", lost.join(", "));
+            }
+            bail!(msg);
+        }
+    }
+    Ok(renames.len())
+}
+
 /// What a file that is not a regular file is, in words.
 pub fn special_kind(kind: &fs::FileType) -> &'static str {
     use std::os::unix::fs::FileTypeExt;
@@ -576,6 +630,47 @@ pub fn remove(path: &Path) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn rename_many_handles_swaps_chains_and_refusals() {
+        let tmp = tempfile::tempdir().unwrap();
+        let d = tmp.path();
+        for (n, c) in [("a", "A"), ("b", "B"), ("c", "C"), ("keep", "K")] {
+            fs::write(d.join(n), c).unwrap();
+        }
+        let r = |pairs: &[(&str, &str)]| -> Vec<(String, String)> {
+            pairs.iter().map(|(a, b)| (a.to_string(), b.to_string())).collect()
+        };
+        let read = |n: &str| fs::read_to_string(d.join(n)).unwrap();
+
+        // Swap and chain in one batch.
+        assert_eq!(rename_many(d, &r(&[("a", "b"), ("b", "a"), ("c", "d")])).unwrap(), 3);
+        assert_eq!((read("a"), read("b"), read("d")), ("B".into(), "A".into(), "C".into()));
+        assert!(!d.join("c").exists());
+
+        // Refused before touching anything.
+        for pairs in [
+            r(&[("a", "keep")]),
+            r(&[("a", "x"), ("b", "x")]),
+            r(&[("a", "x/y")]),
+            r(&[("missing", "x")]),
+            r(&[("a", "..")]),
+        ] {
+            assert!(rename_many(d, &pairs).is_err(), "{pairs:?}");
+        }
+        assert_eq!(
+            (read("a"), read("b"), read("keep")),
+            ("B".into(), "A".into(), "K".into())
+        );
+        let leftovers: Vec<_> = fs::read_dir(d)
+            .unwrap()
+            .flatten()
+            .filter(|e| e.file_name().to_string_lossy().starts_with(".rcmd-rename"))
+            .collect();
+        assert!(leftovers.is_empty());
+        // Unchanged names are fine and not counted.
+        assert_eq!(rename_many(d, &r(&[("a", "a"), ("b", "e")])).unwrap(), 1);
+    }
 
     fn cp(src: &Path, dest: &Path, policy: OnConflict) -> Result<Copied> {
         copy(src, dest, policy, &mut 0, 0, &mut |_| ControlFlow::Continue(())).map(|o| o.result())

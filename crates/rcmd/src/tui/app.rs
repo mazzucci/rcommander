@@ -2,6 +2,7 @@
 //! terminal I/O so it can be unit-tested with plain key events.
 
 use super::find::{self, Find};
+use super::rename::{self, MultiRename};
 use super::views::{DiffView, Viewer};
 use crate::control::Request;
 use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
@@ -43,6 +44,8 @@ pub enum Mode {
     Find(Box<Find>),
     /// A file viewed from the find results; closing it goes back to them.
     FindView(Box<Find>, Viewer),
+    /// Multi-rename (Shift+F6).
+    Rename(Box<MultiRename>),
 }
 
 /// The options dialog: one row per optional column, then "show hidden", then the editor.
@@ -808,7 +811,13 @@ impl App {
         // Never act behind a dialog the user is answering; harmless commands still go through.
         let busy = matches!(
             self.mode,
-            Mode::Prompt(_) | Mode::Confirm(_) | Mode::Filter | Mode::Options(_) | Mode::Find(_) | Mode::FindView(..)
+            Mode::Prompt(_)
+                | Mode::Confirm(_)
+                | Mode::Filter
+                | Mode::Options(_)
+                | Mode::Find(_)
+                | Mode::FindView(..)
+                | Mode::Rename(_)
         );
         if busy && !matches!(command, Command::Message { .. } | Command::Refresh) {
             return Reply::error("rcmd is busy: a dialog is open");
@@ -976,6 +985,11 @@ impl App {
                 };
             }
             Mode::Find(f) => self.find_key(f, key),
+            Mode::Rename(mut r) => match r.handle_key(key) {
+                rename::Action::None => self.mode = Mode::Rename(r),
+                rename::Action::Close => {}
+                rename::Action::Run(op) => self.run_job(op),
+            },
             Mode::Diff(mut d) => {
                 if !d.handle_key(key) {
                     self.mode = Mode::Diff(d);
@@ -1100,6 +1114,21 @@ impl App {
             (key, preview)
         });
         true
+    }
+
+    /// Shift+F6: rename the selected entries (or the one under the cursor) by a rule.
+    fn open_rename(&mut self) {
+        if self.in_changes() {
+            self.error("Claude's changes are links to the edited files; rename the files themselves");
+            return;
+        }
+        let p = self.active_panel();
+        let entries: Vec<(String, bool)> = p.targets().iter().map(|e| (e.name.clone(), e.is_dir)).collect();
+        if entries.is_empty() {
+            return;
+        }
+        let existing = p.entries().iter().map(|e| e.name.clone()).collect();
+        self.mode = Mode::Rename(Box::new(MultiRename::new(p.location.clone(), entries, existing)));
     }
 
     /// Alt+F7: find files under the active panel's folder.
@@ -1317,6 +1346,8 @@ impl App {
                 }
             }
             KeyCode::F(5) => self.start_copy_move(false),
+            KeyCode::F(6) if shift => self.open_rename(),
+            KeyCode::Char('M') => self.open_rename(),
             KeyCode::F(6) => self.start_copy_move(true),
             // Shift+Q too, as in the browser (where Ctrl+Q can quit Firefox).
             KeyCode::Char('q') if ctrl => self.quick_view = !self.quick_view,
