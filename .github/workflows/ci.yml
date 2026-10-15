@@ -54,7 +54,17 @@ jobs:
       # test harness doesn't build for wasm32.)
       - run: cargo clippy -p rc-core -p rc-web --target wasm32-unknown-unknown --locked
       - name: Install trunk
-        run: curl -sSL "https://github.com/trunk-rs/trunk/releases/download/$TRUNK_VERSION/trunk-x86_64-unknown-linux-musl.tar.gz" | tar xz -C ~/.cargo/bin
+        run: |
+          curl -sSLo trunk.tar.gz "https://github.com/trunk-rs/trunk/releases/download/$TRUNK_VERSION/trunk-x86_64-unknown-linux-musl.tar.gz"
+          echo "a67f4054b249fe9acc5fabc25de1aebf19783aca3ad6ff64bf34d7da44d0ea20  trunk.tar.gz" | sha256sum -c
+          tar xzf trunk.tar.gz -C ~/.cargo/bin && rm trunk.tar.gz
       - name: Build the web front end
-        run: trunk build --release
+        run: trunk build --release --locked
         working-directory: crates/rc-web
+      # Release builds embed the front end; check the binary really serves it.
+      - name: Release binary serves the embedded front end
+        run: |
+          cargo build --release -p rcmd --locked
+          ./target/release/rcmd web --no-open --port 7999 > server.log 2>&1 &
+          sleep 2
+          curl -sf -H 'Host: 127.0.0.1:7999' http://127.0.0.1:7999/ | grep -q 'rc-web'

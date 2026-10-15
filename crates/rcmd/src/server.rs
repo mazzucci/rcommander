@@ -50,8 +50,12 @@ pub fn run(vfs: Arc<Vfs>, config: Config) -> Result<()> {
 async fn serve(vfs: Arc<Vfs>, config: Config) -> Result<()> {
     let listener = match tokio::net::TcpListener::bind(("127.0.0.1", config.port)).await {
         Ok(l) => l,
-        // Port taken (another instance?) — fall back to any free port.
-        Err(_) => tokio::net::TcpListener::bind(("127.0.0.1", 0)).await?,
+        // Port taken (another instance?): fall back to any free port, and say so.
+        Err(e) if e.kind() == std::io::ErrorKind::AddrInUse => {
+            eprintln!("port {} is in use; picking a free one", config.port);
+            tokio::net::TcpListener::bind(("127.0.0.1", 0)).await?
+        }
+        Err(e) => return Err(e).with_context(|| format!("cannot listen on 127.0.0.1:{}", config.port)),
     };
     let addr = listener.local_addr()?;
     let token = random_token()?;
@@ -72,21 +76,59 @@ async fn serve(vfs: Arc<Vfs>, config: Config) -> Result<()> {
     let url = format!("http://{addr}/#token={token}");
     println!("rcommander is running at {url}\nPress Ctrl+C to stop.");
     if Assets::get("index.html").is_none() {
-        eprintln!("warning: the web front end is not built; run `trunk build --release` in crates/rc-web");
+        eprintln!("warning: {NOT_BUILT_HINT}");
     }
+    let mut launcher = None;
     if config.open_browser {
-        let opened = match &config.browser {
-            Some(app) => open::with_detached(&url, app),
-            None => open::that_detached(&url),
-        };
+        // Open a private redirect page rather than the URL itself: browsers keep their
+        // command line for life, and other local users could read the token there.
+        let opened = launcher_page(&url).and_then(|page| {
+            let target = page.to_string_lossy().into_owned();
+            launcher = Some(page);
+            Ok(match &config.browser {
+                Some(app) => open::with_detached(&target, app),
+                None => open::that_detached(&target),
+            }?)
+        });
         if let Err(e) = opened {
-            eprintln!("could not open a browser ({e}); open the URL above manually");
+            eprintln!("could not open a browser ({e:#}); open the URL above manually");
         }
     }
-    axum::serve(listener, app)
+    let served = axum::serve(listener, app)
         .with_graceful_shutdown(shutdown_signal())
-        .await?;
-    Ok(())
+        .await;
+    if let Some(page) = launcher {
+        let _ = std::fs::remove_file(page);
+    }
+    Ok(served?)
+}
+
+/// Write a page that redirects to `url` into a directory only this user can read.
+fn launcher_page(url: &str) -> Result<std::path::PathBuf> {
+    use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
+    let base = dirs::runtime_dir().unwrap_or_else(std::env::temp_dir);
+    // SAFETY: getuid has no preconditions and cannot fail.
+    let uid = unsafe { libc::getuid() };
+    let dir = base.join(format!("rcommander-{uid}"));
+    std::fs::create_dir_all(&dir)?;
+    let meta = std::fs::symlink_metadata(&dir)?;
+    if !meta.is_dir() || meta.uid() != uid {
+        anyhow::bail!("{} is not a directory owned by you", dir.display());
+    }
+    std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700))?;
+    let page = dir.join(format!("open-{}.html", std::process::id()));
+    let _ = std::fs::remove_file(&page);
+    let html = format!(
+        "<!doctype html><meta charset=utf-8><title>rcommander</title>\
+         <meta http-equiv=refresh content=\"0;url={url}\"><script>location.replace({url:?})</script>"
+    );
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(&page)?;
+    std::io::Write::write_all(&mut file, html.as_bytes())?;
+    Ok(page)
 }
 
 async fn shutdown_signal() {
@@ -119,21 +161,34 @@ fn random_token() -> Result<String> {
     Ok(bytes.iter().map(|b| format!("{b:02x}")).collect())
 }
 
+/// Reject requests not addressed to us by a loopback name (DNS rebinding), and add
+/// defensive headers to every response.
 async fn require_loopback_host(port: u16, req: Request, next: Next) -> Response {
-    let host = req
-        .headers()
-        .get(header::HOST)
-        .and_then(|h| h.to_str().ok())
-        .unwrap_or("");
+    let mut hosts = req.headers().get_all(header::HOST).iter();
+    let host = hosts.next().and_then(|h| h.to_str().ok()).unwrap_or("");
     let allowed = [format!("127.0.0.1:{port}"), format!("localhost:{port}")];
-    if !allowed.iter().any(|a| a == host) {
+    if hosts.next().is_some() || !allowed.iter().any(|a| a == host) {
         return api_error(StatusCode::FORBIDDEN, "forbidden host");
     }
-    next.run(req).await
+    let mut resp = next.run(req).await;
+    let h = resp.headers_mut();
+    h.insert(header::CACHE_CONTROL, header::HeaderValue::from_static("no-store"));
+    h.insert(
+        header::X_CONTENT_TYPE_OPTIONS,
+        header::HeaderValue::from_static("nosniff"),
+    );
+    h.insert(header::X_FRAME_OPTIONS, header::HeaderValue::from_static("DENY"));
+    resp
+}
+
+/// Compare without an early exit, so timing reveals nothing about the token.
+fn same_token(a: &[u8], b: &[u8]) -> bool {
+    a.len() == b.len() && a.iter().zip(b).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0
 }
 
 async fn require_token(State(state): State<AppState>, headers: HeaderMap, req: Request, next: Next) -> Response {
-    let ok = headers.get("x-rc-token").and_then(|v| v.to_str().ok()) == Some(&*state.token);
+    let given = headers.get("x-rc-token").map_or(&[][..], |v| v.as_bytes());
+    let ok = same_token(given, state.token.as_bytes());
     if !ok {
         return api_error(
             StatusCode::UNAUTHORIZED,
@@ -236,14 +291,23 @@ async fn static_file(uri: Uri) -> Response {
             file.data,
         )
             .into_response(),
-        None if path == "index.html" => Html(NOT_BUILT).into_response(),
+        None if path == "index.html" => Html(format!(
+            "<!doctype html><title>rcommander</title><body style=\"font-family:system-ui;padding:2em\">\
+             <h1>rcommander</h1><p>{NOT_BUILT_HINT}</p>"
+        ))
+        .into_response(),
         None => (StatusCode::NOT_FOUND, "not found").into_response(),
     }
 }
 
-const NOT_BUILT: &str = "<!doctype html><title>rcommander</title><body style=\"font-family:system-ui;padding:2em\">\
-<h1>rcommander</h1><p>The web front end has not been built yet. Run:</p>\
-<pre>cd crates/rc-web &amp;&amp; trunk build --release</pre><p>then restart <code>rcmd web</code>.</p>";
+/// Debug builds read the front end from disk on each request; release builds embed it
+/// when `rcmd` is compiled.
+#[cfg(debug_assertions)]
+const NOT_BUILT_HINT: &str =
+    "the web front end is not built: run `trunk build --release` in crates/rc-web, then reload";
+#[cfg(not(debug_assertions))]
+const NOT_BUILT_HINT: &str = "this rcmd was compiled without the web front end: run `trunk build --release` in \
+crates/rc-web, then `cargo build --release -p rcmd`";
 
 #[cfg(test)]
 mod tests {
@@ -332,6 +396,83 @@ mod tests {
         let (status, body) = call(app(tmp.path()), post("/api/list", req, Some("secret"), &host)).await;
         assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
         assert!(body["error"].is_string());
+    }
+
+    #[tokio::test]
+    async fn rejects_bad_requests() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ok_host = format!("127.0.0.1:{PORT}");
+        let req = |method: &str, path: &str, hosts: &[&str], token: Option<&str>, ctype: &str| {
+            let mut b = Request::builder().method(method).uri(path);
+            for h in hosts {
+                b = b.header(header::HOST, *h);
+            }
+            if let Some(t) = token {
+                b = b.header("x-rc-token", t);
+            }
+            b.header(header::CONTENT_TYPE, ctype).body(Body::from("{}")).unwrap()
+        };
+        let json = "application/json";
+        let cases = [
+            (
+                req("POST", "/api/init", &[&ok_host], Some("wrong"), json),
+                StatusCode::UNAUTHORIZED,
+            ),
+            (
+                req("POST", "/api/init", &[&ok_host], Some("secre"), json),
+                StatusCode::UNAUTHORIZED,
+            ),
+            (
+                req("POST", "/api/init", &[], Some("secret"), json),
+                StatusCode::FORBIDDEN,
+            ),
+            (
+                req("POST", "/api/init", &[&ok_host, "evil.com"], Some("secret"), json),
+                StatusCode::FORBIDDEN,
+            ),
+            (
+                req("POST", "/api/init", &["evil.localhost:7878"], Some("secret"), json),
+                StatusCode::FORBIDDEN,
+            ),
+            (
+                req("GET", "/api/init", &[&ok_host], Some("secret"), json),
+                StatusCode::METHOD_NOT_ALLOWED,
+            ),
+            (
+                req("POST", "/api/list", &[&ok_host], Some("secret"), "text/plain"),
+                StatusCode::UNSUPPORTED_MEDIA_TYPE,
+            ),
+            (
+                req("GET", "/../Cargo.toml", &[&ok_host], None, json),
+                StatusCode::NOT_FOUND,
+            ),
+        ];
+        for (i, (request, expected)) in cases.into_iter().enumerate() {
+            let resp = app(tmp.path()).oneshot(request).await.unwrap();
+            assert_eq!(resp.status(), expected, "case {i}");
+        }
+    }
+
+    #[test]
+    fn launcher_page_is_private_and_redirects() {
+        use std::os::unix::fs::PermissionsExt;
+        let page = launcher_page("http://127.0.0.1:1/#token=abc").unwrap();
+        let mode = std::fs::metadata(&page).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600);
+        assert!(std::fs::read_to_string(&page).unwrap().contains("token=abc"));
+        std::fs::remove_file(page).unwrap();
+    }
+
+    #[tokio::test]
+    async fn responses_carry_defensive_headers() {
+        let tmp = tempfile::tempdir().unwrap();
+        let req = Request::get("/")
+            .header(header::HOST, format!("127.0.0.1:{PORT}"))
+            .body(Body::empty())
+            .unwrap();
+        let resp = app(tmp.path()).oneshot(req).await.unwrap();
+        assert_eq!(resp.headers()[header::X_FRAME_OPTIONS], "DENY");
+        assert_eq!(resp.headers()[header::CACHE_CONTROL], "no-store");
     }
 
     #[tokio::test]

@@ -32,7 +32,7 @@ cargo run --release -p rcmd -- web [LEFT_DIR] [RIGHT_DIR]
 
 Release builds embed the built front end, so the resulting `rcmd` binary is self-contained. The server listens on 127.0.0.1 only and every API call needs the random token from the URL it prints.
 
-Both UIs share the key bindings below.
+Both UIs share the key bindings below. In the browser, F4 opens the file with its default application.
 
 | Key | Action |
 |-----|--------|
@@ -66,6 +66,6 @@ cargo fmt --all
 
 ## Process
 
-Every change goes through a feature branch → code review → pull request → CI (fmt, clippy and tests on Linux and macOS, plus a wasm32 build of `rc-core`) → merge.
+Every change goes through a feature branch → code review → pull request → CI (fmt, clippy and tests on Linux and macOS; the wasm32 front end built with trunk and served by a release binary) → merge.
 
 Building from source needs a Rust toolchain (`rustup`) and a C linker (Xcode Command Line Tools on macOS, `build-essential` or equivalent on Linux).

@@ -10,7 +10,7 @@ use leptos::prelude::*;
 use leptos::task::spawn_local;
 use rc_core::api::{DiffResponse, FileContent, FileOp, OpResult};
 use rc_core::dircmp::{self, CmpMark};
-use rc_core::{Location, Panel, Row};
+use rc_core::{Location, Panel, Row, SortKey};
 use std::collections::HashMap;
 use std::future::Future;
 use std::sync::Arc;
@@ -49,6 +49,9 @@ pub struct App {
     pub message: RwSignal<Option<Message>>,
     /// Number of API requests in flight.
     pub busy: RwSignal<u32>,
+    /// Per panel: id of the latest listing request, so a slow, older reply can't
+    /// overwrite a newer one.
+    load_seq: [StoredValue<u64>; 2],
     /// Local UTC offset in seconds, for `format_time`.
     pub tz_offset: i64,
 }
@@ -81,6 +84,7 @@ impl App {
             overlay: RwSignal::new(None),
             message: RwSignal::new(None),
             busy: RwSignal::new(0),
+            load_seq: [StoredValue::new(0), StoredValue::new(0)],
             // getTimezoneOffset() is "UTC minus local" in minutes.
             tz_offset: -(js_sys::Date::new_0().get_timezone_offset() as i64) * 60,
         }
@@ -137,8 +141,13 @@ impl App {
 
     /// List `location` into a panel, optionally putting the cursor on the entry `focus`.
     pub fn load(self, side: usize, location: Location, focus: Option<String>) {
+        let seq = self.load_seq[side];
+        seq.update_value(|n| *n += 1);
+        let mine = seq.get_value();
         self.request(api::list(location), move |listing| {
-            self.panels[side].update(|p| p.set_listing(listing, focus.as_deref()));
+            if seq.get_value() == mine {
+                self.panels[side].update(|p| p.set_listing(listing, focus.as_deref()));
+            }
         });
     }
 
@@ -202,6 +211,7 @@ impl App {
 
     fn view(self, location: Location) {
         self.request(api::read(location), move |content| {
+            dom::blur_active();
             self.overlay.set(Some(Overlay::View(Arc::new(content))));
         });
     }
@@ -222,6 +232,7 @@ impl App {
             .with_untracked(|l| self.panels[RIGHT].with_untracked(|r| rc_core::diff_targets(l, r, side == LEFT)));
         match pair {
             Some((left, right)) => self.request(api::diff(left, right), move |diff| {
+                dom::blur_active();
                 self.overlay.set(Some(Overlay::Diff(Arc::new(diff))));
             }),
             None => self.error("Put the cursor on a file (or select two files) to compare."),
@@ -270,7 +281,7 @@ impl App {
         };
         self.modal.set(Some(Modal {
             title: title.into(),
-            input: Some("*.*".into()),
+            input: Some("*".into()),
             kind: ModalKind::Mask { select },
         }));
     }
@@ -337,14 +348,17 @@ impl App {
     /// Perform a file operation, then refresh both panels (cursor on `focus` in the active one).
     fn run_op(self, op: FileOp, focus: Option<String>) {
         let verb = op.verb();
+        // The panel the operation started from, even if the user switches meanwhile.
+        let side = self.active_side();
         self.request(api::op(op), move |result: OpResult| {
             let text = result.summary(verb);
             if result.errors.is_empty() {
                 self.info(text);
+                // As in the terminal UI: keep the selection only when something failed.
+                self.panels.iter().for_each(|p| p.update(|p| p.clear_selection()));
             } else {
                 self.error(text);
             }
-            let side = self.active_side();
             self.reload(side, focus);
             self.reload(1 - side, None);
         });
@@ -404,6 +418,12 @@ impl App {
         }
         let (ctrl, shift) = (ev.ctrl_key(), ev.shift_key());
         let key = ev.key();
+        // Auto-repeat only for movement; a held Enter or F-key must act once.
+        let movement = key.starts_with("Arrow") || matches!(key.as_str(), "PageUp" | "PageDown");
+        if ev.repeat() && !movement {
+            ev.prevent_default();
+            return;
+        }
         let side = self.active_side();
         let panel = self.panels[side];
 
@@ -419,6 +439,13 @@ impl App {
             self.function_key(n, shift);
             return;
         }
+        // Ctrl+F3..F6 sort by name, extension, date, size (as in Total Commander).
+        if let Some(n @ 3..=6) = fkey.filter(|_| ctrl && key.starts_with('F')) {
+            ev.prevent_default();
+            let sort = [SortKey::Name, SortKey::Ext, SortKey::Modified, SortKey::Size][usize::from(n - 3)];
+            panel.update(|p| p.set_sort(sort));
+            return;
+        }
 
         match (ctrl, key.as_str()) {
             (false, "ArrowUp") => panel.update(|p| p.move_cursor(-1)),
@@ -428,7 +455,13 @@ impl App {
             (false, "Home") => panel.update(Panel::cursor_home),
             (false, "End") => panel.update(Panel::cursor_end),
             (false, "Enter") => self.enter(side),
-            (false, "Backspace") => self.go_parent(side),
+            (false, "Backspace" | "ArrowLeft") => self.go_parent(side),
+            (false, "ArrowRight") => {
+                if panel.with_untracked(|p| p.current().is_some_and(|e| e.is_dir)) {
+                    self.enter(side);
+                }
+            }
+            (true, "s") => panel.update(Panel::cycle_sort),
             (false, "Tab") => self.active.set(1 - side),
             (false, " " | "Insert") => panel.update(Panel::toggle_current),
             (false, "+") => self.ask_mask(true),

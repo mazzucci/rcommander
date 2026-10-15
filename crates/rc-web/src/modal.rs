@@ -33,9 +33,11 @@ impl Modal {
 pub fn ModalView(app: App, modal: Modal) -> impl IntoView {
     let value = RwSignal::new(modal.input.clone().unwrap_or_default());
     let input_ref = NodeRef::<Input>::new();
-    input_ref.on_load(|input| {
-        let _ = input.focus();
-        input.select();
+    Effect::new(move |_| {
+        if let Some(input) = input_ref.get() {
+            let _ = input.focus();
+            input.select();
+        }
     });
 
     let confirm = move || {
@@ -47,6 +49,11 @@ pub fn ModalView(app: App, modal: Modal) -> impl IntoView {
     let cancel = move || app.modal.set(None);
     // Enter/Esc work whether or not the input has focus (a confirmation has no input).
     let keys = window_event_listener(ev::keydown, move |ev| {
+        // A held Enter must not confirm and then act on the panel; IME composition owns Enter.
+        if ev.repeat() || ev.is_composing() {
+            ev.prevent_default();
+            return;
+        }
         match ev.key().as_str() {
             "Enter" => confirm(),
             "Escape" => cancel(),

@@ -149,10 +149,14 @@ fn PathBar(app: App, side: usize) -> impl IntoView {
     let close = move || app.editing_path.set(None);
     let location = move || panel.with(|p| p.location.to_string());
 
+    // The input is re-created each time the editor opens; focus it whenever it appears.
+    // (`NodeRef::on_load` fires only once and panics on a second mount.)
     let input_ref = NodeRef::<Input>::new();
-    input_ref.on_load(|input| {
-        let _ = input.focus();
-        input.select();
+    Effect::new(move |_| {
+        if let Some(input) = input_ref.get() {
+            let _ = input.focus();
+            input.select();
+        }
     });
     let on_key = move |ev: KeyboardEvent| match ev.key().as_str() {
         "Enter" => {
@@ -188,8 +192,10 @@ fn StatusLine(app: App, side: usize) -> impl IntoView {
     let close = move || app.filtering.set(None);
 
     let input_ref = NodeRef::<Input>::new();
-    input_ref.on_load(|input| {
-        let _ = input.focus();
+    Effect::new(move |_| {
+        if let Some(input) = input_ref.get() {
+            let _ = input.focus();
+        }
     });
     let on_key = move |ev: KeyboardEvent| match ev.key().as_str() {
         "Enter" => close(),

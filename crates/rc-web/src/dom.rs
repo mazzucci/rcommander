@@ -22,6 +22,17 @@ pub fn is_text_field(target: Option<EventTarget>) -> bool {
         .is_some_and(|el| matches!(el.tag_name().as_str(), "INPUT" | "TEXTAREA" | "SELECT") || el.is_content_editable())
 }
 
+/// Take focus away from whatever has it (e.g. a text field under a new overlay, which
+/// would otherwise keep receiving keys).
+pub fn blur_active() {
+    let active = web_sys::window()
+        .and_then(|w| w.document())
+        .and_then(|d| d.active_element());
+    if let Some(el) = active.and_then(|e| e.dyn_into::<HtmlElement>().ok()) {
+        let _ = el.blur();
+    }
+}
+
 /// Scroll a container in response to viewer-style navigation keys.
 /// Returns `false` if the key is not a scrolling key.
 pub fn scroll_by_key(el: &Element, key: &str) -> bool {
