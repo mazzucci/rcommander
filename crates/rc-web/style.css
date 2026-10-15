@@ -519,6 +519,17 @@ button.key kbd {
     margin: 0 5px 0 0;
 }
 
+/* Narrow windows: keys only (labels stay as tooltips), so every key remains reachable. */
+@media (max-width: 860px) {
+    .key-label {
+        display: none;
+    }
+
+    button.key kbd {
+        margin: 0;
+    }
+}
+
 /* ---- overlays ---------------------------------------------------------------- */
 
 .overlay {

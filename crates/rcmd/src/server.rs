@@ -104,12 +104,18 @@ impl LiveDirs {
         let Ok(canonical) = std::fs::canonicalize(path) else {
             return;
         };
-        let mut recent = self.recent.lock().expect("watch lock");
-        recent.retain(|(_, l)| l != location);
-        recent.push_front((canonical, location.clone()));
-        recent.truncate(MAX_WATCHED);
+        let dirs: Vec<PathBuf> = {
+            let mut recent = self.recent.lock().expect("watch lock");
+            recent.retain(|(_, l)| l != location);
+            recent.push_front((canonical.clone(), location.clone()));
+            recent.truncate(MAX_WATCHED);
+            recent.iter().map(|(p, _)| p.clone()).collect()
+        };
+        // Watcher calls happen without holding `recent`, which the change handler takes.
         if let Some(watcher) = &mut *self.watcher.lock().expect("watch lock") {
-            watcher.set(recent.iter().map(|(p, _)| p.as_path()));
+            watcher.set(dirs.iter().map(PathBuf::as_path));
+            // A directory deleted and recreated under the same name lost its watch.
+            watcher.rewatch(&canonical);
         }
     }
 }
@@ -872,6 +878,55 @@ mod tests {
         assert_eq!(recent.len(), MAX_WATCHED);
         assert!(recent[0].1.to_string().ends_with("/5"));
         assert!(!recent.iter().any(|(_, l)| l.to_string().ends_with("/0")));
+    }
+
+    /// Waits for the next change event, or `None` after `ms` milliseconds.
+    async fn next_change(rx: &mut broadcast::Receiver<BrowserEvent>, ms: u64) -> Option<BrowserEvent> {
+        tokio::time::timeout(std::time::Duration::from_millis(ms), rx.recv())
+            .await
+            .ok()
+            .and_then(Result::ok)
+    }
+
+    #[tokio::test]
+    async fn relisting_a_watched_directory_is_not_a_change() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (events, mut rx) = broadcast::channel(8);
+        let live = LiveDirs::new(events);
+        let loc = Location::local(tmp.path().to_string_lossy());
+        let vfs = Vfs::new();
+        live.listed(&loc);
+        // Listing reads the directory, which the OS reports as an access, not a change.
+        for _ in 0..3 {
+            vfs.list(&loc).unwrap();
+            live.listed(&loc);
+        }
+        assert!(
+            next_change(&mut rx, 600).await.is_none(),
+            "re-listing produced a change event"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_recreated_directory_is_watched_again() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("build");
+        std::fs::create_dir(&dir).unwrap();
+        let (events, mut rx) = broadcast::channel(8);
+        let live = LiveDirs::new(events);
+        let loc = Location::local(dir.to_string_lossy());
+        live.listed(&loc);
+        std::fs::remove_dir(&dir).unwrap();
+        std::fs::create_dir(&dir).unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        while next_change(&mut rx, 300).await.is_some() {}
+        live.listed(&loc);
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        std::fs::write(dir.join("out.o"), "x").unwrap();
+        assert!(
+            next_change(&mut rx, 5000).await.is_some(),
+            "no change event after the directory came back"
+        );
     }
 
     #[tokio::test]

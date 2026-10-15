@@ -15,7 +15,7 @@ use rc_core::api::{BrowserEvent, Conflicts, DiffResponse, FileContent, FileOp, O
 use rc_core::dircmp::{self, CmpMark};
 use rc_core::history::History;
 use rc_core::{Location, Panel, Row, Settings, SortKey};
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::future::Future;
 use std::sync::Arc;
 use std::time::Duration;
@@ -72,12 +72,18 @@ pub struct App {
     pub message: RwSignal<Option<Message>>,
     /// Number of API requests in flight.
     pub busy: RwSignal<u32>,
-    /// Per panel: entries that just appeared or changed on disk, highlighted briefly.
-    pub flash: [RwSignal<HashSet<String>>; 2],
+    /// Per panel: entries that just appeared or changed on disk, highlighted briefly,
+    /// with the refresh that highlighted them (a later one restarts the highlight).
+    pub flash: [RwSignal<HashMap<String, u64>>; 2],
     /// Per panel: id of the latest navigation, so a slow, older reply can't overwrite
     /// a newer one.
     load_seq: [StoredValue<u64>; 2],
+    /// Per panel: id of the latest refresh; only its reply is applied.
+    refresh_seq: [StoredValue<u64>; 2],
     history: [StoredValue<History>; 2],
+    /// Per panel: the navigation id of a back/forward step still loading (key repeat
+    /// must not stack steps). Stale once any newer navigation starts.
+    history_busy: [StoredValue<Option<u64>>; 2],
 }
 
 /// Increments the busy counter for as long as it lives.
@@ -111,8 +117,10 @@ impl App {
             overlay: RwSignal::new(None),
             message: RwSignal::new(None),
             busy: RwSignal::new(0),
-            flash: [RwSignal::new(HashSet::new()), RwSignal::new(HashSet::new())],
+            flash: [RwSignal::new(HashMap::new()), RwSignal::new(HashMap::new())],
             load_seq: [StoredValue::new(0), StoredValue::new(0)],
+            refresh_seq: [StoredValue::new(0), StoredValue::new(0)],
+            history_busy: [StoredValue::new(None), StoredValue::new(None)],
             history: [
                 StoredValue::new(History::default()),
                 StoredValue::new(History::default()),
@@ -194,17 +202,29 @@ impl App {
     /// Carry out an event from the server, like the terminal UI's `App::apply`.
     pub fn apply(self, event: BrowserEvent) {
         let active = self.active_side();
-        // Views that cover the panels get out of the way; dialogs the user is typing in stay.
+        // Like the terminal UI: never act behind a dialog the user is answering (the
+        // browser can't report that back to `rcmd ctl`, so say it here).
+        let dialog_open = self.modal.with_untracked(Option::is_some)
+            || self.options_open.get_untracked()
+            || self.hotlist_open.get_untracked();
+        let acts = matches!(
+            event,
+            BrowserEvent::Navigate { .. }
+                | BrowserEvent::Diff { .. }
+                | BrowserEvent::View { .. }
+                | BrowserEvent::Select { .. }
+        );
+        if dialog_open && acts {
+            self.info("Ignored a remote command while a dialog is open");
+            return;
+        }
+        // Views that cover the panels get out of the way.
         let reveal = || self.overlay.set(None);
         match event {
+            // Shows the place without moving the user's focus, as in the terminal UI.
             BrowserEvent::Navigate { side, location, focus } => {
                 reveal();
-                let side = side.index(active);
-                self.show(side, location, focus, Nav::Visit, move |ok| {
-                    if ok {
-                        self.active.set(side);
-                    }
-                });
+                self.show(side.index(active), location, focus, Nav::Visit, |_| {});
             }
             BrowserEvent::Diff { left, right } => self.open_diff(api::diff(left, right)),
             BrowserEvent::View { location } => self.view(location),
@@ -241,10 +261,12 @@ impl App {
                 return;
             }
             let flash = self.flash[side];
-            flash.update(|f| f.extend(changed.iter().cloned()));
+            let generation = self.refresh_seq[side].get_value();
+            flash.update(|f| f.extend(changed.iter().map(|n| (n.clone(), generation))));
             set_timeout(
                 move || {
-                    flash.try_update(|f| changed.iter().for_each(|n| _ = f.remove(n)));
+                    // Only end the highlights this refresh started.
+                    flash.try_update(|f| f.retain(|_, g| *g != generation));
                 },
                 FLASH,
             );
@@ -261,10 +283,16 @@ impl App {
             seq.update_value(|n| *n += 1);
         }
         let mine = seq.get_value();
+        // Refreshes are ordered among themselves: only the latest one's reply counts.
+        let refreshes = self.refresh_seq[side];
+        if nav == Nav::Refresh {
+            refreshes.update_value(|n| *n += 1);
+        }
+        let my_refresh = refreshes.get_value();
         let (panel, history) = (self.panels[side], self.history[side]);
         self.request_then(api::list(location), move |result| {
-            if seq.get_value() != mine {
-                return; // a newer navigation owns the panel now
+            if seq.get_value() != mine || (nav == Nav::Refresh && refreshes.get_value() != my_refresh) {
+                return; // a newer navigation or refresh owns the panel now
             }
             match result {
                 Ok(listing) => {
@@ -315,6 +343,12 @@ impl App {
     /// of a subdirectory puts the cursor on it.
     fn history_step(self, forward: bool) {
         let side = self.active_side();
+        let busy = self.history_busy[side];
+        // A step is still loading (e.g. key repeat): taking another now would push the
+        // same place twice and lose the one in between.
+        if busy.get_value() == Some(self.load_seq[side].get_value()) {
+            return;
+        }
         let history = self.history[side];
         let current = self.panels[side].with_untracked(|p| p.location.clone());
         let target = history
@@ -331,12 +365,14 @@ impl App {
             .then(|| current.file_name().map(str::to_owned))
             .flatten();
         self.show(side, target, focus, Nav::History, move |ok| {
+            busy.set_value(None);
             if !ok {
                 // That place is gone: forget it and try the next one, as the terminal UI does.
                 history.update_value(|h| if forward { h.discard_forward() } else { h.discard_back() });
                 self.history_step(forward);
             }
         });
+        busy.set_value(Some(self.load_seq[side].get_value()));
     }
 
     /// Enter / double click / F3: go up on "..", into a directory, or view a file.
@@ -619,8 +655,8 @@ impl App {
     fn compare_dirs(self) {
         let [left, right] = self.panels;
         if left.with_untracked(|p| !p.marks.is_empty()) || right.with_untracked(|p| !p.marks.is_empty()) {
-            left.update(|p| p.marks.clear());
-            right.update(|p| p.marks.clear());
+            left.update(|p| p.set_marks(HashMap::new()));
+            right.update(|p| p.set_marks(HashMap::new()));
             self.info("Directory compare marks cleared");
             return;
         }
@@ -635,8 +671,8 @@ impl App {
             count(&lm, CmpMark::Different),
             count(&lm, CmpMark::Same),
         ));
-        left.update(|p| p.marks = lm);
-        right.update(|p| p.marks = rm);
+        left.update(|p| p.set_marks(lm));
+        right.update(|p| p.set_marks(rm));
     }
 
     /// F1–F9, from the keyboard or the footer.
@@ -783,9 +819,9 @@ pub fn Root() -> impl IntoView {
     // Footer buttons must not take focus, or Enter/Space would click them again.
     let key_button = move |key: String, label: &'static str, action: Box<dyn Fn(bool)>| {
         view! {
-            <button class="key" tabindex="-1" on:mousedown=|ev| ev.prevent_default() on:click=move |ev| action(ev.shift_key())>
+            <button class="key" tabindex="-1" title=label on:mousedown=|ev| ev.prevent_default() on:click=move |ev| action(ev.shift_key())>
                 <kbd>{key}</kbd>
-                {label}
+                <span class="key-label">{label}</span>
             </button>
         }
     };

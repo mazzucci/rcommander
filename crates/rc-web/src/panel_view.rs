@@ -76,8 +76,15 @@ pub fn PanelView(app: App, side: usize) -> impl IntoView {
     let flash = app.flash[side];
     let is_active = Memo::new(move |_| app.active.get() == side);
     let cursor = Memo::new(move |_| panel.with(|p| p.cursor));
+    // A cursor move only re-renders the two rows it leaves and enters.
+    let on_cursor = Selector::new(move || cursor.get());
     let selected = Memo::new(move |_| panel.with(|p| p.selected.clone()));
-    let rows = Memo::new(move |_| panel.with(|p| (0..p.len()).map(|i| row_data(p, i)).collect::<Vec<_>>()));
+    // Rebuild the row list only when rows change, not on cursor moves or selection.
+    let version = Memo::new(move |_| panel.with(|p| p.version()));
+    let rows = Memo::new(move |_| {
+        let _ = version.get(); // `get`, not `track`: a lazy memo must be pulled to update
+        panel.with_untracked(|p| (0..p.len()).map(|i| row_data(p, i)).collect::<Vec<_>>())
+    });
 
     // Optional columns that fit the panel's width, least important dropped first.
     let list_ref = NodeRef::<Div>::new();
@@ -145,7 +152,7 @@ pub fn PanelView(app: App, side: usize) -> impl IntoView {
             .collect_view();
         let flashing = {
             let name = name.clone();
-            move || flash.with(|f| f.contains(&name))
+            move || flash.with(|f| f.contains_key(&name))
         };
         view! {
             <div
@@ -154,7 +161,10 @@ pub fn PanelView(app: App, side: usize) -> impl IntoView {
                 class:marked=mark.is_some_and(|m| m != CmpMark::Same)
                 style=mark.map(|m| format!("--mark:{}", m.color().0))
                 class:hidden=entry.as_ref().is_some_and(|e| e.hidden)
-                class:cursor=move || cursor.get() == i
+                class:cursor={
+                    let on_cursor = on_cursor.clone();
+                    move || on_cursor.selected(&i)
+                }
                 class:selected=move || selected.with(|s| s.contains(&name))
                 class:flash=flashing
                 on:mousedown=move |_| panel.update(|p| p.cursor = i)
@@ -260,7 +270,9 @@ fn PathBar(app: App, side: usize) -> impl IntoView {
                 <input
                     class="path-input"
                     node_ref=input_ref
-                    prop:value=location
+                    // Set once when the editor opens: live refreshes must not overwrite
+                    // what the user is typing.
+                    prop:value=panel.with_untracked(|p| p.location.to_string())
                     spellcheck="false"
                     on:keydown=on_key
                     on:blur=move |_| close()

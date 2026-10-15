@@ -53,6 +53,9 @@ pub struct Panel {
     pub show_hidden: bool,
     /// Directory-compare marks, keyed by entry name. Cleared on navigation.
     pub marks: HashMap<String, CmpMark>,
+    /// Bumped whenever the rows or their contents change (not on cursor moves or
+    /// selection), so views can skip rebuilding a large list.
+    version: u64,
 }
 
 impl Panel {
@@ -69,6 +72,7 @@ impl Panel {
             filter: String::new(),
             show_hidden: false,
             marks: HashMap::new(),
+            version: 0,
         }
     }
 
@@ -242,6 +246,17 @@ impl Panel {
         }
     }
 
+    /// See the `version` field.
+    pub fn version(&self) -> u64 {
+        self.version
+    }
+
+    /// Replace the directory-compare marks.
+    pub fn set_marks(&mut self, marks: HashMap<String, CmpMark>) {
+        self.marks = marks;
+        self.version += 1;
+    }
+
     pub fn toggle_hidden(&mut self) {
         self.show_hidden = !self.show_hidden;
         self.rebuild_keep_cursor();
@@ -263,6 +278,7 @@ impl Panel {
     }
 
     fn rebuild(&mut self) {
+        self.version += 1;
         let filter = self.filter.to_lowercase();
         let mut idx: Vec<usize> = (0..self.entries.len())
             .filter(|&i| {
@@ -465,6 +481,20 @@ mod tests {
         p.cursor_home();
         p.set_filter("read");
         assert_eq!(p.current().unwrap().name, "README.md");
+    }
+
+    #[test]
+    fn version_changes_with_rows_not_with_cursor_or_selection() {
+        let mut p = panel();
+        let v = p.version();
+        p.move_cursor(1);
+        p.toggle_current();
+        assert_eq!(p.version(), v);
+        p.set_filter("b");
+        assert!(p.version() > v);
+        let v = p.version();
+        p.set_marks(HashMap::new());
+        assert!(p.version() > v);
     }
 
     #[test]
