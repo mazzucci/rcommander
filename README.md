@@ -32,29 +32,37 @@ cargo run --release -p rcmd -- web [LEFT_DIR] [RIGHT_DIR]
 
 Release builds embed the built front end, so the resulting `rcmd` binary is self-contained. The server listens on 127.0.0.1 only and every API call needs the random token from the URL it prints.
 
-Both UIs share the key bindings below. In the browser, F4 opens the file with its default application.
+Both UIs share the key bindings below; the few differences are marked. `F1` or `?` shows them in the app.
 
 | Key | Action |
 |-----|--------|
 | ↑ ↓ PgUp PgDn Home End | move cursor |
 | Enter / → | open directory, view file |
 | Backspace / ← | parent directory |
+| Alt+← Alt+→, `[` `]` | back / forward in the panel's history |
 | Tab | switch panel |
 | Space / Insert | select / deselect |
 | `+` `-` `*` | select by mask, deselect by mask, invert selection |
-| Esc | clear selection and filter |
+| Esc | clear filter, then selection |
 | `/` Ctrl+F | quick filter |
 | `.` | show / hide hidden files |
 | `g` Ctrl+L | go to path |
+| Ctrl+D | hotlist: `a` add current folder, `d` remove, Enter or `1`..`9` go |
+| `z` | jump with zoxide (terminal only) |
+| `o` | options: columns, hidden files, editor |
 | Ctrl+S, Ctrl+F3..F6 | cycle sort / sort by name, extension, date, size |
 | Ctrl+R, Ctrl+U | refresh / swap panels |
-| F2 | diff the files under both cursors (or two selected files) — `n`/`p` next/previous change, `f` fold |
-| F3 / F4 | view / edit with `$VISUAL` or `$EDITOR` |
-| F5 / F6 | copy / move or rename |
+| F1 / `?` | key help |
+| F2 | diff the files under both cursors (or two selected); against git HEAD if the other panel has no such file — `n`/`p` next/previous change, `f` fold |
+| Shift+F2 | diff the file against git HEAD |
+| F3 / F4 | view / edit (terminal: the editor from options, else `$VISUAL`/`$EDITOR`; browser: the GUI editor from options, else the default application) |
+| F5 / F6 | copy / move or rename; asks before overwriting (overwrite, only if newer, skip) |
 | F7 / F8 | new directory / delete to Trash (Shift+F8: permanent) |
 | F9 | compare directories (toggle) |
 | `1`..`9` | same as F1..F9, so Mac laptops don't need the fn key |
-| `q` F10 Ctrl+C | quit |
+| `q` F10 Ctrl+C | quit (terminal only) |
+
+Panels follow changes on disk: a directory that changes is re-read and the new or changed entries light up briefly. `rcmd ctl` commands (below) reach the browser UI too.
 
 ## Remote control and Claude Code
 

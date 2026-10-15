@@ -89,6 +89,23 @@ pub enum FileOp {
 }
 
 impl FileOp {
+    /// The same copy or move with a different conflict policy; other operations unchanged.
+    pub fn with_on_conflict(self, policy: OnConflict) -> FileOp {
+        match self {
+            FileOp::Copy { sources, dest, .. } => FileOp::Copy {
+                sources,
+                dest,
+                on_conflict: policy,
+            },
+            FileOp::Move { sources, dest, .. } => FileOp::Move {
+                sources,
+                dest,
+                on_conflict: policy,
+            },
+            other => other,
+        }
+    }
+
     pub fn verb(&self) -> &'static str {
         match self {
             FileOp::Copy { .. } => "Copy",
@@ -201,6 +218,11 @@ pub enum BrowserEvent {
     Message {
         text: String,
     },
+    /// The contents of a directory a browser listed changed on disk. `location` is the
+    /// location as the listing returned it, i.e. as the panel shows it.
+    Changed {
+        location: Location,
+    },
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -232,5 +254,34 @@ mod tests {
         );
         let back: FileOp = serde_json::from_value(json).unwrap();
         assert!(matches!(back, FileOp::Copy { .. }));
+        let changed = BrowserEvent::Changed {
+            location: Location::local("/a"),
+        };
+        assert_eq!(
+            serde_json::to_value(&changed).unwrap(),
+            serde_json::json!({ "event": "changed", "location": { "kind": "local", "path": "/a" } })
+        );
+    }
+
+    #[test]
+    fn conflict_policy_applies_to_copy_and_move_only() {
+        let (src, dest) = (vec![Location::local("/a")], Location::local("/b"));
+        let mv = FileOp::Move {
+            sources: src.clone(),
+            dest: dest.clone(),
+            on_conflict: OnConflict::Skip,
+        };
+        assert!(matches!(
+            mv.with_on_conflict(OnConflict::IfNewer),
+            FileOp::Move {
+                on_conflict: OnConflict::IfNewer,
+                ..
+            }
+        ));
+        let mkdir = FileOp::Mkdir { location: dest };
+        assert!(matches!(
+            mkdir.with_on_conflict(OnConflict::Overwrite),
+            FileOp::Mkdir { .. }
+        ));
     }
 }

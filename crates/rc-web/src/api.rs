@@ -2,8 +2,8 @@
 
 use gloo_net::http::Request;
 use rc_core::api::{
-    ApiError, DiffRequest, DiffResponse, FileContent, FileOp, InitResponse, ListRequest, OpResult, OpenRequest,
-    ReadRequest,
+    ApiError, Conflicts, DiffRequest, DiffResponse, FileContent, FileOp, InitResponse, ListRequest, OpResult,
+    OpenRequest, ReadRequest,
 };
 use rc_core::{Listing, Location, Settings};
 use serde::Serialize;
@@ -46,6 +46,13 @@ pub fn init_token() {
 
 pub fn has_token() -> bool {
     TOKEN.get().is_some()
+}
+
+/// URL of the server-sent event stream. EventSource cannot send headers, so the token
+/// goes in the query string (same origin, never leaves the machine).
+pub fn events_url() -> String {
+    let token = TOKEN.get().map_or("", String::as_str);
+    format!("/api/events?token={}", js_sys::encode_uri_component(token))
 }
 
 /// POST `body` as JSON to `/api/<name>` and decode the reply. Errors are user-facing strings.
@@ -91,6 +98,16 @@ pub async fn diff(left: Location, right: Location) -> Result<DiffResponse, Strin
         },
     )
     .await
+}
+
+/// Diff a file against its committed version (git HEAD).
+pub async fn diff_head(location: Location) -> Result<DiffResponse, String> {
+    call("diff_head", &ReadRequest { location }).await
+}
+
+/// What a copy or move would find already at the destination.
+pub async fn conflicts(op: &FileOp) -> Result<Conflicts, String> {
+    call("conflicts", op).await
 }
 
 pub async fn op(op: FileOp) -> Result<OpResult, String> {

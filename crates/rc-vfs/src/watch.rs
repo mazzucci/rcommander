@@ -58,14 +58,21 @@ impl DirWatcher {
     /// Watch exactly `dirs` (duplicates and unwatchable paths are fine).
     pub fn set<'a>(&mut self, dirs: impl IntoIterator<Item = &'a Path>) {
         let wanted: BTreeSet<PathBuf> = dirs.into_iter().map(Path::to_path_buf).collect();
-        let mut watched = self.watched.lock().expect("watch set");
-        for gone in watched.difference(&wanted) {
-            let _ = self.watcher.unwatch(gone);
+        // Update the shared set and let go of the lock *before* talking to notify: its
+        // watch/unwatch wait for the event thread, whose handler needs this same lock.
+        let (gone, new) = {
+            let mut watched = self.watched.lock().expect("watch set");
+            let gone: Vec<PathBuf> = watched.difference(&wanted).cloned().collect();
+            let new: Vec<PathBuf> = wanted.difference(&watched).cloned().collect();
+            *watched = wanted;
+            (gone, new)
+        };
+        for dir in gone {
+            let _ = self.watcher.unwatch(&dir);
         }
-        for new in wanted.difference(&watched) {
-            let _ = self.watcher.watch(new, RecursiveMode::NonRecursive);
+        for dir in new {
+            let _ = self.watcher.watch(&dir, RecursiveMode::NonRecursive);
         }
-        *watched = wanted;
     }
 
     /// Watch `dir` afresh. After a directory is deleted and recreated under the same
@@ -140,6 +147,46 @@ mod tests {
         std::fs::write(a.join("late"), "x").unwrap();
         std::thread::sleep(Duration::from_millis(400));
         assert!(rx.try_iter().all(|d| d != a), "a is no longer watched");
+    }
+
+    #[test]
+    fn changing_watches_while_events_flow_does_not_deadlock() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().canonicalize().unwrap();
+        let busy = root.join("busy");
+        std::fs::create_dir(&busy).unwrap();
+        let dirs: Vec<PathBuf> = (0..50).map(|i| root.join(format!("d{i}"))).collect();
+        for d in &dirs {
+            std::fs::create_dir(d).unwrap();
+        }
+        let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let churn = {
+            let (busy, stop) = (busy.clone(), Arc::clone(&stop));
+            std::thread::spawn(move || {
+                let mut i = 0u64;
+                while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+                    let _ = std::fs::write(busy.join(format!("f{}", i % 20)), "x");
+                    let _ = std::fs::read_dir(&busy).map(|r| r.count());
+                    i += 1;
+                }
+            })
+        };
+        let (done_tx, done_rx) = mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            let mut w = DirWatcher::new(|_| {}).unwrap();
+            for _ in 0..4 {
+                for d in &dirs {
+                    w.set([busy.as_path(), d.as_path()]);
+                    let _ = std::fs::read_dir(d).map(|r| r.count());
+                }
+            }
+            let _ = done_tx.send(());
+        });
+        let finished = done_rx.recv_timeout(Duration::from_secs(20)).is_ok();
+        stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        churn.join().unwrap();
+        assert!(finished, "set() deadlocked against the event thread");
+        worker.join().unwrap();
     }
 
     #[test]

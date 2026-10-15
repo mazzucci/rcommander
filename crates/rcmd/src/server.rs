@@ -23,14 +23,14 @@ use rc_core::api::{ApiError, DiffRequest, FileOp, InitResponse, ListRequest, Ope
 use rc_core::control::{Command, Reply};
 use rc_core::{Location, Settings};
 use rc_vfs::Vfs;
+use rc_vfs::watch::DirWatcher;
 use rust_embed::RustEmbed;
 use serde::Serialize;
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::convert::Infallible;
 use std::io::Read;
-use std::path::PathBuf;
-use std::sync::Arc;
-use std::sync::RwLock;
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex, RwLock};
 use tokio::sync::broadcast;
 
 /// Built front end (`trunk build` in crates/rc-web). Embedded in release builds, read from
@@ -59,8 +59,74 @@ struct AppState {
     settings: Arc<RwLock<Settings>>,
     /// Where settings are saved; `None` keeps them in memory (tests).
     settings_path: Option<Arc<PathBuf>>,
-    /// Remote-control commands on their way to connected browsers.
+    /// Remote-control commands and change notices on their way to connected browsers.
     events: broadcast::Sender<BrowserEvent>,
+    live: LiveDirs,
+}
+
+/// Most directories watched for live refresh: the browser shows two, the rest let
+/// back/forward and panel swaps find fresh listings.
+const MAX_WATCHED: usize = 8;
+
+/// Live refresh for browsers: watches the directories they listed most recently and
+/// broadcasts [`BrowserEvent::Changed`] when one changes on disk.
+#[derive(Clone)]
+struct LiveDirs {
+    /// Most recent first: canonical path (what the watcher reports) and the location as
+    /// the listing returned it (what the panels show; on macOS `/tmp` vs `/private/tmp`).
+    recent: Arc<Mutex<VecDeque<(PathBuf, Location)>>>,
+    /// `None` if the platform watcher could not start; live refresh is then off.
+    watcher: Arc<Mutex<Option<DirWatcher>>>,
+}
+
+impl LiveDirs {
+    fn new(events: broadcast::Sender<BrowserEvent>) -> Self {
+        let recent = Arc::new(Mutex::new(VecDeque::new()));
+        let watched = Arc::clone(&recent);
+        let watcher = DirWatcher::new(move |dir| {
+            let locations = changed_locations(&watched.lock().expect("watch lock"), &dir);
+            for location in locations {
+                // No browser connected is fine: nobody needs refreshing.
+                let _ = events.send(BrowserEvent::Changed { location });
+            }
+        })
+        .map_err(|e| eprintln!("warning: live refresh unavailable: {e:#}"))
+        .ok();
+        LiveDirs {
+            recent,
+            watcher: Arc::new(Mutex::new(watcher)),
+        }
+    }
+
+    /// Note that a browser listed `location`, and watch it.
+    fn listed(&self, location: &Location) {
+        let Location::Local { path } = location;
+        let Ok(canonical) = std::fs::canonicalize(path) else {
+            return;
+        };
+        let dirs: Vec<PathBuf> = {
+            let mut recent = self.recent.lock().expect("watch lock");
+            recent.retain(|(_, l)| l != location);
+            recent.push_front((canonical.clone(), location.clone()));
+            recent.truncate(MAX_WATCHED);
+            recent.iter().map(|(p, _)| p.clone()).collect()
+        };
+        // Watcher calls happen without holding `recent`, which the change handler takes.
+        if let Some(watcher) = &mut *self.watcher.lock().expect("watch lock") {
+            watcher.set(dirs.iter().map(PathBuf::as_path));
+            // A directory deleted and recreated under the same name lost its watch.
+            watcher.rewatch(&canonical);
+        }
+    }
+}
+
+/// The listed locations that are the directory `dir` (a canonical path).
+fn changed_locations(recent: &VecDeque<(PathBuf, Location)>, dir: &Path) -> Vec<Location> {
+    recent
+        .iter()
+        .filter(|(canonical, _)| canonical == dir)
+        .map(|(_, location)| location.clone())
+        .collect()
 }
 
 pub fn run(vfs: Arc<Vfs>, config: Config) -> Result<()> {
@@ -86,6 +152,7 @@ async fn serve(vfs: Arc<Vfs>, config: Config) -> Result<()> {
         settings: Settings::default(),
     };
     let (events, _) = broadcast::channel(64);
+    let live = LiveDirs::new(events.clone());
     // `rcmd ctl` commands are resolved here and pushed to the browsers.
     let _control = match crate::control::listen() {
         Ok((listener, rx)) => {
@@ -115,6 +182,7 @@ async fn serve(vfs: Arc<Vfs>, config: Config) -> Result<()> {
             settings: Arc::new(RwLock::new(config.settings)),
             settings_path: config.settings_path.map(Arc::new),
             events,
+            live,
         },
         addr.port(),
     );
@@ -301,11 +369,13 @@ async fn edit_external(State(s): State<AppState>, Json(req): Json<OpenRequest>) 
 async fn list(State(s): State<AppState>, Json(req): Json<ListRequest>) -> Response {
     blocking(move || {
         let loc = s.vfs.normalize(req.location, None);
-        if s.settings.read().expect("settings lock").shows(rc_core::Column::Git) {
-            s.vfs.list_with_git(&loc)
+        let listing = if s.settings.read().expect("settings lock").shows(rc_core::Column::Git) {
+            s.vfs.list_with_git(&loc)?
         } else {
-            s.vfs.list(&loc)
-        }
+            s.vfs.list(&loc)?
+        };
+        s.live.listed(&listing.location);
+        Ok(listing)
     })
     .await
 }
@@ -485,6 +555,7 @@ mod tests {
 
     fn app(dir: &std::path::Path) -> Router {
         let loc = Location::local(dir.to_string_lossy());
+        let events = broadcast::channel(8).0;
         let state = AppState {
             vfs: Arc::new(Vfs::new()),
             token: "secret".into(),
@@ -496,7 +567,8 @@ mod tests {
             }),
             settings: Arc::new(RwLock::new(Settings::default())),
             settings_path: None,
-            events: broadcast::channel(8).0,
+            live: LiveDirs::new(events.clone()),
+            events,
         };
         router(state, PORT)
     }
@@ -743,6 +815,7 @@ mod tests {
             }),
             settings: Arc::new(RwLock::new(Settings::default())),
             settings_path: None,
+            live: LiveDirs::new(events.clone()),
             events: events.clone(),
         };
         let resp = super::router(state, PORT)
@@ -773,5 +846,121 @@ mod tests {
                 .unwrap()
                 .starts_with("text/html")
         );
+    }
+
+    #[test]
+    fn changed_locations_match_the_canonical_directory() {
+        let recent = VecDeque::from([
+            (PathBuf::from("/private/tmp"), Location::local("/tmp")),
+            (PathBuf::from("/private/tmp"), Location::local("/private/tmp")),
+            (PathBuf::from("/home/u"), Location::local("/home/u")),
+        ]);
+        assert_eq!(
+            changed_locations(&recent, Path::new("/private/tmp")),
+            [Location::local("/tmp"), Location::local("/private/tmp")]
+        );
+        assert!(changed_locations(&recent, Path::new("/elsewhere")).is_empty());
+    }
+
+    #[test]
+    fn watches_only_the_most_recent_listings() {
+        let (events, _) = broadcast::channel(8);
+        let live = LiveDirs::new(events);
+        let tmp = tempfile::tempdir().unwrap();
+        for i in 0..MAX_WATCHED + 2 {
+            let dir = tmp.path().join(i.to_string());
+            std::fs::create_dir(&dir).unwrap();
+            live.listed(&Location::local(dir.to_string_lossy()));
+        }
+        // Listing a directory again moves it to the front instead of adding a duplicate.
+        live.listed(&Location::local(tmp.path().join("5").to_string_lossy()));
+        let recent = live.recent.lock().unwrap();
+        assert_eq!(recent.len(), MAX_WATCHED);
+        assert!(recent[0].1.to_string().ends_with("/5"));
+        assert!(!recent.iter().any(|(_, l)| l.to_string().ends_with("/0")));
+    }
+
+    /// Waits for the next change event, or `None` after `ms` milliseconds.
+    async fn next_change(rx: &mut broadcast::Receiver<BrowserEvent>, ms: u64) -> Option<BrowserEvent> {
+        tokio::time::timeout(std::time::Duration::from_millis(ms), rx.recv())
+            .await
+            .ok()
+            .and_then(Result::ok)
+    }
+
+    #[tokio::test]
+    async fn relisting_a_watched_directory_is_not_a_change() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (events, mut rx) = broadcast::channel(8);
+        let live = LiveDirs::new(events);
+        let loc = Location::local(tmp.path().to_string_lossy());
+        let vfs = Vfs::new();
+        live.listed(&loc);
+        // Listing reads the directory, which the OS reports as an access, not a change.
+        for _ in 0..3 {
+            vfs.list(&loc).unwrap();
+            live.listed(&loc);
+        }
+        assert!(
+            next_change(&mut rx, 600).await.is_none(),
+            "re-listing produced a change event"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_recreated_directory_is_watched_again() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("build");
+        std::fs::create_dir(&dir).unwrap();
+        let (events, mut rx) = broadcast::channel(8);
+        let live = LiveDirs::new(events);
+        let loc = Location::local(dir.to_string_lossy());
+        live.listed(&loc);
+        std::fs::remove_dir(&dir).unwrap();
+        std::fs::create_dir(&dir).unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        while next_change(&mut rx, 300).await.is_some() {}
+        live.listed(&loc);
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        std::fs::write(dir.join("out.o"), "x").unwrap();
+        assert!(
+            next_change(&mut rx, 5000).await.is_some(),
+            "no change event after the directory came back"
+        );
+    }
+
+    #[tokio::test]
+    async fn listing_a_directory_reports_changes_to_it() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (events, mut rx) = broadcast::channel(8);
+        // The router is consumed by the request; this handle keeps the watcher running.
+        let live = LiveDirs::new(events.clone());
+        let dir = tmp.path().to_string_lossy().to_string();
+        let state = AppState {
+            vfs: Arc::new(Vfs::new()),
+            token: "secret".into(),
+            init: Arc::new(InitResponse {
+                left: Location::local(&dir),
+                right: Location::local(&dir),
+                home: "/".into(),
+                settings: Settings::default(),
+            }),
+            settings: Arc::new(RwLock::new(Settings::default())),
+            settings_path: None,
+            live: live.clone(),
+            events,
+        };
+        let host = format!("127.0.0.1:{PORT}");
+        let req = serde_json::json!({ "location": { "kind": "local", "path": &dir } });
+        let (status, listing) = call(router(state, PORT), post("/api/list", req, Some("secret"), &host)).await;
+        assert_eq!(status, StatusCode::OK);
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        std::fs::write(tmp.path().join("new.txt"), "x").unwrap();
+        let event = tokio::time::timeout(std::time::Duration::from_secs(5), rx.recv())
+            .await
+            .expect("a change event")
+            .unwrap();
+        let expected: Location = serde_json::from_value(listing["location"].clone()).unwrap();
+        assert_eq!(event, BrowserEvent::Changed { location: expected });
     }
 }

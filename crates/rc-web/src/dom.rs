@@ -1,7 +1,12 @@
 //! Small DOM helpers shared by the views.
 
+use leptos::html::Div;
+use leptos::prelude::*;
 use wasm_bindgen::JsCast;
-use web_sys::{Element, EventTarget, HtmlElement, ScrollIntoViewOptions, ScrollLogicalPosition};
+use web_sys::{Element, EventTarget, HtmlElement, KeyboardEvent, ScrollIntoViewOptions, ScrollLogicalPosition};
+
+/// Elements that take keyboard focus inside dialogs.
+pub const FOCUSABLE: &str = "button, input, [tabindex]:not([tabindex='-1'])";
 
 pub fn by_id(id: &str) -> Option<Element> {
     web_sys::window()?.document()?.get_element_by_id(id)
@@ -31,16 +36,9 @@ pub fn is_button(target: Option<EventTarget>) -> bool {
 /// Move keyboard focus among the elements in `container` matching `selector`: `delta`
 /// steps from the focused one (clamped), or to the first if none of them has focus.
 pub fn move_focus(container: &Element, selector: &str, delta: isize) {
-    let Ok(list) = container.query_selector_all(selector) else {
-        return;
-    };
-    let items: Vec<HtmlElement> = (0..list.length())
-        .filter_map(|i| list.item(i)?.dyn_into().ok())
-        .collect();
+    let items = query_all(container, selector);
     let Some(last) = items.len().checked_sub(1) else { return };
-    let active = web_sys::window()
-        .and_then(|w| w.document())
-        .and_then(|d| d.active_element());
+    let active = active_element();
     let next = items
         .iter()
         .position(|el| el.is_same_node(active.as_ref().map(|a| a.as_ref())))
@@ -48,13 +46,47 @@ pub fn move_focus(container: &Element, selector: &str, delta: isize) {
     let _ = items[next].focus();
 }
 
+fn active_element() -> Option<Element> {
+    web_sys::window()?.document()?.active_element()
+}
+
+fn query_all(container: &Element, selector: &str) -> Vec<HtmlElement> {
+    let Ok(list) = container.query_selector_all(selector) else {
+        return Vec::new();
+    };
+    (0..list.length())
+        .filter_map(|i| list.item(i)?.dyn_into().ok())
+        .collect()
+}
+
+/// Keep Tab / Shift+Tab inside a dialog: wrap around at either end, and pull focus back
+/// in if it is somewhere else. (The page behind is `inert`, so nothing there is reachable
+/// anyway; this also keeps focus from leaving for the browser's own UI.)
+pub fn trap_tab(dialog: NodeRef<Div>, ev: &KeyboardEvent) {
+    let Some(dialog) = dialog.get_untracked() else { return };
+    let items = query_all(&dialog, FOCUSABLE);
+    let (Some(first), Some(last)) = (items.first(), items.last()) else {
+        return;
+    };
+    let active = active_element();
+    let inside = active.as_ref().is_some_and(|a| dialog.contains(Some(a)));
+    let at = |el: &HtmlElement| active.as_ref().is_some_and(|a| el.is_same_node(Some(a)));
+    let target = match (inside, ev.shift_key()) {
+        (false, false) => first,
+        (false, true) => last,
+        (true, false) if at(last) => first,
+        (true, true) if at(first) => last,
+        // Inside and not at an edge: the browser moves focus normally.
+        _ => return,
+    };
+    ev.prevent_default();
+    let _ = target.focus();
+}
+
 /// Take focus away from whatever has it (e.g. a text field under a new overlay, which
 /// would otherwise keep receiving keys).
 pub fn blur_active() {
-    let active = web_sys::window()
-        .and_then(|w| w.document())
-        .and_then(|d| d.active_element());
-    if let Some(el) = active.and_then(|e| e.dyn_into::<HtmlElement>().ok()) {
+    if let Some(el) = active_element().and_then(|e| e.dyn_into::<HtmlElement>().ok()) {
         let _ = el.blur();
     }
 }

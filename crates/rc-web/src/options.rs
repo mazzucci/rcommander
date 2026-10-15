@@ -17,6 +17,8 @@ pub fn OptionsView(app: App) -> impl IntoView {
     let draft = RwSignal::new(app.settings.get_untracked());
     let hidden_before = app.panels.map(|p| p.with_untracked(|p| p.show_hidden));
     let dialog = NodeRef::<Div>::new();
+    // Why the server refused to save (e.g. an editor that is not a program), shown here.
+    let error = RwSignal::new(None::<String>);
     Effect::new(move |_| {
         if let Some(dialog) = dialog.get() {
             dom::move_focus(&dialog, CONTROLS, 0);
@@ -26,7 +28,13 @@ pub fn OptionsView(app: App) -> impl IntoView {
     let save = move || {
         let mut settings = draft.get_untracked();
         settings.gui_editor = settings.gui_editor.trim().to_string();
-        app.save_settings(settings);
+        app.save_settings(settings, move |result| match result {
+            Ok(()) => {
+                app.options_open.set(false);
+                app.info("Options saved");
+            }
+            Err(e) => error.set(Some(e)),
+        });
     };
     let cancel = move || {
         for (panel, show) in app.panels.into_iter().zip(hidden_before) {
@@ -48,6 +56,7 @@ pub fn OptionsView(app: App) -> impl IntoView {
             "Enter" if dom::is_button(ev.target()) => return,
             "Enter" => save(),
             "Escape" => cancel(),
+            "Tab" => dom::trap_tab(dialog, &ev),
             "ArrowDown" | "ArrowUp" => {
                 if let Some(dialog) = dialog.get_untracked() {
                     dom::move_focus(&dialog, CONTROLS, if key == "ArrowDown" { 1 } else { -1 });
@@ -108,6 +117,7 @@ pub fn OptionsView(app: App) -> impl IntoView {
                     "The browser UI starts the editor without a terminal, so use a GUI command such as "
                     <code>"code"</code> " or " <code>"open -t"</code> ", not " <code>"vim"</code> "."
                 </div>
+                {move || error.get().map(|e| view! { <div class="modal-error" role="alert">{e}</div> })}
                 <div class="modal-buttons">
                     <button class="primary" on:click=move |_| save()>
                         "Save"

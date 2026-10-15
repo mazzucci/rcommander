@@ -15,11 +15,15 @@ gloo-net = { version = "0.6", default-features = false, features = ["http", "jso
 wasm-bindgen = "0.2"
 js-sys = "0.3"
 web-sys = { version = "0.3", features = [
+    "Document",
+    "DomRect",
+    "EventSource",
     "History",
     "HtmlElement",
     "HtmlInputElement",
     "KeyboardEvent",
     "Location",
+    "MessageEvent",
     "NodeList",
     "ScrollBehavior",
     "ScrollIntoViewOptions",
