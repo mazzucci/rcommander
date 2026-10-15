@@ -1258,6 +1258,130 @@ tr.fold:hover td {
     color: var(--meta);
 }
 
+/* Multi-rename */
+
+.modal.rename {
+    display: flex;
+    flex-direction: column;
+    width: min(900px, 94vw);
+    max-height: 84vh;
+    overflow: hidden;
+}
+
+.backdrop:has(.rename) {
+    padding-top: 6vh;
+}
+
+.rn-fields {
+    display: grid;
+    grid-template-columns: max-content 1fr;
+    align-items: center;
+    gap: 8px 12px;
+    font-size: 12.5px;
+}
+
+.rn-fields > label {
+    color: var(--meta);
+}
+
+.rn-mask,
+.rn-row {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+}
+
+.rn-row label {
+    margin-left: 10px;
+    color: var(--meta);
+    white-space: nowrap;
+}
+
+.rn-row select {
+    width: auto;
+    font-family: var(--ui);
+}
+
+.modal-input.num {
+    width: 72px;
+}
+
+button.token {
+    flex: none;
+    height: 28px;
+    padding: 0 8px;
+    font: 12px var(--mono);
+    color: var(--accent);
+}
+
+.rn-status {
+    margin: 12px 0 6px;
+    font-size: 12px;
+    color: var(--dim);
+}
+
+.rn-status .ok {
+    color: var(--add);
+}
+
+.rn-status .error {
+    color: var(--del);
+}
+
+.rn-preview {
+    flex: 1;
+    min-height: 100px;
+    overflow: auto;
+    background: var(--bg);
+    border: 1px solid var(--border);
+    border-radius: 6px;
+}
+
+.rn-preview table {
+    width: 100%;
+    border-collapse: collapse;
+    table-layout: fixed;
+    font: 12.5px/24px var(--mono);
+}
+
+.rn-preview td {
+    padding: 0 8px;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+
+.rn-from {
+    width: 38%;
+    color: var(--meta);
+}
+
+.rn-arrow {
+    width: 20px;
+    color: var(--dim);
+    text-align: center;
+}
+
+.rn-to {
+    width: 38%;
+    color: var(--text);
+}
+
+.rn-problem {
+    color: var(--del);
+    font-family: var(--ui);
+    font-size: 12px;
+}
+
+tr.same .rn-from,
+tr.same .rn-to {
+    color: var(--dim);
+}
+
+tr.bad .rn-to {
+    color: var(--del);
+}
+
 /* Help */
 
 .modal.help {

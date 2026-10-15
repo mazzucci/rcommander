@@ -12,6 +12,7 @@ mod modal;
 mod options;
 mod panel_view;
 mod quick_view;
+mod rename;
 mod viewer;
 
 fn main() {

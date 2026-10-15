@@ -8,6 +8,7 @@ use crate::modal::{Modal, ModalKind, ModalView};
 use crate::options::OptionsView;
 use crate::panel_view::PanelView;
 use crate::quick_view::QuickView;
+use crate::rename::{RenameTarget, RenameView};
 use crate::viewer::Viewer;
 use crate::{api, dom, events};
 use leptos::ev;
@@ -88,6 +89,8 @@ pub struct App {
     pub modal: RwSignal<Option<Modal>>,
     pub options_open: RwSignal<bool>,
     pub hotlist_open: RwSignal<bool>,
+    /// Multi-rename (Shift+F6) and what it renames.
+    pub rename: RwSignal<Option<RenameTarget>>,
     /// Quick View (Ctrl+Q): the panel that is not active previews the cursor's entry.
     pub quick_view: RwSignal<bool>,
     /// Find files (Alt+F7) is open, and its form and last results.
@@ -148,6 +151,7 @@ impl App {
             modal: RwSignal::new(None),
             options_open: RwSignal::new(false),
             hotlist_open: RwSignal::new(false),
+            rename: RwSignal::new(None),
             quick_view: RwSignal::new(false),
             find_open: RwSignal::new(false),
             find: FindForm::new(),
@@ -192,6 +196,7 @@ impl App {
             || self.options_open.get()
             || self.hotlist_open.get()
             || self.find_open.get()
+            || self.rename.with(Option::is_some)
             || self.overlay.with(Option::is_some)
     }
 
@@ -263,7 +268,8 @@ impl App {
         let dialog_open = self.modal.with_untracked(Option::is_some)
             || self.options_open.get_untracked()
             || self.hotlist_open.get_untracked()
-            || self.find_open.get_untracked();
+            || self.find_open.get_untracked()
+            || self.rename.with_untracked(Option::is_some);
         let acts = matches!(
             event,
             BrowserEvent::Navigate { .. }
@@ -484,6 +490,26 @@ impl App {
     }
 
     // ---- file actions -----------------------------------------------------------
+
+    /// Shift+F6: rename the selected entries (or the one under the cursor) by a rule.
+    fn open_rename(self) {
+        if self.in_changes() {
+            self.error("Claude's changes are links to the edited files; rename the files themselves");
+            return;
+        }
+        let target = self.panels[self.active_side()].with_untracked(|p| {
+            let entries: Vec<(String, bool)> = p.targets().iter().map(|e| (e.name.clone(), e.is_dir)).collect();
+            (!entries.is_empty()).then(|| RenameTarget {
+                folder: p.location.clone(),
+                entries,
+                existing: p.entries().iter().map(|e| e.name.clone()).collect(),
+            })
+        });
+        if let Some(target) = target {
+            dom::blur_active();
+            self.rename.set(Some(target));
+        }
+    }
 
     /// Alt+F7: find files under the active panel's folder.
     fn open_find(self) {
@@ -830,7 +856,7 @@ impl App {
     }
 
     /// Perform a file operation, then refresh both panels (cursor on `focus` in the active one).
-    fn run_op(self, op: FileOp, focus: Option<String>) {
+    pub fn run_op(self, op: FileOp, focus: Option<String>) {
         let verb = op.verb();
         // The panel the operation started from, even if the user switches meanwhile.
         let side = self.active_side();
@@ -870,7 +896,7 @@ impl App {
             FileOp::Copy { .. } => Some("Copying"),
             FileOp::Move { .. } => Some("Moving"),
             FileOp::Delete { .. } => Some("Deleting"),
-            FileOp::Mkdir { .. } | FileOp::Rename { .. } => None,
+            FileOp::Mkdir { .. } | FileOp::Rename { .. } | FileOp::RenameMany { .. } => None,
         }
     }
 
@@ -996,6 +1022,7 @@ impl App {
             3 => self.enter(self.active_side()),
             4 => self.edit(),
             5 => self.ask_transfer(false),
+            6 if shift => self.open_rename(),
             6 => self.ask_transfer(true),
             7 => self.ask_mkdir(),
             8 if self.in_changes() => self.ask_forget(),
@@ -1081,6 +1108,7 @@ impl App {
             (false, "Delete") => self.ask_delete(shift),
             (false, "c") => self.show_changes(),
             (false, "F") => self.open_find(),
+            (false, "M") | (true, "m") => self.open_rename(),
             (false, "Escape") => {
                 let idle = panel.with_untracked(|p| p.filter.is_empty() && p.selected.is_empty());
                 if !(idle && self.cancel_running_job()) {
@@ -1217,6 +1245,7 @@ pub fn Root() -> impl IntoView {
         <Show when=move || app.find_open.get()>
             <FindView app/>
         </Show>
+        {move || app.rename.get().map(|target| view! { <RenameView app target/> })}
         {move || {
             app.overlay
                 .get()

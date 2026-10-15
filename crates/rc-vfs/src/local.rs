@@ -138,6 +138,178 @@ mod owners {
     }
 }
 
+#[cfg(test)]
+thread_local! {
+    /// Tests: make phase 2 of `rename_many` fail at this step.
+    static FAIL_PHASE2_AT: std::cell::Cell<Option<usize>> = const { std::cell::Cell::new(None) };
+}
+
+/// Batches started by this process, so concurrent batches get different temp names.
+static RENAME_BATCH: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Whether `name` can be a new file name: not empty, not `.`/`..`, no `/`, no control
+/// characters, at most 255 bytes.
+pub fn valid_name(name: &str) -> bool {
+    !name.is_empty()
+        && name != "."
+        && name != ".."
+        && name.len() <= 255
+        && !name.contains('/')
+        && !name.chars().any(char::is_control)
+}
+
+/// Rename `from` to `to` only if nothing is at `to`: atomically where the system can
+/// (Linux `RENAME_NOREPLACE`, macOS `RENAME_EXCL`), else check first. Fails with
+/// `AlreadyExists` instead of replacing anything.
+pub fn rename_noreplace(from: &Path, to: &Path) -> std::io::Result<()> {
+    use std::io::{Error, ErrorKind};
+    use std::os::unix::ffi::OsStrExt;
+    let c =
+        |p: &Path| std::ffi::CString::new(p.as_os_str().as_bytes()).map_err(|_| Error::from(ErrorKind::InvalidInput));
+    let (a, b) = (c(from)?, c(to)?);
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    // SAFETY: both arguments are valid NUL-terminated paths for the duration of the call.
+    let r = unsafe {
+        libc::renameat2(
+            libc::AT_FDCWD,
+            a.as_ptr(),
+            libc::AT_FDCWD,
+            b.as_ptr(),
+            libc::RENAME_NOREPLACE,
+        )
+    };
+    #[cfg(any(target_os = "macos", target_os = "ios"))]
+    // SAFETY: as above.
+    let r = unsafe { libc::renamex_np(a.as_ptr(), b.as_ptr(), libc::RENAME_EXCL) };
+    #[cfg(not(any(target_os = "linux", target_os = "android", target_os = "macos", target_os = "ios")))]
+    let r = {
+        let _ = (&a, &b);
+        -2
+    };
+    if r == 0 {
+        return Ok(());
+    }
+    let err = if r == -2 {
+        Error::from_raw_os_error(libc::ENOSYS)
+    } else {
+        Error::last_os_error()
+    };
+    match err.raw_os_error() {
+        // The filesystem (or system) does not support the flag: check, then rename.
+        Some(e) if e == libc::EINVAL || e == libc::ENOSYS || e == libc::ENOTSUP || e == libc::EOPNOTSUPP => {
+            if to.symlink_metadata().is_ok() {
+                return Err(ErrorKind::AlreadyExists.into());
+            }
+            fs::rename(from, to)
+        }
+        _ => Err(err),
+    }
+}
+
+/// Are `a` and `b` the same directory entry under two spellings (a case-only rename on
+/// a case-insensitive disk)? Links are not followed, and hard links to one file with
+/// different names are not the same entry.
+pub fn same_entry(a: &Path, b: &Path) -> bool {
+    use std::os::unix::fs::MetadataExt;
+    let names_match = match (a.file_name(), b.file_name()) {
+        (Some(x), Some(y)) => x.to_string_lossy().to_lowercase() == y.to_string_lossy().to_lowercase(),
+        _ => false,
+    };
+    names_match
+        && match (fs::symlink_metadata(a), fs::symlink_metadata(b)) {
+            (Ok(x), Ok(y)) => x.dev() == y.dev() && x.ino() == y.ino(),
+            _ => false,
+        }
+}
+
+/// Rename entries of `dir` (old name, new name) as one batch: first every entry moves to
+/// a temporary name, then to its new one, so swaps and chains work. Everything is checked
+/// first, no rename ever replaces an existing entry, and if a step fails the batch is
+/// undone. Returns how many entries got a new name.
+pub fn rename_many(dir: &Path, renames: &[(String, String)]) -> Result<usize> {
+    let renames: Vec<&(String, String)> = renames.iter().filter(|(a, b)| a != b).collect();
+    let sources: std::collections::HashSet<&str> = renames.iter().map(|(a, _)| a.as_str()).collect();
+    let mut targets = std::collections::HashSet::new();
+    for (from, to) in &renames {
+        // An existing name only has to be one entry of `dir` (it may be odd, which is
+        // often why it is being renamed).
+        if from.is_empty() || from == "." || from == ".." || from.contains('/') {
+            bail!("invalid name: {from:?}");
+        }
+        if !valid_name(to) {
+            bail!("invalid new name for {from}: {to:?}");
+        }
+        if !targets.insert(to.as_str()) {
+            bail!("two entries would be named {to}");
+        }
+        dir.join(from)
+            .symlink_metadata()
+            .with_context(|| format!("cannot rename {from}"))?;
+        let target = dir.join(to);
+        if !sources.contains(to.as_str()) && target.symlink_metadata().is_ok() && !same_entry(&dir.join(from), &target)
+        {
+            bail!("{to} already exists");
+        }
+    }
+    let batch = RENAME_BATCH.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let temp = |i: usize| dir.join(format!(".rcmd-rename-{}-{batch}-{i}", std::process::id()));
+    let old = |i: usize| dir.join(&renames[i].0);
+    let new = |i: usize| dir.join(&renames[i].1);
+
+    // Phase 1: everything out of the way.
+    for i in 0..renames.len() {
+        if let Err(e) = rename_noreplace(&old(i), &temp(i)) {
+            let stuck: Vec<String> = (0..i)
+                .rev()
+                .filter(|&j| rename_noreplace(&temp(j), &old(j)).is_err())
+                .map(|j| format!("{} is at {}", renames[j].0, temp(j).display()))
+                .collect();
+            return Err(undo_report(format!("cannot rename {}: {e}", renames[i].0), &stuck));
+        }
+    }
+    // Phase 2: into place.
+    for i in 0..renames.len() {
+        #[cfg(test)]
+        let step = if FAIL_PHASE2_AT.with(|f| f.get()) == Some(i) {
+            Err(std::io::Error::other("injected failure"))
+        } else {
+            rename_noreplace(&temp(i), &new(i))
+        };
+        #[cfg(not(test))]
+        let step = rename_noreplace(&temp(i), &new(i));
+        if let Err(e) = step {
+            let why = if e.kind() == std::io::ErrorKind::AlreadyExists {
+                format!("cannot rename {} to {}: it already exists", renames[i].0, renames[i].1)
+            } else {
+                format!("cannot rename {} to {}: {e}", renames[i].0, renames[i].1)
+            };
+            // Done ones go back out of the way first (their new names may be other
+            // entries' old ones), then everything returns to its old name.
+            let mut stuck = Vec::new();
+            for k in (0..i).rev() {
+                if rename_noreplace(&new(k), &temp(k)).is_err() {
+                    stuck.push(format!("{} kept its new name {}", renames[k].0, renames[k].1));
+                }
+            }
+            for (j, (from, _)) in renames.iter().enumerate() {
+                if temp(j).symlink_metadata().is_ok() && rename_noreplace(&temp(j), &old(j)).is_err() {
+                    stuck.push(format!("{from} is at {}", temp(j).display()));
+                }
+            }
+            return Err(undo_report(why, &stuck));
+        }
+    }
+    Ok(renames.len())
+}
+
+fn undo_report(why: String, stuck: &[String]) -> anyhow::Error {
+    if stuck.is_empty() {
+        anyhow::anyhow!("{why}; nothing was renamed")
+    } else {
+        anyhow::anyhow!("{why}; could not undo everything: {}", stuck.join("; "))
+    }
+}
+
 /// What a file that is not a regular file is, in words.
 pub fn special_kind(kind: &fs::FileType) -> &'static str {
     use std::os::unix::fs::FileTypeExt;
@@ -576,6 +748,124 @@ pub fn remove(path: &Path) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn rename_many_handles_swaps_chains_and_refusals() {
+        let tmp = tempfile::tempdir().unwrap();
+        let d = tmp.path();
+        for (n, c) in [("a", "A"), ("b", "B"), ("c", "C"), ("keep", "K")] {
+            fs::write(d.join(n), c).unwrap();
+        }
+        let r = |pairs: &[(&str, &str)]| -> Vec<(String, String)> {
+            pairs.iter().map(|(a, b)| (a.to_string(), b.to_string())).collect()
+        };
+        let read = |n: &str| fs::read_to_string(d.join(n)).unwrap();
+
+        // Swap and chain in one batch.
+        assert_eq!(rename_many(d, &r(&[("a", "b"), ("b", "a"), ("c", "d")])).unwrap(), 3);
+        assert_eq!((read("a"), read("b"), read("d")), ("B".into(), "A".into(), "C".into()));
+        assert!(!d.join("c").exists());
+
+        // Refused before touching anything.
+        for pairs in [
+            r(&[("a", "keep")]),
+            r(&[("a", "x"), ("b", "x")]),
+            r(&[("a", "x/y")]),
+            r(&[("missing", "x")]),
+            r(&[("a", "..")]),
+        ] {
+            assert!(rename_many(d, &pairs).is_err(), "{pairs:?}");
+        }
+        assert_eq!(
+            (read("a"), read("b"), read("keep")),
+            ("B".into(), "A".into(), "K".into())
+        );
+        let leftovers: Vec<_> = fs::read_dir(d)
+            .unwrap()
+            .flatten()
+            .filter(|e| e.file_name().to_string_lossy().starts_with(".rcmd-rename"))
+            .collect();
+        assert!(leftovers.is_empty());
+        // A name with a control character can be fixed by renaming it.
+        fs::write(d.join("odd\nname"), "O").unwrap();
+        assert_eq!(rename_many(d, &r(&[("odd\nname", "odd name")])).unwrap(), 1);
+        assert_eq!(read("odd name"), "O");
+        fs::remove_file(d.join("odd name")).unwrap();
+        // Unchanged names are fine and not counted.
+        assert_eq!(rename_many(d, &r(&[("a", "a"), ("b", "e")])).unwrap(), 1);
+    }
+
+    fn names_in(d: &Path) -> Vec<String> {
+        let mut v: Vec<String> = fs::read_dir(d)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        v.sort();
+        v
+    }
+
+    #[test]
+    fn failed_chain_is_undone_without_losing_anything() {
+        let tmp = tempfile::tempdir().unwrap();
+        let d = tmp.path();
+        fs::write(d.join("a"), "A").unwrap();
+        fs::write(d.join("b"), "B").unwrap();
+        // a → b works, then b → (too long) fails: a must get its name and content back.
+        let long = "x".repeat(300);
+        let err = rename_many(d, &[("a".into(), "b".into()), ("b".into(), long)]).unwrap_err();
+        assert!(err.to_string().contains("invalid"), "{err}");
+        // A failure in phase 2 at every position of a swap-and-chain batch: a → b,
+        // b → a, c → d. Everything must be back as it was.
+        fs::write(d.join("c"), "C").unwrap();
+        let batch: Vec<(String, String)> = [("a", "b"), ("b", "a"), ("c", "d")]
+            .iter()
+            .map(|(x, y)| (x.to_string(), y.to_string()))
+            .collect();
+        for at in 0..3 {
+            FAIL_PHASE2_AT.with(|f| f.set(Some(at)));
+            let err = rename_many(d, &batch).unwrap_err().to_string();
+            FAIL_PHASE2_AT.with(|f| f.set(None));
+            assert!(err.contains("nothing was renamed"), "{at}: {err}");
+            assert_eq!(names_in(d), ["a", "b", "c"], "after a failure at step {at}");
+            let content: Vec<String> = ["a", "b", "c"]
+                .iter()
+                .map(|n| fs::read_to_string(d.join(n)).unwrap())
+                .collect();
+            assert_eq!(content, ["A", "B", "C"], "after a failure at step {at}");
+        }
+    }
+
+    #[test]
+    fn links_and_hard_links_are_never_clobbered() {
+        let tmp = tempfile::tempdir().unwrap();
+        let d = tmp.path();
+        fs::write(d.join("keep"), "K").unwrap();
+        std::os::unix::fs::symlink(d.join("keep"), d.join("link")).unwrap();
+        assert!(
+            rename_many(d, &[("link".into(), "keep".into())]).is_err(),
+            "link onto its own target"
+        );
+        fs::hard_link(d.join("keep"), d.join("twin")).unwrap();
+        assert!(
+            rename_many(d, &[("twin".into(), "keep".into())]).is_err(),
+            "hard link onto its twin"
+        );
+        assert_eq!(names_in(d), ["keep", "link", "twin"]);
+        assert_eq!(fs::read_to_string(d.join("keep")).unwrap(), "K");
+    }
+
+    #[test]
+    fn noreplace_refuses_existing_targets() {
+        let tmp = tempfile::tempdir().unwrap();
+        let d = tmp.path();
+        fs::write(d.join("a"), "A").unwrap();
+        fs::write(d.join("b"), "B").unwrap();
+        let e = rename_noreplace(&d.join("a"), &d.join("b")).unwrap_err();
+        assert_eq!(e.kind(), std::io::ErrorKind::AlreadyExists);
+        assert_eq!(fs::read_to_string(d.join("b")).unwrap(), "B");
+        rename_noreplace(&d.join("a"), &d.join("c")).unwrap();
+        assert_eq!(names_in(d), ["b", "c"]);
+    }
 
     fn cp(src: &Path, dest: &Path, policy: OnConflict) -> Result<Copied> {
         copy(src, dest, policy, &mut 0, 0, &mut |_| ControlFlow::Continue(())).map(|o| o.result())

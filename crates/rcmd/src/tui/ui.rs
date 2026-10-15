@@ -2,6 +2,7 @@
 
 use super::app::{App, EDITOR_ROW, HIDDEN_ROW, LEFT, Mode, Options, RIGHT};
 use super::find::{Field, Find};
+use super::rename::{self, MultiRename};
 use super::views::{DiffView, Viewer, sanitize};
 use chrono::{Local, Offset, TimeZone};
 use ratatui::Frame;
@@ -53,6 +54,9 @@ pub fn draw(f: &mut Frame, app: &mut App) {
     draw_keys(f, keys, &app.mode);
     if let Mode::Find(find) = &mut app.mode {
         draw_find(f, main, find);
+    }
+    if let Mode::Rename(r) = &mut app.mode {
+        draw_rename(f, main, r);
     }
 
     match &app.mode {
@@ -445,6 +449,12 @@ fn draw_keys(f: &mut Frame, area: Rect, mode: &Mode) {
             ("Tab", "Next field"),
             ("Space", "Toggle"),
             ("Esc", "Close"),
+        ],
+        Mode::Rename(_) => &[
+            ("Enter", "Rename"),
+            ("Tab", "Next field"),
+            ("PgUp/PgDn", "Scroll"),
+            ("Esc", "Cancel"),
         ],
         Mode::Diff(_) => &[
             ("Esc", "Close"),
@@ -846,6 +856,123 @@ fn draw_find(f: &mut Frame, area: Rect, find: &mut Find) {
     f.render_widget(Paragraph::new(Line::raw(keys).fg(DIM)), hint);
 }
 
+fn draw_rename(f: &mut Frame, area: Rect, r: &mut MultiRename) {
+    let area = popup(area, 80, area.height.saturating_sub(2).max(12));
+    let Location::Local { path } = &r.folder;
+    let title = format!(" Rename {} in {} ", r.plan.len(), path);
+    let block = Block::bordered()
+        .border_type(BorderType::Rounded)
+        .border_style(Style::new().fg(ACCENT))
+        .title(
+            Line::raw(elide_start(&title, area.width.saturating_sub(4) as usize))
+                .fg(TEXT)
+                .bold(),
+        );
+    let inner = block.inner(area);
+    f.render_widget(Clear, area);
+    f.render_widget(block, area);
+    let [fields, status, list, hint] = Layout::vertical([
+        Constraint::Length(6),
+        Constraint::Length(1),
+        Constraint::Min(1),
+        Constraint::Length(1),
+    ])
+    .areas(inner);
+
+    let rule = &r.rule;
+    let row = |label: &'static str, value: String, which: rename::Field, note: &'static str| {
+        let active = r.field == which;
+        let cursor = if active && which != rename::Field::Case {
+            "█"
+        } else {
+            ""
+        };
+        Line::from(vec![
+            Span::raw(format!(" {label:<9}"))
+                .fg(if active { ACCENT } else { META })
+                .bold(),
+            Span::raw(format!("{}{cursor}", sanitize(&value))).fg(TEXT),
+            Span::raw(format!("  {note}")).fg(DIM),
+        ])
+    };
+    f.render_widget(
+        Paragraph::new(vec![
+            row(
+                "Mask",
+                rule.mask.clone(),
+                rename::Field::Mask,
+                "[N] name  [E] ext  [C] counter  [P] folder",
+            ),
+            row("Search", rule.search.clone(), rename::Field::Search, ""),
+            row("Replace", rule.replace.clone(), rename::Field::Replace, ""),
+            row("Case", rule.case.label().into(), rename::Field::Case, "Space to change"),
+            row(
+                "Counter",
+                rule.counter_start.to_string(),
+                rename::Field::Start,
+                "first number",
+            ),
+            row(
+                "Digits",
+                rule.counter_digits.to_string(),
+                rename::Field::Digits,
+                "zero-padded width",
+            ),
+        ]),
+        fields,
+    );
+
+    let (changes, problems) = (r.changes(), r.problems());
+    let status_line = if problems > 0 {
+        let s = if problems == 1 { "" } else { "s" };
+        Line::raw(format!(" {problems} problem{s} · nothing will be renamed")).fg(ERR)
+    } else if changes == 0 {
+        Line::raw(" No name changes yet").fg(DIM)
+    } else {
+        Line::raw(format!(" {changes} to rename · Enter")).fg(OK)
+    };
+    f.render_widget(Paragraph::new(status_line), status);
+
+    let height = list.height as usize;
+    r.scroll = r.scroll.min(r.plan.len().saturating_sub(height));
+    let width = r
+        .plan
+        .iter()
+        .map(|p| p.from.chars().count())
+        .max()
+        .unwrap_or(0)
+        .min(list.width as usize / 2);
+    let lines: Vec<Line> = r
+        .plan
+        .iter()
+        .skip(r.scroll)
+        .take(height)
+        .map(|p| {
+            let to_color = if p.problem.is_some() {
+                ERR
+            } else if p.changes() {
+                TEXT
+            } else {
+                DIM
+            };
+            let mut spans = vec![
+                Span::raw(format!(" {:<width$}", sanitize(&p.from))).fg(if p.changes() { META } else { DIM }),
+                Span::raw(" → ").fg(DIM),
+                Span::raw(sanitize(&p.to)).fg(to_color),
+            ];
+            if let Some(problem) = &p.problem {
+                spans.push(Span::raw(format!("  {problem}")).fg(ERR));
+            }
+            Line::from(spans)
+        })
+        .collect();
+    f.render_widget(Paragraph::new(lines), list);
+    f.render_widget(
+        Paragraph::new(Line::raw(" Tab next field · PgUp/PgDn scroll · Enter rename · Esc cancel").fg(DIM)),
+        hint,
+    );
+}
+
 fn draw_help(f: &mut Frame, area: Rect) {
     const HELP: &[(&str, &str)] = &[
         ("↑↓ PgUp PgDn Home End", "move cursor"),
@@ -871,6 +998,7 @@ fn draw_help(f: &mut Frame, area: Rect) {
         ("F5  F6", "copy / move or rename"),
         ("F7  F8", "new directory / delete to Trash (Shift: permanent)"),
         ("F9", "compare directories (toggle)"),
+        ("Shift+F6  M", "multi-rename: mask, search/replace, case, counter"),
         (
             "Ctrl+Q  Shift+Q",
             "quick view: the other panel previews the file or folder",
@@ -1016,6 +1144,53 @@ mod tests {
     }
 
     #[test]
+    fn multi_rename_dialog_renames_the_selection() {
+        let tmp = tempfile::tempdir().unwrap();
+        for n in ["b.TXT", "a.TXT", "keep.md"] {
+            std::fs::write(tmp.path().join(n), n).unwrap();
+        }
+        let loc = rc_core::Location::local(tmp.path().to_string_lossy());
+        let mut app = App::new(Arc::new(rc_vfs::Vfs::new()), loc.clone(), loc);
+        app.panels[0].select_mask("*.TXT", true);
+        app.handle_key(KeyEvent::new(KeyCode::F(6), KeyModifiers::SHIFT));
+        let press = |app: &mut App, code: KeyCode| {
+            app.handle_key(KeyEvent::new(code, KeyModifiers::NONE));
+        };
+        for _ in 0..7 {
+            press(&mut app, KeyCode::Backspace);
+        }
+        for c in "note-[C].[E]".chars() {
+            press(&mut app, KeyCode::Char(c));
+        }
+        for _ in 0..3 {
+            press(&mut app, KeyCode::Tab);
+        }
+        press(&mut app, KeyCode::Char(' '));
+        let s = screen(&mut app);
+        assert!(
+            s.contains("a.TXT") && s.contains("note-1.txt") && s.contains("2 to rename"),
+            "{s}"
+        );
+        press(&mut app, KeyCode::Enter);
+        let start = std::time::Instant::now();
+        while app.job.is_some() {
+            app.tick();
+            assert!(start.elapsed().as_secs() < 10);
+        }
+        let mut names: Vec<_> = std::fs::read_dir(tmp.path())
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        names.sort();
+        assert_eq!(names, ["keep.md", "note-1.txt", "note-2.txt"]);
+        assert_eq!(
+            std::fs::read_to_string(tmp.path().join("note-1.txt")).unwrap(),
+            "a.TXT",
+            "in panel order"
+        );
+    }
+
+    #[test]
     fn extreme_terminal_sizes_do_not_panic() {
         let tmp = tempfile::tempdir().unwrap();
         let loc = rc_core::Location::local(tmp.path().to_string_lossy());
@@ -1048,6 +1223,13 @@ mod tests {
                 app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
                 draw_at(&mut app, w, h);
             }
+            assert!(matches!(app.mode, Mode::Normal));
+            // Multi-rename with a preview.
+            app.handle_key(KeyEvent::new(KeyCode::Char('M'), KeyModifiers::SHIFT));
+            app.handle_key(KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE));
+            app.handle_key(KeyEvent::new(KeyCode::PageDown, KeyModifiers::NONE));
+            draw_at(&mut app, w, h);
+            app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
             assert!(matches!(app.mode, Mode::Normal));
         }
     }

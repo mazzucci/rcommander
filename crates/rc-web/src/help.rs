@@ -27,6 +27,10 @@ const KEYS: &[(&str, &str)] = &[
         "Ctrl+Q  Shift+Q",
         "quick view: the other panel previews the file or folder",
     ),
+    (
+        "Shift+F6  M  Ctrl+M",
+        "multi-rename: mask, search/replace, case, counter",
+    ),
     ("Ctrl+D", "hotlist (bookmarks)"),
     ("c", "Claude's changes: F2 diff vs original, F8 forget"),
     ("o", "options: columns, hidden files, editor"),

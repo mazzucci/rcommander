@@ -286,12 +286,25 @@ impl Vfs {
             FileOp::Rename { from, to } => {
                 let (Location::Local { path: a }, Location::Local { path: b }) = (from, to);
                 // Same file under another name = case-only rename on case-insensitive APFS.
-                let r = if Path::new(b).symlink_metadata().is_ok() && !local::same_file(Path::new(a), Path::new(b)) {
-                    Err(anyhow::anyhow!("{b} already exists"))
+                // Never replaces anything, except the entry itself under another
+                // spelling (a case-only rename on a case-insensitive disk).
+                let (pa, pb) = (Path::new(a), Path::new(b));
+                let r = if local::same_entry(pa, pb) {
+                    std::fs::rename(pa, pb).map_err(Into::into)
                 } else {
-                    std::fs::rename(a, b).map_err(Into::into)
+                    local::rename_noreplace(pa, pb).map_err(|e| match e.kind() {
+                        std::io::ErrorKind::AlreadyExists => anyhow::anyhow!("{b} already exists"),
+                        _ => anyhow::Error::from(e).context(format!("cannot rename {a}")),
+                    })
                 };
                 record(&mut res, &to.to_string(), r.map(|_| Copied::Done));
+            }
+            FileOp::RenameMany { folder, renames } => {
+                let Location::Local { path } = folder;
+                match local::rename_many(Path::new(path), renames) {
+                    Ok(n) => res.done = n,
+                    Err(e) => res.errors.push(format!("{e:#}")),
+                }
             }
         }
         res
@@ -410,6 +423,32 @@ mod tests {
     use super::*;
     use rc_core::api::OnConflict;
     use std::ops::ControlFlow;
+
+    #[test]
+    fn rename_never_replaces_another_entry() {
+        let tmp = tempfile::tempdir().unwrap();
+        let p = tmp.path();
+        std::fs::write(p.join("keep"), "K").unwrap();
+        std::fs::write(p.join("other"), "O").unwrap();
+        std::os::unix::fs::symlink(p.join("keep"), p.join("link")).unwrap();
+        let vfs = Vfs::new();
+        let loc = |n: &str| Location::local(p.join(n).to_string_lossy());
+        let rename = |a: &str, b: &str| {
+            vfs.op(
+                &FileOp::Rename {
+                    from: loc(a),
+                    to: loc(b),
+                },
+                &mut |_| ControlFlow::Continue(()),
+            )
+        };
+        for (a, b) in [("link", "keep"), ("other", "keep")] {
+            let res = rename(a, b);
+            assert!(res.errors[0].contains("already exists"), "{a} → {b}: {res:?}");
+        }
+        assert_eq!(std::fs::read_to_string(p.join("keep")).unwrap(), "K");
+        assert_eq!(rename("other", "new").done, 1);
+    }
 
     #[test]
     fn preview_reads_the_beginning_of_files_and_summarizes_folders() {
