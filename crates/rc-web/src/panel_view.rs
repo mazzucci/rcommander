@@ -1,7 +1,6 @@
 //! One file panel: path bar, column header, file list and status line.
 
-use crate::app::App;
-use crate::dom;
+use crate::app::{App, ROW_HEIGHT};
 use leptos::ev;
 use leptos::html::{Div, Input, Span};
 use leptos::prelude::*;
@@ -9,7 +8,7 @@ use rc_core::dircmp::CmpMark;
 use rc_core::format::human_size;
 use rc_core::{Column, Entry, Panel, Row, SortKey};
 use wasm_bindgen::JsValue;
-use web_sys::{KeyboardEvent, ScrollLogicalPosition};
+use web_sys::KeyboardEvent;
 
 /// What a list row shows, so the list only re-renders when this changes (not on every
 /// cursor move). `entry` is `None` for the synthetic ".." row.
@@ -58,6 +57,8 @@ const MIN_NAME: u16 = 12;
 /// Characters each row needs besides the name and the optional columns: the mark column,
 /// the icon and paddings.
 const FIXED: u16 = 6;
+/// Rows rendered above and below the visible ones, so scrolling stays smooth.
+const OVERSCAN: usize = 20;
 
 /// Grid track list for the mark, name and the given optional columns. Each optional
 /// column is its `width()` in characters plus padding, about one character, which is
@@ -90,10 +91,23 @@ pub fn PanelView(app: App, side: usize) -> impl IntoView {
     let list_ref = NodeRef::<Div>::new();
     let probe = NodeRef::<Span>::new();
     let width_chars = RwSignal::new(None::<u16>);
+    // Only the rows in view (plus a margin) are in the DOM, so huge folders stay fast.
+    let scroll_top = RwSignal::new(0i32);
+    let view_height = RwSignal::new(0i32);
+    let window = Memo::new(move |_| {
+        let n = rows.with(Vec::len);
+        let first = (scroll_top.get().max(0) / ROW_HEIGHT) as usize;
+        // Before the first measurement, render a screenful.
+        let visible = (view_height.get().max(ROW_HEIGHT * 40) / ROW_HEIGHT) as usize + 1;
+        let start = first.saturating_sub(OVERSCAN).min(n);
+        (start, (first + visible + OVERSCAN).min(n))
+    });
+
     let measure = move || {
         let (Some(list), Some(probe)) = (list_ref.get_untracked(), probe.get_untracked()) else {
             return;
         };
+        view_height.set(list.client_height());
         // The probe holds ten digits in the row font: one `ch` is a tenth of it.
         let ch = f64::from(probe.offset_width()) / 10.0;
         if ch > 0.0 {
@@ -115,12 +129,16 @@ pub fn PanelView(app: App, side: usize) -> impl IntoView {
         })
     });
 
-    // Keep the cursor row visible. Effects run after the DOM update, so the row exists.
+    // Keep the cursor row visible (by position: off-screen rows are not in the DOM).
     Effect::new(move |_| {
-        let c = cursor.get();
-        rows.track();
-        if let Some(row) = list_ref.get().and_then(|list| list.children().item(c as u32)) {
-            dom::scroll_into_view(&row, ScrollLogicalPosition::Nearest);
+        let c = cursor.get() as i32;
+        let _ = rows.get();
+        let Some(list) = list_ref.get() else { return };
+        let (top, height, scrolled) = (c * ROW_HEIGHT, list.client_height(), list.scroll_top());
+        if top < scrolled {
+            list.set_scroll_top(top);
+        } else if top + ROW_HEIGHT > scrolled + height {
+            list.set_scroll_top(top + ROW_HEIGHT - height);
         }
     });
 
@@ -224,11 +242,33 @@ pub fn PanelView(app: App, side: usize) -> impl IntoView {
                 {header(Some(SortKey::Name), "Name", "c-name".into())}
                 {move || columns.get().into_iter().map(|c| header(c.sort_key(), c.title(), cell_class(c))).collect_view()}
             </div>
-            <div class="list" id=format!("list-{side}") node_ref=list_ref>
+            <div
+                class="list"
+                id=format!("list-{side}")
+                node_ref=list_ref
+                on:scroll=move |_| {
+                    if let Some(list) = list_ref.get_untracked() {
+                        scroll_top.set(list.scroll_top());
+                    }
+                }
+            >
+                <div style=move || format!("height:{}px", window.get().0 as i32 * ROW_HEIGHT)></div>
                 {move || {
+                    let (start, end) = window.get();
                     let columns = columns.get();
-                    rows.get().into_iter().enumerate().map(|(i, r)| row_view(i, r, &columns)).collect_view()
+                    rows.with(|r| {
+                        r[start..end]
+                            .iter()
+                            .cloned()
+                            .enumerate()
+                            .map(|(k, row)| row_view(start + k, row, &columns))
+                            .collect_view()
+                    })
                 }}
+                <div style=move || {
+                    let (_, end) = window.get();
+                    format!("height:{}px", (rows.with(Vec::len) - end) as i32 * ROW_HEIGHT)
+                }></div>
                 {move || empty().map(|text| view! { <div class="list-empty">{text}</div> })}
             </div>
             <span class="ch-probe" node_ref=probe aria-hidden="true">"0000000000"</span>
