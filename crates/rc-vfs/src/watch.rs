@@ -153,7 +153,9 @@ mod tests {
         })
         .unwrap();
         w.set([dir.as_path()]);
-        std::thread::sleep(Duration::from_millis(100));
+        // FSEvents (macOS) may still deliver the setup write after the watch starts:
+        // wait until the watcher has been quiet for a while.
+        while rx.recv_timeout(Duration::from_millis(700)).is_ok() {}
         let _ = std::fs::read_dir(&dir).unwrap().count();
         let _ = std::fs::read(dir.join("f")).unwrap();
         assert!(rx.recv_timeout(DEBOUNCE * 4).is_err(), "reads were reported as changes");
