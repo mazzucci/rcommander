@@ -44,7 +44,7 @@ pub struct ReadRequest {
     pub location: Location,
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct FileContent {
     pub location: Location,
     /// `None` for binary files.
@@ -52,6 +52,35 @@ pub struct FileContent {
     pub size: u64,
     /// The file was larger than the viewer limit and was cut.
     pub truncated: bool,
+}
+
+/// `POST /api/preview` with a [`ReadRequest`] → [`Preview`]: what Quick View (Ctrl+Q)
+/// shows for the entry under the cursor.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum Preview {
+    /// The beginning of a file.
+    File(FileContent),
+    Folder(FolderSummary),
+    /// Not something to read: a named pipe, socket or device (`what` says which).
+    Special {
+        location: Location,
+        what: String,
+    },
+}
+
+/// What a folder holds directly (subfolders are not entered).
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct FolderSummary {
+    pub location: Location,
+    pub folders: usize,
+    pub files: usize,
+    /// How many of the above are hidden (dot-files).
+    pub hidden: usize,
+    /// Total size of the files.
+    pub size: u64,
+    /// Counting stopped early (a very large folder): the numbers are a lower bound.
+    pub partial: bool,
 }
 
 /// `POST /api/diff` → [`DiffResponse`]. A missing side diffs against an empty file.

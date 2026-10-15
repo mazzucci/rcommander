@@ -5,7 +5,7 @@ use super::find::{self, Find};
 use super::views::{DiffView, Viewer};
 use crate::control::Request;
 use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
-use rc_core::api::{FileOp, OpResult};
+use rc_core::api::{FileOp, OpResult, Preview};
 use rc_core::api::{OnConflict, Progress};
 use rc_core::control::{Command, Reply};
 use rc_core::format::human_size;
@@ -152,7 +152,14 @@ pub struct App {
     /// Per panel: a git worker is running, and the newest request waiting behind it.
     git_busy: [bool; 2],
     git_pending: [Option<Location>; 2],
+    /// Quick View (Ctrl+Q): the other panel previews the entry under the cursor.
+    pub quick_view: bool,
+    /// What it shows: the entry (location, size, modified) and its preview.
+    pub preview: Option<(PreviewKey, Result<Preview, String>)>,
 }
+
+/// An entry as previewed; a change on disk (size or time) makes a new key.
+pub type PreviewKey = (Location, Option<u64>, Option<i64>);
 
 /// How long a changed row stays highlighted after a live refresh.
 pub const FLASH: Duration = Duration::from_millis(1500);
@@ -200,6 +207,8 @@ impl App {
             git_rx,
             git_busy: [false, false],
             git_pending: [None, None],
+            quick_view: false,
+            preview: None,
         };
         app.load(LEFT, left, None);
         app.load(RIGHT, right, None);
@@ -718,6 +727,8 @@ impl App {
         }
         changed |= self.tick_watch();
         changed |= self.tick_git();
+        // Live refresh may have changed the entry under the cursor.
+        changed |= self.sync_preview();
         if let Mode::Find(f) = &mut self.mode {
             changed |= f.poll();
         }
@@ -814,6 +825,10 @@ impl App {
             // Shows the place in the requested panel without moving the user's focus.
             Command::Goto { path, side } => {
                 let side = side.index(self.active);
+                // The panel is hidden behind Quick View: show it.
+                if side != self.active {
+                    self.quick_view = false;
+                }
                 let target = loc(&path);
                 let Location::Local { path: p } = &target;
                 let p = std::path::Path::new(p);
@@ -853,6 +868,9 @@ impl App {
             },
             Command::Select { mask, side } => {
                 reveal(&mut self.mode);
+                if side.index(self.active) != self.active {
+                    self.quick_view = false;
+                }
                 let n = self.panels[side.index(self.active)].select_mask(&mask, true);
                 self.info(format!("Selected {n} entries matching {mask}"));
             }
@@ -922,6 +940,13 @@ impl App {
     }
 
     pub fn handle_key(&mut self, key: KeyEvent) -> Effect {
+        let effect = self.dispatch_key(key);
+        // Right away, so the frame drawn after this key already shows it.
+        self.sync_preview();
+        effect
+    }
+
+    fn dispatch_key(&mut self, key: KeyEvent) -> Effect {
         let ctrl_c = key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL);
         match std::mem::replace(&mut self.mode, Mode::Normal) {
             Mode::Normal if ctrl_c => return self.request_quit(),
@@ -1025,7 +1050,8 @@ impl App {
         let marks = &mut self.settings.bookmarks;
         let here = self.panels[self.active].location.to_string();
         match key.code {
-            KeyCode::Esc | KeyCode::Char('q') => return,
+            KeyCode::Esc => return,
+            KeyCode::Char('q') if !has_command_modifier(key) => return,
             KeyCode::Up => cursor = cursor.saturating_sub(1),
             KeyCode::Down => cursor = (cursor + 1).min(marks.len().saturating_sub(1)),
             KeyCode::Char('a') if !marks.contains(&here) => {
@@ -1056,6 +1082,24 @@ impl App {
             _ => {}
         }
         self.mode = Mode::Hotlist(cursor);
+    }
+
+    /// Keep the Quick View preview on the entry under the cursor. Returns true if it
+    /// changed. Reads at most `PREVIEW_LIMIT` bytes, so it is cheap on every move.
+    pub fn sync_preview(&mut self) -> bool {
+        let key = self.quick_view.then(|| {
+            let p = self.active_panel();
+            p.current().map(|e| (p.location.join(&e.name), e.size, e.modified))
+        });
+        let key = key.flatten();
+        if key.as_ref() == self.preview.as_ref().map(|(k, _)| k) {
+            return false;
+        }
+        self.preview = key.map(|key| {
+            let preview = self.vfs.preview(&key.0).map_err(|e| format!("{e:#}"));
+            (key, preview)
+        });
+        true
     }
 
     /// Alt+F7: find files under the active panel's folder.
@@ -1187,7 +1231,8 @@ impl App {
             other => other,
         };
         match code {
-            KeyCode::Char('q') | KeyCode::F(10) => return self.request_quit(),
+            KeyCode::Char('q') if !ctrl => return self.request_quit(),
+            KeyCode::F(10) => return self.request_quit(),
             KeyCode::Up => self.active_mut().move_cursor(-1),
             KeyCode::Down => self.active_mut().move_cursor(1),
             KeyCode::PageUp => self.active_mut().move_cursor(-page),
@@ -1273,6 +1318,9 @@ impl App {
             }
             KeyCode::F(5) => self.start_copy_move(false),
             KeyCode::F(6) => self.start_copy_move(true),
+            // Shift+Q too, as in the browser (where Ctrl+Q can quit Firefox).
+            KeyCode::Char('q') if ctrl => self.quick_view = !self.quick_view,
+            KeyCode::Char('Q') => self.quick_view = !self.quick_view,
             KeyCode::F(7) if alt => self.open_find(),
             KeyCode::Char('F') => self.open_find(),
             KeyCode::F(7) => self.prompt("New directory".into(), String::new(), PromptAction::Mkdir),

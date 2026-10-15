@@ -1,6 +1,6 @@
 //! Rendering. Colors use the 256-color palette because macOS Terminal.app has no truecolor.
 
-use super::app::{App, EDITOR_ROW, HIDDEN_ROW, LEFT, Mode, Options};
+use super::app::{App, EDITOR_ROW, HIDDEN_ROW, LEFT, Mode, Options, RIGHT};
 use super::find::{Field, Find};
 use super::views::{DiffView, Viewer, sanitize};
 use chrono::{Local, Offset, TimeZone};
@@ -10,6 +10,7 @@ use ratatui::style::{Color, Modifier, Style, Stylize};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, BorderType, Cell, Clear, Paragraph, Row as TableRow, Table};
 use rc_core::Settings;
+use rc_core::api::Preview;
 use rc_core::diff::{DiffRow, RowKind, Side, Visible};
 use rc_core::dircmp::CmpMark;
 use rc_core::format::human_size;
@@ -43,8 +44,8 @@ pub fn draw(f: &mut Frame, app: &mut App) {
         Mode::Diff(d) => draw_diff(f, main, d),
         _ => {
             let [l, r] = Layout::horizontal([Constraint::Percentage(50); 2]).areas(main);
-            draw_panel(f, l, app, LEFT);
-            draw_panel(f, r, app, 1);
+            draw_side(f, l, app, LEFT);
+            draw_side(f, r, app, RIGHT);
         }
     }
 
@@ -183,6 +184,96 @@ fn panel_status(p: &Panel, settings: &Settings) -> String {
         };
     }
     s
+}
+
+/// A panel, or with Quick View on, the preview in the panel that is not active.
+fn draw_side(f: &mut Frame, area: Rect, app: &mut App, side: usize) {
+    if app.quick_view && side != app.active {
+        draw_preview(f, area, app);
+    } else {
+        draw_panel(f, area, app, side);
+    }
+}
+
+fn draw_preview(f: &mut Frame, area: Rect, app: &App) {
+    let name = app
+        .preview
+        .as_ref()
+        .and_then(|((loc, ..), _)| loc.file_name().map(str::to_string));
+    let title = elide_start(
+        &format!(
+            " Quick view{} ",
+            name.map(|n| format!(": {}", sanitize(&n))).unwrap_or_default()
+        ),
+        area.width.saturating_sub(4) as usize,
+    );
+    let mut block = Block::bordered()
+        .border_type(BorderType::Rounded)
+        .border_style(Style::new().fg(RULE))
+        .title(Line::raw(title).bold().fg(META));
+    let centered = |text: String, color: Color| (vec![Line::raw(text).fg(color)], true);
+    let (lines, center) = match app.preview.as_ref().map(|(_, p)| p) {
+        None => centered("Nothing to preview · Ctrl+Q close".into(), DIM),
+        Some(Err(e)) => centered(e.clone(), ERR),
+        Some(Ok(Preview::Special { what, .. })) => centered(format!("A {what}: nothing to show"), DIM),
+        Some(Ok(Preview::Folder(sum))) => {
+            let plural = |n: usize, w: &str| format!("{n} {w}{}", if n == 1 { "" } else { "s" });
+            let mut lines = vec![
+                Line::raw("Folder").fg(DIR).bold(),
+                Line::raw(""),
+                Line::raw(plural(sum.folders, "folder")).fg(TEXT),
+                Line::raw(format!("{} · {}", plural(sum.files, "file"), human_size(sum.size))).fg(TEXT),
+            ];
+            if sum.hidden > 0 {
+                lines.push(Line::raw(format!("{} hidden", sum.hidden)).fg(DIM));
+            }
+            lines.push(Line::raw(""));
+            lines.push(
+                Line::raw(if sum.partial {
+                    "Very large folder: counting stopped early"
+                } else {
+                    "Subfolders not included"
+                })
+                .fg(DIM),
+            );
+            (lines, true)
+        }
+        Some(Ok(Preview::File(c))) => match &c.text {
+            None => centered(format!("Binary file · {} · F3 to view", human_size(c.size)), DIM),
+            Some(text) => {
+                let note = if c.truncated {
+                    format!(" {} · beginning shown · F3 to view ", human_size(c.size))
+                } else {
+                    format!(" {} ", human_size(c.size))
+                };
+                block = block.title_bottom(Line::raw(note).fg(DIM));
+                let height = area.height.saturating_sub(2) as usize;
+                let gutter = text.lines().take(height).count().to_string().len();
+                let lines = text
+                    .lines()
+                    .take(height)
+                    .enumerate()
+                    .map(|(i, l)| {
+                        Line::from(vec![
+                            Span::raw(format!("{:>gutter$} ", i + 1)).fg(DIM),
+                            Span::raw(sanitize(l)).fg(TEXT),
+                        ])
+                    })
+                    .collect();
+                (lines, false)
+            }
+        },
+    };
+    let inner = block.inner(area);
+    f.render_widget(block, area);
+    if center {
+        let h = (lines.len() as u16).min(inner.height);
+        let [_, middle, _] =
+            Layout::vertical([Constraint::Fill(1), Constraint::Length(h), Constraint::Fill(1)]).areas(inner);
+        f.render_widget(Paragraph::new(lines).alignment(Alignment::Center), middle);
+    } else {
+        f.render_widget(Paragraph::new(lines), inner);
+    }
 }
 
 fn draw_panel(f: &mut Frame, area: Rect, app: &mut App, side: usize) {
@@ -780,6 +871,10 @@ fn draw_help(f: &mut Frame, area: Rect) {
         ("F5  F6", "copy / move or rename"),
         ("F7  F8", "new directory / delete to Trash (Shift: permanent)"),
         ("F9", "compare directories (toggle)"),
+        (
+            "Ctrl+Q  Shift+Q",
+            "quick view: the other panel previews the file or folder",
+        ),
         ("Alt+F7  Shift+F", "find files (name mask, text inside)"),
         ("1..9", "same as F1..F9 (Mac: no fn needed)"),
         ("q  F10  Ctrl+C", "quit"),
@@ -875,6 +970,49 @@ mod tests {
         }
         let s = screen(&mut app);
         assert!(s.contains("notes.md:2  find me") && s.contains("Go to"), "{s}");
+    }
+
+    #[test]
+    fn quick_view_previews_the_entry_under_the_cursor() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::create_dir(tmp.path().join("dir")).unwrap();
+        std::fs::write(tmp.path().join("dir/x"), "").unwrap();
+        std::fs::write(tmp.path().join("notes.txt"), "first line\nsecond line\n").unwrap();
+        std::fs::write(tmp.path().join("blob.bin"), b"\0\x01\x02").unwrap();
+        let loc = rc_core::Location::local(tmp.path().to_string_lossy());
+        let mut app = App::new(Arc::new(rc_vfs::Vfs::new()), loc.clone(), loc);
+        let ctrl_q = KeyEvent::new(KeyCode::Char('q'), KeyModifiers::CONTROL);
+        app.panels[0].focus_name("notes.txt");
+        app.handle_key(ctrl_q);
+        let s = screen(&mut app);
+        assert!(
+            s.contains("Quick view: notes.txt") && s.contains("2 second line"),
+            "{s}"
+        );
+        app.handle_key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE));
+        assert!(screen(&mut app).contains("Quick view: blob.bin"), "follows the cursor");
+        app.panels[0].focus_name("dir");
+        app.sync_preview();
+        let s = screen(&mut app);
+        assert!(s.contains("Quick view: dir") && s.contains("1 file"), "{s}");
+        app.panels[0].focus_name("blob.bin");
+        app.sync_preview();
+        assert!(screen(&mut app).contains("Binary file"));
+        // Tab: the preview moves to the other side, following the new active panel.
+        app.handle_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
+        assert!(screen(&mut app).contains("Quick view"));
+        app.handle_key(ctrl_q);
+        assert!(!screen(&mut app).contains("Quick view") && app.preview.is_none());
+
+        // A named pipe is described, never opened for reading (that would hang).
+        let fifo = tmp.path().join("pipe");
+        let c = std::ffi::CString::new(fifo.to_string_lossy().as_bytes()).unwrap();
+        assert_eq!(unsafe { libc::mkfifo(c.as_ptr(), 0o600) }, 0);
+        app.handle_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
+        app.handle_key(KeyEvent::new(KeyCode::Char('r'), KeyModifiers::CONTROL));
+        app.panels[app.active].focus_name("pipe");
+        app.handle_key(KeyEvent::new(KeyCode::Char('Q'), KeyModifiers::SHIFT));
+        assert!(screen(&mut app).contains("named pipe"));
     }
 
     #[test]

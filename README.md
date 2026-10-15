@@ -17,6 +17,7 @@ Runs on **Linux and macOS** (both built and tested in CI).
 - **Live refresh**: folders re-read themselves when files change, and changed rows light up.
 - **Safe file operations**: asks before overwriting (replace, replace older, keep existing), atomic replacement so a failed or cancelled copy never damages existing files, Trash instead of delete; both UIs show byte progress and cancel with Esc.
 - **Find files** (Alt+F7 or Shift+F): name masks and text inside files, then jump to a hit or view it at the matching line.
+- **Quick View** (Ctrl+Q or Shift+Q): the other panel previews the file under the cursor (or summarizes a folder) as you move.
 - **Directory compare** (F9), quick filter, selection masks, history (Alt+←/→), hotlist (Ctrl+D), zoxide jumps (terminal).
 - **Configurable columns**: permissions, owner, group, created, extension, git; hidden files; your editor for F4.
 - **Claude's changes**: every file Claude edits is logged with its original; press `c` to list them and F2 to review each one as a diff.
@@ -94,6 +95,7 @@ Both UIs share the key bindings below; the few differences are marked. `F1` or `
 | F5 / F6 | copy / move or rename; asks before overwriting: `o` replace existing, `u` replace older, `s` keep existing (folders are merged); shows byte progress, Esc cancels |
 | F7 / F8, Delete | new directory / delete to Trash (Shift+F8: permanent) |
 | F9 | compare directories (toggle) |
+| Ctrl+Q, Shift+Q | quick view: the other panel previews the file (or folder) under the cursor |
 | Alt+F7, Shift+F | find files: name mask (`*.rs;*.toml`, a plain word matches inside names) and text inside (case-sensitive only with capitals); Enter go to, F3 view |
 | `1`..`9` | same as F1..F9, so Mac laptops don't need the fn key |
 | `q` F10 Ctrl+C | quit (terminal only) |

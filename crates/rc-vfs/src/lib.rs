@@ -9,14 +9,16 @@ pub mod local;
 pub mod settings;
 pub mod watch;
 
-use anyhow::{Result, bail};
+use anyhow::{Context, Result, bail};
 use local::Copied;
-use rc_core::api::{Conflicts, DiffResponse, FileContent, FileOp, OpResult, Progress};
+use rc_core::api::{Conflicts, DiffResponse, FileContent, FileOp, OpResult, Preview, Progress};
 use rc_core::{Listing, Location, diff};
 use std::path::{Path, PathBuf};
 
 /// Files larger than this are cut in the viewer and diff.
 pub const VIEW_LIMIT: u64 = 8 << 20;
+/// Bytes of a file Quick View reads: enough to fill a panel, cheap on every cursor move.
+pub const PREVIEW_LIMIT: u64 = 256 << 10;
 #[derive(Default)]
 pub struct Vfs {}
 
@@ -98,9 +100,29 @@ impl Vfs {
     }
 
     pub fn read_content(&self, loc: &Location) -> Result<FileContent> {
-        let (bytes, size) = self.read(loc, VIEW_LIMIT + 1)?;
-        let truncated = bytes.len() as u64 > VIEW_LIMIT;
-        let bytes = &bytes[..bytes.len().min(VIEW_LIMIT as usize)];
+        self.read_limited(loc, VIEW_LIMIT)
+    }
+
+    /// Quick View: the beginning of a file, or what a folder holds.
+    pub fn preview(&self, loc: &Location) -> Result<Preview> {
+        let Location::Local { path } = loc;
+        let meta = std::fs::metadata(path).with_context(|| format!("cannot open {path}"))?;
+        if meta.is_dir() {
+            local::summarize(path).map(Preview::Folder)
+        } else if meta.is_file() {
+            self.read_limited(loc, PREVIEW_LIMIT).map(Preview::File)
+        } else {
+            Ok(Preview::Special {
+                location: loc.clone(),
+                what: local::special_kind(&meta.file_type()).into(),
+            })
+        }
+    }
+
+    fn read_limited(&self, loc: &Location, limit: u64) -> Result<FileContent> {
+        let (bytes, size) = self.read(loc, limit + 1)?;
+        let truncated = bytes.len() as u64 > limit;
+        let bytes = &bytes[..bytes.len().min(limit as usize)];
         Ok(FileContent {
             location: loc.clone(),
             text: (!diff::looks_binary(bytes)).then(|| String::from_utf8_lossy(bytes).into_owned()),
@@ -388,6 +410,49 @@ mod tests {
     use super::*;
     use rc_core::api::OnConflict;
     use std::ops::ControlFlow;
+
+    #[test]
+    fn preview_reads_the_beginning_of_files_and_summarizes_folders() {
+        let tmp = tempfile::tempdir().unwrap();
+        let p = tmp.path();
+        std::fs::create_dir(p.join("sub")).unwrap();
+        std::fs::write(p.join("small.txt"), "hello\n").unwrap();
+        std::fs::write(p.join(".hidden"), "x").unwrap();
+        std::fs::write(p.join("big.txt"), "y".repeat(PREVIEW_LIMIT as usize + 10)).unwrap();
+        std::os::unix::fs::symlink(p.join("sub"), p.join("link")).unwrap();
+        let vfs = Vfs::new();
+        let loc = |n: &str| Location::local(p.join(n).to_string_lossy());
+
+        let Preview::File(small) = vfs.preview(&loc("small.txt")).unwrap() else {
+            panic!()
+        };
+        assert_eq!((small.text.as_deref(), small.truncated), (Some("hello\n"), false));
+        let Preview::File(big) = vfs.preview(&loc("big.txt")).unwrap() else {
+            panic!()
+        };
+        assert!(big.truncated && big.text.unwrap().len() == PREVIEW_LIMIT as usize);
+        assert_eq!(big.size, PREVIEW_LIMIT + 10);
+
+        let Preview::Folder(sum) = vfs.preview(&Location::local(p.to_string_lossy())).unwrap() else {
+            panic!()
+        };
+        assert_eq!(
+            (sum.folders, sum.files, sum.hidden, sum.partial),
+            (2, 3, 1, false),
+            "{sum:?}"
+        );
+        assert_eq!(sum.size, 6 + 1 + PREVIEW_LIMIT + 10);
+        assert!(vfs.preview(&loc("missing")).is_err());
+        // A named pipe is refused at once instead of blocking on open.
+        let fifo = p.join("pipe");
+        let c = std::ffi::CString::new(fifo.to_string_lossy().as_bytes()).unwrap();
+        assert_eq!(unsafe { libc::mkfifo(c.as_ptr(), 0o600) }, 0);
+        let Preview::Special { what, .. } = vfs.preview(&loc("pipe")).unwrap() else {
+            panic!()
+        };
+        assert_eq!(what, "named pipe");
+        assert!(vfs.read_content(&loc("pipe")).is_err());
+    }
 
     #[cfg(unix)]
     #[test]

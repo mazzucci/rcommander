@@ -11,6 +11,7 @@ mod hotlist;
 mod modal;
 mod options;
 mod panel_view;
+mod quick_view;
 mod viewer;
 
 fn main() {

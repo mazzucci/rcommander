@@ -120,6 +120,13 @@ pub fn PanelView(app: App, side: usize) -> impl IntoView {
         }
     });
     let resize = window_event_listener(ev::resize, move |_| measure());
+    // Hidden behind Quick View it measures nothing: measure again when it comes back.
+    let previewed = Memo::new(move |_| app.previewing(side));
+    Effect::new(move |_| {
+        if !previewed.get() {
+            request_animation_frame(measure);
+        }
+    });
     on_cleanup(move || resize.remove());
     let columns = Memo::new(move |_| {
         let width = width_chars.get();
@@ -246,6 +253,7 @@ pub fn PanelView(app: App, side: usize) -> impl IntoView {
         <div
             class="panel"
             class:active=is_active
+            class:previewed=previewed
             style=move || columns.with(|c| grid_columns(c))
             on:mousedown=move |_| app.active.set(side)
         >

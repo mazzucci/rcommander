@@ -7,6 +7,7 @@ use crate::hotlist::HotlistView;
 use crate::modal::{Modal, ModalKind, ModalView};
 use crate::options::OptionsView;
 use crate::panel_view::PanelView;
+use crate::quick_view::QuickView;
 use crate::viewer::Viewer;
 use crate::{api, dom, events};
 use leptos::ev;
@@ -87,6 +88,8 @@ pub struct App {
     pub modal: RwSignal<Option<Modal>>,
     pub options_open: RwSignal<bool>,
     pub hotlist_open: RwSignal<bool>,
+    /// Quick View (Ctrl+Q): the panel that is not active previews the cursor's entry.
+    pub quick_view: RwSignal<bool>,
     /// Find files (Alt+F7) is open, and its form and last results.
     pub find_open: RwSignal<bool>,
     pub find: FindForm,
@@ -145,6 +148,7 @@ impl App {
             modal: RwSignal::new(None),
             options_open: RwSignal::new(false),
             hotlist_open: RwSignal::new(false),
+            quick_view: RwSignal::new(false),
             find_open: RwSignal::new(false),
             find: FindForm::new(),
             find_return: StoredValue::new(false),
@@ -168,6 +172,18 @@ impl App {
 
     fn active_side(self) -> usize {
         self.active.get_untracked()
+    }
+
+    /// Quick View shows in panel `side` in place of its listing (tracked).
+    pub fn previewing(self, side: usize) -> bool {
+        self.quick_view.get() && self.active.get() != side
+    }
+
+    /// Remote control acting on a panel hidden behind Quick View: show it.
+    fn show_panel(self, side: usize) {
+        if side != self.active_side() {
+            self.quick_view.set(false);
+        }
     }
 
     /// A dialog or overlay has the keyboard (tracked, for the view).
@@ -265,12 +281,14 @@ impl App {
             // Shows the place without moving the user's focus, as in the terminal UI.
             BrowserEvent::Navigate { side, location, focus } => {
                 reveal();
+                self.show_panel(side.index(active));
                 self.show(side.index(active), location, focus, Nav::Visit, |_| {});
             }
             BrowserEvent::Diff { left, right } => self.open_diff(api::diff(left, right)),
             BrowserEvent::View { location, line } => self.view_at(location, line),
             BrowserEvent::Select { side, mask } => {
                 reveal();
+                self.show_panel(side.index(active));
                 let n = self.panels[side.index(active)]
                     .try_update(|p| p.select_mask(&mask, true))
                     .unwrap_or(0);
@@ -1081,6 +1099,8 @@ impl App {
             (false, "o") => self.options_open.set(true),
             (false, "?") => self.overlay.set(Some(Overlay::Help)),
             (true, "d") => self.hotlist_open.set(true),
+            // Shift+Q too: Firefox on Linux quits on Ctrl+Q.
+            (true, "q") | (false, "Q") => self.quick_view.update(|on| *on = !*on),
             (true, "r") => self.refresh_both(),
             (true, "u") => self.swap_panels(),
             _ => return,
@@ -1152,7 +1172,13 @@ pub fn Root() -> impl IntoView {
         <div class="app" inert=move || app.covered()>
             <div class="panels">
                 <PanelView app side=LEFT/>
+                <Show when=move || app.previewing(LEFT)>
+                    <QuickView app side=LEFT/>
+                </Show>
                 <PanelView app side=RIGHT/>
+                <Show when=move || app.previewing(RIGHT)>
+                    <QuickView app side=RIGHT/>
+                </Show>
             </div>
             <footer class="footer">
                 <span class="msg-area">
