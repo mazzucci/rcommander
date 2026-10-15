@@ -209,11 +209,15 @@ impl App {
                     self.scroll[side] = 0;
                     // Highlights belong to the directory they were made in.
                     self.flash[side].clear();
-                    if record && !self.panels[side].location.to_string().is_empty() {
-                        self.history[side].visit(self.panels[side].location.clone());
+                    // Only places the user chose count (like a shell's cd hook), not
+                    // back/forward steps.
+                    if record {
+                        if !self.panels[side].location.to_string().is_empty() {
+                            self.history[side].visit(self.panels[side].location.clone());
+                        }
+                        let Location::Local { path } = &listing.location;
+                        zoxide_add(path);
                     }
-                    let Location::Local { path } = &listing.location;
-                    zoxide_add(path);
                 }
                 self.panels[side].set_listing(listing, focus);
                 true
@@ -234,17 +238,27 @@ impl App {
         } else {
             self.history[side].back(current)
         };
-        let Some(target) = target else { return };
+        let Some(mut target) = target else { return };
         // Put the cursor back where we were when coming back out of a subdirectory.
         let came_from = self.panels[side].location.clone();
-        let focus = (came_from.parent().as_ref() == Some(&target))
-            .then(|| came_from.file_name().map(str::to_string))
-            .flatten();
-        if !self.show(side, target.clone(), focus.as_deref(), false) {
-            if forward {
-                self.history[side].undo_forward(target);
+        loop {
+            let focus = (came_from.parent().as_ref() == Some(&target))
+                .then(|| came_from.file_name().map(str::to_string))
+                .flatten();
+            if self.show(side, target, focus.as_deref(), false) {
+                return;
+            }
+            // That place is gone: forget it and try the next one.
+            let next = if forward {
+                self.history[side].discard_forward();
+                self.history[side].forward(came_from.clone())
             } else {
-                self.history[side].undo_back(target);
+                self.history[side].discard_back();
+                self.history[side].back(came_from.clone())
+            };
+            match next {
+                Some(t) => target = t,
+                None => return,
             }
         }
     }
@@ -429,7 +443,7 @@ impl App {
                     if select { "Selected" } else { "Deselected" }
                 ));
             }
-            PromptAction::Zoxide => match zoxide_query(input) {
+            PromptAction::Zoxide => match zoxide_query(input, &base.to_string()) {
                 Ok(path) => {
                     self.load(self.active, Location::local(path), None);
                 }
@@ -805,7 +819,12 @@ impl App {
                     _ => cursor,
                 };
                 if let Some(path) = marks.get(index).cloned() {
-                    self.load(self.active, Location::local(path), None);
+                    // Bookmarks may be hand-edited: allow ~ and relative paths.
+                    let base = self.panels[self.active].location.clone();
+                    if let Some(loc) = Location::resolve_input(&path, &base) {
+                        let loc = self.vfs.normalize(loc, Some(&base));
+                        self.load(self.active, loc, None);
+                    }
                     return;
                 }
             }
@@ -990,10 +1009,11 @@ fn zoxide_add(path: &str) {
 }
 
 /// Ask zoxide for the best match for `query` (space-separated keywords).
-fn zoxide_query(query: &str) -> Result<String, String> {
+fn zoxide_query(query: &str, current: &str) -> Result<String, String> {
     let words: Vec<&str> = query.split_whitespace().collect();
     let out = std::process::Command::new("zoxide")
-        .args(["query", "--"])
+        // Like the shell's `z`: never "jump" to where we already are.
+        .args(["query", "--exclude", current, "--"])
         .args(&words)
         .output()
         .map_err(|_| "zoxide is not installed (https://github.com/ajeetdsouza/zoxide)".to_string())?;
@@ -1403,6 +1423,31 @@ mod tests {
         );
         app.handle_key(key(KeyCode::Char(']')));
         assert_eq!(app.panels[LEFT].location, sub);
+    }
+
+    #[test]
+    fn history_skips_deleted_places() {
+        let (tmp, mut app) = setup();
+        let start = app.panels[LEFT].location.clone();
+        fs::create_dir(tmp.path().join("left/sub/gone")).unwrap();
+        app.panels[LEFT].focus_name("sub");
+        app.handle_key(key(KeyCode::Enter));
+        app.panels[LEFT].focus_name("gone");
+        app.handle_key(key(KeyCode::Enter));
+        app.handle_key(key(KeyCode::Char('g')));
+        app.handle_key(KeyEvent::new(KeyCode::Char('u'), KeyModifiers::CONTROL));
+        typed(&mut app, &tmp.path().join("right").to_string_lossy());
+        app.handle_key(key(KeyCode::Enter));
+        fs::remove_dir(tmp.path().join("left/sub/gone")).unwrap();
+        // Back: "gone" no longer exists, so it lands on sub; back again reaches the start.
+        app.handle_key(key(KeyCode::Char('[')));
+        assert!(
+            app.panels[LEFT].location.to_string().ends_with("/left/sub"),
+            "{}",
+            app.panels[LEFT].location
+        );
+        app.handle_key(key(KeyCode::Char('[')));
+        assert_eq!(app.panels[LEFT].location, start);
     }
 
     #[test]

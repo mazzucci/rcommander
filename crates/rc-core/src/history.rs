@@ -37,15 +37,15 @@ impl History {
         Some(to)
     }
 
-    /// Undo a `back`/`forward` whose target could not be shown.
-    pub fn undo_back(&mut self, target: Location) {
+    /// The target of the last `back` could not be shown (e.g. it was deleted): forget
+    /// it, leaving the current place where it was, so the next `back` goes further.
+    pub fn discard_back(&mut self) {
         self.forward.pop();
-        self.back.push(target);
     }
 
-    pub fn undo_forward(&mut self, target: Location) {
+    /// Like [`History::discard_back`], for `forward`.
+    pub fn discard_forward(&mut self) {
         self.back.pop();
-        self.forward.push(target);
     }
 }
 
@@ -71,12 +71,30 @@ mod tests {
     }
 
     #[test]
-    fn undo_restores_state() {
+    fn dead_entries_are_skipped() {
         let l = |s: &str| Location::local(s);
         let mut h = History::default();
+        h.visit(l("/older"));
         h.visit(l("/gone"));
-        let to = h.back(l("/here")).unwrap();
-        h.undo_back(to);
         assert_eq!(h.back(l("/here")), Some(l("/gone")));
+        h.discard_back();
+        assert_eq!(h.back(l("/here")), Some(l("/older")), "goes past the dead entry");
+        assert_eq!(h.forward(l("/older")), Some(l("/here")));
+    }
+
+    #[test]
+    fn limit_keeps_the_newest() {
+        let mut h = History::default();
+        for i in 0..150 {
+            h.visit(Location::local(format!("/{i}")));
+        }
+        let mut n = 0;
+        let mut at = Location::local("/now");
+        while let Some(prev) = h.back(at.clone()) {
+            at = prev;
+            n += 1;
+        }
+        assert_eq!(n, 100);
+        assert_eq!(at, Location::local("/50"));
     }
 }
