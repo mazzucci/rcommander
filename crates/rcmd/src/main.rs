@@ -70,7 +70,23 @@ enum CtlAction {
     /// content from stdin (for showing an edit without writing a temp file yourself).
     Diff { left: String, right: String },
     /// Open a file in the viewer.
-    View { path: String },
+    View {
+        path: String,
+        /// Scroll to this line (1-based) and highlight it.
+        #[arg(long)]
+        line: Option<usize>,
+    },
+    /// Record that FILE is about to be edited, reading its current content from stdin.
+    /// The first recording of a file keeps its original for "Claude's changes".
+    Track { file: String },
+    /// Show "Claude's changes", the files an agent edited, in a panel.
+    Changes {
+        #[arg(long, value_enum, default_value_t = SideArg::Active)]
+        side: SideArg,
+        /// Forget all recorded changes instead (the files stay as they are).
+        #[arg(long)]
+        clear: bool,
+    },
     /// Select entries matching a mask such as '*.rs'.
     Select {
         mask: String,
@@ -150,7 +166,32 @@ fn ctl(action: CtlAction, pid: Option<u32>, timeout: u64) -> anyhow::Result<()> 
             };
             RemoteCommand::Diff { left, right }
         }
-        CtlAction::View { path } => RemoteCommand::View { path: absolute(&path) },
+        CtlAction::View { path, line } => RemoteCommand::View {
+            path: absolute(&path),
+            line,
+        },
+        CtlAction::Track { file } => {
+            use std::io::Read;
+            // One byte over the cap is enough to know it is too large.
+            let mut original = Vec::new();
+            std::io::stdin()
+                .take(rc_vfs::changes::MAX_ORIGINAL + 1)
+                .read_to_end(&mut original)?;
+            control::changes_log()?.record(std::path::Path::new(&absolute(&file)), &original)?;
+            // Panels showing the log pick the new entry up; no running rcmd is fine.
+            let _ = control::send(&RemoteCommand::Refresh, pid, std::time::Duration::from_secs(timeout));
+            return Ok(());
+        }
+        CtlAction::Changes { side, clear: true } => {
+            let _ = side;
+            control::changes_log()?.clear()?;
+            let _ = control::send(&RemoteCommand::Refresh, pid, std::time::Duration::from_secs(timeout));
+            return Ok(());
+        }
+        CtlAction::Changes { side, clear: false } => RemoteCommand::Goto {
+            path: control::changes_log()?.links_dir().to_string_lossy().into_owned(),
+            side: side.into(),
+        },
         CtlAction::Select { mask, side } => RemoteCommand::Select {
             mask,
             side: side.into(),

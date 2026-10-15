@@ -15,8 +15,12 @@ pub enum Command {
     },
     /// Open the side-by-side diff of two files.
     Diff { left: String, right: String },
-    /// Open a file in the viewer.
-    View { path: String },
+    /// Open a file in the viewer, optionally at a (1-based) line, which is highlighted.
+    View {
+        path: String,
+        #[serde(default)]
+        line: Option<usize>,
+    },
     /// Select entries matching a wildcard mask such as `*.rs`.
     Select {
         mask: String,

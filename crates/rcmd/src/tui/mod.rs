@@ -24,6 +24,7 @@ pub fn run(mut app: App) -> Result<()> {
             None
         }
     };
+    app.change_log = crate::control::changes_log().ok();
     if let Err(e) = app.enable_live_refresh() {
         app.message = Some((format!("live refresh unavailable: {e:#}"), true));
     }

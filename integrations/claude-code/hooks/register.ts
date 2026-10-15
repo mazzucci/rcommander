@@ -25,9 +25,13 @@ async function ctl(
 /** Following must never slow Claude down: give up quickly if rcmd is busy or stopped. */
 const FOLLOW = { timeoutMs: 3_000 }
 
+/** Matches rcmd's cap on saved originals (8 MiB). */
+const MAX_ORIGINAL = 8 * 1024 * 1024
+
 export const register: Register = (on, options) => {
   const rcmd = typeof options.rcmd_path === 'string' && options.rcmd_path ? options.rcmd_path : 'rcmd'
   const follow: Follow = options.follow === 'off' || options.follow === 'diff' ? options.follow : 'goto'
+  const track = options.track_changes !== false
 
   on('session.start', async ($, e, next) => {
     const started = await next(e)
@@ -48,6 +52,7 @@ export const register: Register = (on, options) => {
           path: { type: 'string', description: 'Absolute path of a file or directory.' },
           compare_with: { type: 'string', description: 'Optional second file: opens a diff of path vs this.' },
           view: { type: 'boolean', description: 'Open the file in the viewer instead of the panel.' },
+          line: { type: 'integer', description: 'Open the file in the viewer at this line (1-based), highlighted.' },
         },
         required: ['path'],
       },
@@ -66,31 +71,38 @@ export const register: Register = (on, options) => {
     const path = typeof e.path === 'string' ? e.path : ''
     if (!path) return { deny: 'path is required' }
     // `--` keeps paths that start with a dash from being read as options.
+    const line = typeof e.line === 'number' && e.line > 0 ? Math.floor(e.line) : undefined
     const args =
       typeof e.compare_with === 'string' && e.compare_with
         ? ['diff', '--', path, e.compare_with]
-        : e.view === true
-          ? ['view', '--', path]
-          : ['goto', '--', path]
+        : line !== undefined
+          ? ['view', '--line', String(line), '--', path]
+          : e.view === true
+            ? ['view', '--', path]
+            : ['goto', '--', path]
     const error = await ctl($, rcmd, args)
-    return error ? { deny: `rcommander: ${error}` } : { result: `Shown in rcommander (${args[0]} ${args.slice(2).join(' ')}).` }
+    return error ? { deny: `rcommander: ${error}` } : { result: `Shown in rcommander (${args[0]} ${path}${line ? `:${line}` : ''}).` }
   }).catch(() => ({ deny: 'rcommander: showing it failed.' }))
 
-  if (follow === 'off') return
+  if (follow === 'off' && !track) return
 
   for (const tool of EDIT_TOOLS) {
     on('tool.call', { tool }, async ($, e, next) => {
       const file = typeof e.file_path === 'string' ? e.file_path : undefined
       if (!file) return next(e)
-      // For a diff, keep the file as it was before the edit (empty if it is new). It goes
-      // to rcmd on stdin; nothing is written to disk here.
-      const before = follow === 'diff' ? await $.fs.read(file).then(t => (typeof t === 'string' ? t : ''), () => '') : undefined
+      // The file as it was before the edit (empty if it is new). It goes to rcmd on stdin;
+      // nothing is written to disk here.
+      const before =
+        track || follow === 'diff' ? await $.fs.read(file).then(t => (typeof t === 'string' ? t : ''), () => '') : ''
+      // rcmd keeps originals up to 8 MiB; don't send what it would refuse.
+      const keep = track && before.length <= MAX_ORIGINAL
       const ran = await next(e)
       if (ran.deny === undefined && ran.isError !== true) {
-        // rcommander may not be running; following is best effort and silent.
-        await (before === undefined
-          ? ctl($, rcmd, ['goto', '--side', 'other', '--', file], FOLLOW)
-          : ctl($, rcmd, ['diff', '--', '-', file], { ...FOLLOW, stdin: before }))
+        // rcommander may not be running; all of this is best effort and silent.
+        // `track` keeps only the first original of each file, for "Claude's changes".
+        if (keep) await ctl($, rcmd, ['track', '--', file], { ...FOLLOW, stdin: before })
+        if (follow === 'goto') await ctl($, rcmd, ['goto', '--side', 'other', '--', file], FOLLOW)
+        if (follow === 'diff') await ctl($, rcmd, ['diff', '--', '-', file], { ...FOLLOW, stdin: before })
       }
       return ran
     })
