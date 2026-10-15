@@ -1,29 +1,85 @@
 //! `rcmd`: a Total Commander-style dual-pane file manager.
+//!
+//! `rcmd [LEFT] [RIGHT]` starts the terminal UI; `rcmd web [LEFT] [RIGHT]` serves the
+//! browser UI on 127.0.0.1 and opens it.
 
+mod server;
 mod tui;
 
-use clap::Parser;
+use clap::{Parser, Subcommand};
 use rc_core::Location;
 use rc_vfs::Vfs;
 use std::sync::Arc;
 
 #[derive(Parser)]
-#[command(version, about)]
+#[command(version, about, args_conflicts_with_subcommands = true)]
 struct Cli {
+    #[command(subcommand)]
+    command: Option<Command>,
+    #[command(flatten)]
+    dirs: Dirs,
+}
+
+#[derive(clap::Args)]
+struct Dirs {
     /// Directory for the left panel (default: current directory).
     left: Option<String>,
     /// Directory for the right panel (default: home directory).
     right: Option<String>,
 }
 
+#[derive(Subcommand)]
+enum Command {
+    /// Serve the browser UI on 127.0.0.1 and open it.
+    Web {
+        #[command(flatten)]
+        dirs: Dirs,
+        #[arg(long, default_value_t = 7878)]
+        port: u16,
+        /// Don't open a browser, just print the URL.
+        #[arg(long)]
+        no_open: bool,
+        /// Browser application to use, e.g. "Google Chrome" (default: system browser).
+        #[arg(long)]
+        browser: Option<String>,
+    },
+}
+
+impl Dirs {
+    fn locations(self) -> (Location, Location) {
+        let (left, right) = Vfs::default_locations();
+        (
+            self.left.map(Location::local).unwrap_or(left),
+            self.right.map(Location::local).unwrap_or(right),
+        )
+    }
+}
+
 fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
-    let (default_left, default_right) = Vfs::default_locations();
-    let pick = |arg: Option<String>, default| arg.map(Location::local).unwrap_or(default);
-    let app = tui::App::new(
-        Arc::new(Vfs::new()),
-        pick(cli.left, default_left),
-        pick(cli.right, default_right),
-    );
-    tui::run(app)
+    let vfs = Arc::new(Vfs::new());
+    match cli.command {
+        None => {
+            let (left, right) = cli.dirs.locations();
+            tui::run(tui::App::new(vfs, left, right))
+        }
+        Some(Command::Web {
+            dirs,
+            port,
+            no_open,
+            browser,
+        }) => {
+            let (left, right) = dirs.locations();
+            server::run(
+                vfs,
+                server::Config {
+                    port,
+                    open_browser: !no_open,
+                    browser,
+                    left,
+                    right,
+                },
+            )
+        }
+    }
 }
