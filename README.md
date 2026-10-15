@@ -10,13 +10,29 @@ Runs on **Linux and macOS** (both are built and tested in CI). Deleting moves fi
 |-------|---------|
 | `crates/rc-core` | Platform-independent model: locations, panel state (cursor, selection, sort, filter), side-by-side diff engine, directory compare, HTTP API types. Compiles to native and `wasm32`. |
 | `crates/rc-vfs`  | Native back end: local filesystem listing, reading, copy/move/delete (to Trash)/mkdir. |
-| `crates/rcmd`    | The `rcmd` binary: terminal UI. |
+| `crates/rcmd`    | The `rcmd` binary: terminal UI, and `rcmd web`, a local server for the browser UI. |
+| `crates/rc-web`  | Browser UI (Leptos), compiled to WebAssembly with [trunk](https://trunk-rs.github.io/trunk/). |
 
 ## Usage
+
+Terminal UI:
 
 ```sh
 cargo run --release -p rcmd -- [LEFT_DIR] [RIGHT_DIR]
 ```
+
+Browser UI (opens your default browser; `--browser "Google Chrome"` to pick one, `--no-open` to just print the URL):
+
+```sh
+rustup target add wasm32-unknown-unknown
+cargo install trunk --locked                       # or download a release binary
+(cd crates/rc-web && trunk build --release)        # builds crates/rc-web/dist
+cargo run --release -p rcmd -- web [LEFT_DIR] [RIGHT_DIR]
+```
+
+Release builds embed the built front end, so the resulting `rcmd` binary is self-contained. The server listens on 127.0.0.1 only and every API call needs the random token from the URL it prints.
+
+Both UIs share the key bindings below.
 
 | Key | Action |
 |-----|--------|

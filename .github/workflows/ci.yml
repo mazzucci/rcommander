@@ -41,6 +41,8 @@ jobs:
 
   wasm:
     runs-on: ubuntu-latest
+    env:
+      TRUNK_VERSION: v0.21.14
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -48,5 +50,11 @@ jobs:
           targets: wasm32-unknown-unknown
           components: clippy
       - uses: Swatinem/rust-cache@v2
-      # The shared model must stay free of native-only dependencies.
-      - run: cargo clippy -p rc-core --target wasm32-unknown-unknown --locked
+      # The shared model must stay free of native-only dependencies. (Lib only: the
+      # test harness doesn't build for wasm32.)
+      - run: cargo clippy -p rc-core -p rc-web --target wasm32-unknown-unknown --locked
+      - name: Install trunk
+        run: curl -sSL "https://github.com/trunk-rs/trunk/releases/download/$TRUNK_VERSION/trunk-x86_64-unknown-linux-musl.tar.gz" | tar xz -C ~/.cargo/bin
+      - name: Build the web front end
+        run: trunk build --release
+        working-directory: crates/rc-web
