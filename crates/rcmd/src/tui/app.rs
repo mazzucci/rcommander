@@ -10,7 +10,7 @@ use rc_core::control::{Command, Reply};
 use rc_core::format::human_size;
 use rc_core::history::History;
 use rc_core::panel::SortKey;
-use rc_core::{Column, Location, Panel, Row, Settings, dircmp};
+use rc_core::{Column, GitStatus, Location, Panel, Row, Settings, dircmp};
 use rc_vfs::Vfs;
 use rc_vfs::changes::ChangeLog;
 use rc_vfs::watch::DirWatcher;
@@ -19,7 +19,7 @@ use std::ops::ControlFlow;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::mpsc::{self, Receiver, TryRecvError};
+use std::sync::mpsc::{self, Receiver, Sender, TryRecvError};
 use std::time::{Duration, Instant};
 
 pub const LEFT: usize = 0;
@@ -141,6 +141,10 @@ pub struct App {
     /// Entries that changed in a live refresh, highlighted briefly.
     pub flash: [HashMap<String, Instant>; 2],
     history: [History; 2],
+    /// Git statuses computed off the UI thread: (panel, request id, folder, statuses).
+    git_tx: Sender<(usize, u64, Location, HashMap<String, GitStatus>)>,
+    git_rx: Receiver<(usize, u64, Location, HashMap<String, GitStatus>)>,
+    git_seq: [u64; 2],
 }
 
 /// How long a changed row stays highlighted after a live refresh.
@@ -165,6 +169,7 @@ impl App {
         for p in &mut panels {
             p.show_hidden = settings.show_hidden;
         }
+        let (git_tx, git_rx) = mpsc::channel();
         let mut app = App {
             vfs,
             panels,
@@ -184,6 +189,9 @@ impl App {
             watched_locations: [Location::local(""), Location::local("")],
             flash: [HashMap::new(), HashMap::new()],
             history: [History::default(), History::default()],
+            git_tx,
+            git_rx,
+            git_seq: [0, 0],
         };
         app.load(LEFT, left, None);
         app.load(RIGHT, right, None);
@@ -217,13 +225,24 @@ impl App {
 
     /// List `loc` into a panel; `record` adds the place we leave to the back history.
     fn show(&mut self, side: usize, loc: Location, focus: Option<&str>, record: bool) -> bool {
-        let listed = if self.settings.shows(Column::Git) {
-            self.vfs.list_with_git(&loc)
-        } else {
-            self.vfs.list(&loc)
-        };
-        match listed {
-            Ok(listing) => {
+        // Git status can take a while in big repositories: list now, and let a worker
+        // fill in the Git column (see `tick_git`).
+        match self.vfs.list(&loc) {
+            Ok(mut listing) => {
+                if self.settings.shows(Column::Git) {
+                    if listing.location == self.panels[side].location {
+                        // Keep the letters we had until fresh ones arrive (no flicker).
+                        let previous: HashMap<&str, GitStatus> = self.panels[side]
+                            .entries()
+                            .iter()
+                            .filter_map(|e| Some((e.name.as_str(), e.git?)))
+                            .collect();
+                        for e in &mut listing.entries {
+                            e.git = previous.get(e.name.as_str()).copied();
+                        }
+                    }
+                    self.request_git(side, &listing.location);
+                }
                 if listing.location != self.panels[side].location {
                     self.scroll[side] = 0;
                     // Highlights belong to the directory they were made in.
@@ -246,6 +265,30 @@ impl App {
                 false
             }
         }
+    }
+
+    /// Compute git statuses for a panel's folder on a worker thread.
+    fn request_git(&mut self, side: usize, loc: &Location) {
+        self.git_seq[side] += 1;
+        let (seq, tx, loc) = (self.git_seq[side], self.git_tx.clone(), loc.clone());
+        std::thread::spawn(move || {
+            let Location::Local { path } = &loc;
+            let statuses = rc_vfs::git::statuses(std::path::Path::new(path));
+            let _ = tx.send((side, seq, loc, statuses));
+        });
+    }
+
+    /// Apply git statuses that arrived, if the panel still shows that folder and no newer
+    /// request is pending.
+    fn tick_git(&mut self) -> bool {
+        let mut changed = false;
+        while let Ok((side, seq, loc, statuses)) = self.git_rx.try_recv() {
+            if seq == self.git_seq[side] && self.panels[side].location == loc {
+                self.panels[side].set_git_statuses(&statuses);
+                changed = true;
+            }
+        }
+        changed
     }
 
     /// Alt+← / Alt+→: step through the panel's history.
@@ -646,6 +689,7 @@ impl App {
             changed = true;
         }
         changed |= self.tick_watch();
+        changed |= self.tick_git();
         self.tick_job() || changed
     }
 
@@ -1591,6 +1635,19 @@ mod tests {
         git(&["-c", "user.name=t", "-c", "user.email=t@e", "commit", "-qm", "x"]).unwrap();
         fs::write(left.join("b.txt"), "changed\n").unwrap();
         app.refresh(LEFT);
+        // Statuses arrive from a worker thread.
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while Instant::now() < deadline
+            && app.panels[LEFT]
+                .entries()
+                .iter()
+                .find(|e| e.name == "b.txt")
+                .and_then(|e| e.git)
+                .is_none()
+        {
+            app.tick();
+            std::thread::sleep(Duration::from_millis(10));
+        }
         assert_eq!(
             app.panels[LEFT]
                 .entries()
@@ -1599,6 +1656,17 @@ mod tests {
                 .unwrap()
                 .git,
             Some(rc_core::GitStatus::Modified)
+        );
+        // A refresh keeps the letters until the new ones arrive, so the column doesn't flicker.
+        app.refresh(LEFT);
+        assert!(
+            app.panels[LEFT]
+                .entries()
+                .iter()
+                .find(|e| e.name == "b.txt")
+                .unwrap()
+                .git
+                .is_some()
         );
         // The right panel has no b.txt, so F2 compares with HEAD.
         app.panels[LEFT].focus_name("b.txt");
