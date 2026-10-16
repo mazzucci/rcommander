@@ -31,6 +31,10 @@ const KEYS: &[(&str, &str)] = &[
         "Shift+F6  M  Ctrl+M",
         "multi-rename: mask, search/replace, case, counter",
     ),
+    (
+        "i  I",
+        "Claude map of the file or folder: Tab into it, Enter go, F3 view; I regenerate",
+    ),
     ("Ctrl+D", "hotlist (bookmarks)"),
     ("c", "Claude's changes: F2 diff vs original, F8 forget"),
     ("o", "options: columns, hidden files, editor"),

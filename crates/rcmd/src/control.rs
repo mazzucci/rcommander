@@ -55,6 +55,28 @@ pub fn changes_log() -> Result<rc_vfs::changes::ChangeLog> {
     rc_vfs::changes::ChangeLog::open(&dir)
 }
 
+/// Where Claude maps are cached: `~/.cache/rcommander/maps` (Linux; the platform's cache
+/// folder elsewhere), private to this user. `None` if it cannot be set up: maps then
+/// still work, uncached.
+pub fn maps_cache() -> Option<PathBuf> {
+    let base = dirs::cache_dir()?;
+    std::fs::create_dir_all(&base).ok()?;
+    let dir = base.join("rcommander");
+    secure_dir(&dir).ok()?;
+    let maps = dir.join("maps");
+    secure_dir(&maps).ok()?;
+    Some(maps)
+}
+
+/// A map maker for the current settings.
+pub fn mapper(settings: &rc_core::Settings) -> rc_vfs::map::Mapper {
+    rc_vfs::map::Mapper {
+        command: settings.claude_command.clone(),
+        model: settings.claude_model.clone(),
+        cache: maps_cache(),
+    }
+}
+
 /// Create `dir` as 0700 if missing, then insist it is ours and private.
 pub fn secure_dir(dir: &Path) -> Result<()> {
     use std::os::unix::fs::{DirBuilderExt, MetadataExt};

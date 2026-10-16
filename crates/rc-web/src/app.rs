@@ -4,6 +4,7 @@ use crate::diff_view::DiffView;
 use crate::find::{FindForm, FindView};
 use crate::help::HelpView;
 use crate::hotlist::HotlistView;
+use crate::map_view::{MapTarget, MapView};
 use crate::modal::{Modal, ModalKind, ModalView};
 use crate::options::OptionsView;
 use crate::panel_view::PanelView;
@@ -93,6 +94,11 @@ pub struct App {
     pub rename: RwSignal<Option<RenameTarget>>,
     /// Quick View (Ctrl+Q): the panel that is not active previews the cursor's entry.
     pub quick_view: RwSignal<bool>,
+    /// Claude map (`i`) shown in the panel that is not active, and whether it has the
+    /// keyboard.
+    pub map: RwSignal<Option<MapTarget>>,
+    pub map_focused: RwSignal<bool>,
+    map_seq: StoredValue<u64>,
     /// Find files (Alt+F7) is open, and its form and last results.
     pub find_open: RwSignal<bool>,
     pub find: FindForm,
@@ -153,6 +159,9 @@ impl App {
             hotlist_open: RwSignal::new(false),
             rename: RwSignal::new(None),
             quick_view: RwSignal::new(false),
+            map: RwSignal::new(None),
+            map_focused: RwSignal::new(false),
+            map_seq: StoredValue::new(0),
             find_open: RwSignal::new(false),
             find: FindForm::new(),
             find_return: StoredValue::new(false),
@@ -179,14 +188,36 @@ impl App {
     }
 
     /// Quick View shows in panel `side` in place of its listing (tracked).
+    /// Quick View or the Claude map shows in panel `side` in place of its listing (tracked).
     pub fn previewing(self, side: usize) -> bool {
-        self.quick_view.get() && self.active.get() != side
+        (self.quick_view.get() || self.map.with(Option::is_some)) && self.active.get() != side
+    }
+
+    /// `i`: Claude's map of the entry under the cursor (of the folder itself on ".."), or
+    /// close it. `I` asks Claude again instead of using the cache.
+    fn toggle_map(self, refresh: bool) {
+        if !refresh && self.map.with_untracked(Option::is_some) {
+            self.map.set(None);
+            return;
+        }
+        let location = match self.map.get_untracked() {
+            Some(open) if refresh => open.location,
+            _ => self.panels[self.active_side()].with_untracked(|p| match p.current() {
+                Some(e) => p.location.join(&e.name),
+                None => p.location.clone(),
+            }),
+        };
+        let seq = self.map_seq.get_value() + 1;
+        self.map_seq.set_value(seq);
+        self.quick_view.set(false);
+        self.map.set(Some(MapTarget { location, refresh, seq }));
     }
 
     /// Remote control acting on a panel hidden behind Quick View: show it.
     fn show_panel(self, side: usize) {
         if side != self.active_side() {
             self.quick_view.set(false);
+            self.map.set(None);
         }
     }
 
@@ -554,7 +585,7 @@ impl App {
     }
 
     /// Open the viewer, optionally at a line.
-    fn view_at(self, location: Location, line: Option<usize>) {
+    pub fn view_at(self, location: Location, line: Option<usize>) {
         self.request(api::read(location), move |content| {
             dom::blur_active();
             self.overlay.set(Some(Overlay::View(Arc::new(content), line)));
@@ -1099,7 +1130,17 @@ impl App {
             (false, "[") => self.history_step(false),
             (false, "]") => self.history_step(true),
             (true, "s") => panel.update(Panel::cycle_sort),
+            // With a map open, Tab moves the keyboard into it.
+            (false, "Tab") if self.map.with_untracked(Option::is_some) => {
+                if let Some(el) = dom::by_id(&format!("map-body-{}", 1 - side))
+                    && let Ok(el) = wasm_bindgen::JsCast::dyn_into::<web_sys::HtmlElement>(el)
+                {
+                    let _ = el.focus();
+                }
+            }
             (false, "Tab") => self.active.set(1 - side),
+            (false, "i") => self.toggle_map(false),
+            (false, "I") => self.toggle_map(true),
             (false, " " | "Insert") => panel.update(Panel::toggle_current),
             (false, "+") => self.ask_mask(true),
             (false, "-") => self.ask_mask(false),
@@ -1128,7 +1169,10 @@ impl App {
             (false, "?") => self.overlay.set(Some(Overlay::Help)),
             (true, "d") => self.hotlist_open.set(true),
             // Shift+Q too: Firefox on Linux quits on Ctrl+Q.
-            (true, "q") | (false, "Q") => self.quick_view.update(|on| *on = !*on),
+            (true, "q") | (false, "Q") => {
+                self.map.set(None);
+                self.quick_view.update(|on| *on = !*on);
+            }
             (true, "r") => self.refresh_both(),
             (true, "u") => self.swap_panels(),
             _ => return,
@@ -1177,6 +1221,9 @@ pub fn Root() -> impl IntoView {
         document().set_title(if path.is_empty() { "rcommander" } else { &path });
     });
     app.start();
+    // The map shown on each side; a memo, so clicks that leave it as it is (setting the
+    // active panel again) do not rebuild it.
+    let map_on = [LEFT, RIGHT].map(|side| Memo::new(move |_| app.map.get().filter(|_| app.previewing(side))));
     // Closing a viewer opened from Find files goes back to the results.
     Effect::new(move |_| {
         if app.overlay.with(Option::is_none) && app.find_return.get_value() {
@@ -1200,13 +1247,15 @@ pub fn Root() -> impl IntoView {
         <div class="app" inert=move || app.covered()>
             <div class="panels">
                 <PanelView app side=LEFT/>
-                <Show when=move || app.previewing(LEFT)>
+                <Show when=move || app.previewing(LEFT) && app.quick_view.get()>
                     <QuickView app side=LEFT/>
                 </Show>
+                {move || map_on[LEFT].get().map(|target| view! { <MapView app side=LEFT target/> })}
                 <PanelView app side=RIGHT/>
-                <Show when=move || app.previewing(RIGHT)>
+                <Show when=move || app.previewing(RIGHT) && app.quick_view.get()>
                     <QuickView app side=RIGHT/>
                 </Show>
+                {move || map_on[RIGHT].get().map(|target| view! { <MapView app side=RIGHT target/> })}
             </div>
             <footer class="footer">
                 <span class="msg-area">

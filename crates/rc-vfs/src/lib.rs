@@ -6,6 +6,7 @@ pub mod changes;
 pub mod find;
 pub mod git;
 pub mod local;
+pub mod map;
 pub mod settings;
 pub mod watch;
 
@@ -366,7 +367,7 @@ pub fn check_program(program: &str) -> Result<()> {
     if found {
         Ok(())
     } else {
-        bail!("editor `{program}` not found")
+        bail!("`{program}` not found (not an executable file, nor on PATH)")
     }
 }
 

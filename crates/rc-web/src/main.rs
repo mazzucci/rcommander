@@ -8,6 +8,7 @@ mod events;
 mod find;
 mod help;
 mod hotlist;
+mod map_view;
 mod modal;
 mod options;
 mod panel_view;

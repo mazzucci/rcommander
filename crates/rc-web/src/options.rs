@@ -117,6 +117,34 @@ pub fn OptionsView(app: App) -> impl IntoView {
                     "The browser UI starts the editor without a terminal, so use a GUI command such as "
                     <code>"code"</code> " or " <code>"open -t"</code> ", not " <code>"vim"</code> "."
                 </div>
+                <div class="opt-row">
+                    <label class="opt-field">
+                        "Claude map model (i)"
+                        <input
+                            type="text"
+                            class="modal-input"
+                            spellcheck="false"
+                            placeholder="sonnet"
+                            prop:value=move || draft.with(|s| s.claude_model.clone())
+                            on:input=move |ev| draft.update(|s| s.claude_model = event_target_value(&ev))
+                        />
+                    </label>
+                    <label class="opt-field">
+                        "Claude command"
+                        <input
+                            type="text"
+                            class="modal-input"
+                            spellcheck="false"
+                            placeholder="claude"
+                            prop:value=move || draft.with(|s| s.claude_command.clone())
+                            on:input=move |ev| draft.update(|s| s.claude_command = event_target_value(&ev))
+                        />
+                    </label>
+                </div>
+                <div class="opt-note">
+                    "Maps run your Claude Code with read-only tools; the file contents they read go to Claude. "
+                    "Model: " <code>"haiku"</code> ", " <code>"sonnet"</code> " or " <code>"opus"</code> "."
+                </div>
                 {move || error.get().map(|e| view! { <div class="modal-error" role="alert">{e}</div> })}
                 <div class="modal-buttons">
                     <button class="primary" on:click=move |_| save()>

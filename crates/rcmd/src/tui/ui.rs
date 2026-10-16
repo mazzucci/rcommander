@@ -1,7 +1,8 @@
 //! Rendering. Colors use the 256-color palette because macOS Terminal.app has no truecolor.
 
-use super::app::{App, EDITOR_ROW, HIDDEN_ROW, LEFT, Mode, Options, RIGHT};
+use super::app::{App, CLAUDE_ROW, EDITOR_ROW, HIDDEN_ROW, LEFT, MODEL_ROW, Mode, Options, RIGHT};
 use super::find::{Field, Find};
+use super::map::MapState;
 use super::rename::{self, MultiRename};
 use super::views::{DiffView, Viewer, sanitize};
 use chrono::{Local, Offset, TimeZone};
@@ -51,7 +52,8 @@ pub fn draw(f: &mut Frame, app: &mut App) {
     }
 
     draw_message(f, message, app);
-    draw_keys(f, keys, &app.mode);
+    let map_focused = app.map.as_ref().is_some_and(|m| m.focused);
+    draw_keys(f, keys, &app.mode, map_focused);
     if let Mode::Find(find) = &mut app.mode {
         draw_find(f, main, find);
     }
@@ -192,11 +194,187 @@ fn panel_status(p: &Panel, settings: &Settings) -> String {
 
 /// A panel, or with Quick View on, the preview in the panel that is not active.
 fn draw_side(f: &mut Frame, area: Rect, app: &mut App, side: usize) {
-    if app.quick_view && side != app.active {
+    if app.map.is_some() && side != app.active {
+        draw_map(f, area, app);
+    } else if app.quick_view && side != app.active {
         draw_preview(f, area, app);
     } else {
         draw_panel(f, area, app, side);
     }
+}
+
+/// Greedy word wrap to `width` columns (long words are cut).
+fn wrap(text: &str, width: usize) -> Vec<String> {
+    let width = width.max(8);
+    let mut lines = Vec::new();
+    for para in text.lines() {
+        let mut line = String::new();
+        for word in para.split_whitespace() {
+            let mut word = word.to_string();
+            while word.chars().count() > width {
+                let head: String = word.chars().take(width).collect();
+                if !line.is_empty() {
+                    lines.push(std::mem::take(&mut line));
+                }
+                lines.push(head);
+                word = word.chars().skip(width).collect();
+            }
+            if !line.is_empty() && line.chars().count() + 1 + word.chars().count() > width {
+                lines.push(std::mem::take(&mut line));
+            }
+            if !line.is_empty() {
+                line.push(' ');
+            }
+            line.push_str(&word);
+        }
+        lines.push(line);
+    }
+    lines
+}
+
+/// A map link as shown: relative to `base` when inside it (the base itself by `name`),
+/// else absolute.
+fn relative(path: &str, base: &str, name: &str) -> String {
+    if path == base {
+        return name.to_string();
+    }
+    let prefix = format!("{}/", base.trim_end_matches('/'));
+    path.strip_prefix(&prefix).unwrap_or(path).to_string()
+}
+
+fn draw_map(f: &mut Frame, area: Rect, app: &mut App) {
+    let Some(map) = &mut app.map else { return };
+    let name = map.target.file_name().unwrap_or("/").to_string();
+    let title = elide_start(
+        &format!(" Claude map: {} ", sanitize(&name)),
+        area.width.saturating_sub(4) as usize,
+    );
+    let mut block = Block::bordered()
+        .border_type(BorderType::Rounded)
+        .border_style(Style::new().fg(if map.focused { ACCENT } else { RULE }))
+        .title(
+            Line::raw(title)
+                .bold()
+                .fg(if map.focused { Color::White } else { META }),
+        );
+    let inner_width = area.width.saturating_sub(2) as usize;
+    let centered = |lines: Vec<Line<'static>>| (lines, None::<usize>, true);
+    let (lines, cursor_line, center) = match &map.state {
+        MapState::Loading { started } => centered(vec![
+            Line::raw(format!(
+                "Claude is reading {}… {} s",
+                sanitize(&name),
+                started.elapsed().as_secs()
+            ))
+            .fg(SELECTED),
+            Line::raw(""),
+            Line::raw("i closes (and stops it)").fg(DIM),
+        ]),
+        MapState::Failed(e) => {
+            let mut lines: Vec<Line> = wrap(e, inner_width.saturating_sub(4))
+                .into_iter()
+                .map(|l| Line::raw(l).fg(ERR))
+                .collect();
+            lines.push(Line::raw(""));
+            lines.push(Line::raw("I tries again · i closes").fg(DIM));
+            centered(lines)
+        }
+        MapState::Ready(m) => {
+            let age = (std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |d| d.as_secs() as i64)
+                - m.generated)
+                .max(0);
+            let age = match age {
+                0..60 => "just now".to_string(),
+                60..3600 => format!("{} min ago", age / 60),
+                3600..86400 => format!("{} h ago", age / 3600),
+                _ => format!("{} days ago", age / 86400),
+            };
+            let cost = m
+                .cost_usd
+                .filter(|_| !m.cached)
+                .map(|c| format!(" · ${c:.2}"))
+                .unwrap_or_default();
+            let cached = if m.cached { " · cached" } else { "" };
+            block =
+                block.title_bottom(Line::raw(format!(" {} · {age}{cost}{cached} · I regenerate ", m.model)).fg(DIM));
+            let mut lines: Vec<Line> = wrap(&sanitize(&m.summary.replace('`', "")), inner_width.saturating_sub(2))
+                .into_iter()
+                .map(|l| Line::raw(format!(" {l}")).fg(TEXT))
+                .collect();
+            // Links are shown relative to the folder mapped (or the file's folder).
+            let base = if m.is_dir {
+                Some(map.target.clone())
+            } else {
+                map.target.parent()
+            };
+            let base = base.unwrap_or_else(|| map.target.clone()).to_string();
+            let mut link = 0;
+            let mut cursor_line = None;
+            for section in &m.sections {
+                lines.push(Line::raw(""));
+                lines.push(Line::raw(format!(" {}", sanitize(&section.heading))).fg(ACCENT).bold());
+                for item in &section.items {
+                    let text = sanitize(&item.text.replace('`', ""));
+                    let Some(path) = &item.path else {
+                        for (k, l) in wrap(&text, inner_width.saturating_sub(4)).into_iter().enumerate() {
+                            lines.push(Line::raw(format!("{}{l}", if k == 0 { " · " } else { "   " })).fg(META));
+                        }
+                        continue;
+                    };
+                    let rel = relative(path, &base, &name);
+                    let mut target = sanitize(&rel);
+                    if item.is_dir {
+                        target.push('/');
+                    }
+                    if let Some(n) = item.line {
+                        target += &format!(":{n}");
+                    }
+                    let selected = link == map.cursor;
+                    if selected {
+                        cursor_line = Some(lines.len());
+                    }
+                    let mut first = Line::from(vec![
+                        Span::raw(" ▸ ").fg(if selected { ACCENT } else { DIM }),
+                        Span::raw(target).fg(if item.is_dir { DIR } else { TEXT }).bold(),
+                    ]);
+                    if selected && map.focused {
+                        first = first.bg(CURSOR_ACTIVE);
+                    } else if selected {
+                        first = first.bg(CURSOR_INACTIVE);
+                    }
+                    lines.push(first);
+                    for l in wrap(&text, inner_width.saturating_sub(5)) {
+                        lines.push(Line::raw(format!("     {l}")).fg(META));
+                    }
+                    link += 1;
+                }
+            }
+            (lines, cursor_line, false)
+        }
+    };
+    let inner = block.inner(area);
+    f.render_widget(block, area);
+    if center {
+        let h = (lines.len() as u16).min(inner.height);
+        let [_, middle, _] =
+            Layout::vertical([Constraint::Fill(1), Constraint::Length(h), Constraint::Fill(1)]).areas(inner);
+        f.render_widget(Paragraph::new(lines).alignment(Alignment::Center), middle);
+        return;
+    }
+    // Keep the selected link (and the line after it) in view.
+    let height = inner.height as usize;
+    if let Some(c) = cursor_line {
+        if c < map.scroll {
+            map.scroll = c.saturating_sub(1);
+        } else if c + 2 > map.scroll + height {
+            map.scroll = (c + 2).saturating_sub(height);
+        }
+    }
+    map.scroll = map.scroll.min(lines.len().saturating_sub(height));
+    let visible: Vec<Line> = lines.into_iter().skip(map.scroll).take(height).collect();
+    f.render_widget(Paragraph::new(visible), inner);
 }
 
 fn draw_preview(f: &mut Frame, area: Rect, app: &App) {
@@ -437,8 +615,16 @@ fn draw_message(f: &mut Frame, area: Rect, app: &App) {
     f.render_widget(Paragraph::new(line), area);
 }
 
-fn draw_keys(f: &mut Frame, area: Rect, mode: &Mode) {
+fn draw_keys(f: &mut Frame, area: Rect, mode: &Mode, map_focused: bool) {
     let keys: &[(&str, &str)] = match mode {
+        Mode::Normal if map_focused => &[
+            ("↑↓", "Link"),
+            ("Enter", "Go to"),
+            ("F3", "View"),
+            ("Tab/Esc", "Panels"),
+            ("I", "Regenerate"),
+            ("i", "Close"),
+        ],
         Mode::Viewer(_) | Mode::FindView(..) => {
             &[("Esc", "Close"), ("↑↓", "Scroll"), ("←→", "Pan"), ("PgUp/PgDn", "Page")]
         }
@@ -662,12 +848,32 @@ fn draw_options(f: &mut Frame, area: Rect, o: &Options, settings: &Settings) {
         row(i, format!("{} {}", check(settings.shows(*c)), c.label()));
     }
     row(HIDDEN_ROW, format!("{} Show hidden files", check(settings.show_hidden)));
-    let editor = match &o.editing {
-        Some(text) => format!("{text}█"),
-        None if settings.editor.is_empty() => "($VISUAL / $EDITOR)".into(),
-        None => settings.editor.clone(),
+    let field = |r: usize, value: &str, empty: &str| match &o.editing {
+        Some(text) if o.cursor == r => format!("{text}█"),
+        _ if value.is_empty() => empty.to_string(),
+        _ => value.to_string(),
     };
-    row(EDITOR_ROW, format!("Editor (F4): {editor}"));
+    row(
+        EDITOR_ROW,
+        format!(
+            "Editor (F4): {}",
+            field(EDITOR_ROW, &settings.editor, "($VISUAL / $EDITOR)")
+        ),
+    );
+    row(
+        MODEL_ROW,
+        format!(
+            "Claude map model (i): {}",
+            field(MODEL_ROW, &settings.claude_model, "(sonnet)")
+        ),
+    );
+    row(
+        CLAUDE_ROW,
+        format!(
+            "Claude command: {}",
+            field(CLAUDE_ROW, &settings.claude_command, "(claude)")
+        ),
+    );
     lines.push(Line::raw(""));
     lines.push(
         Line::raw(if o.editing.is_some() {
@@ -998,6 +1204,10 @@ fn draw_help(f: &mut Frame, area: Rect) {
         ("F5  F6", "copy / move or rename"),
         ("F7  F8", "new directory / delete to Trash (Shift: permanent)"),
         ("F9", "compare directories (toggle)"),
+        (
+            "i  I",
+            "Claude map of the file/folder: Tab into it, Enter go, F3 view; I regenerate",
+        ),
         ("Shift+F6  M", "multi-rename: mask, search/replace, case, counter"),
         (
             "Ctrl+Q  Shift+Q",
@@ -1188,6 +1398,71 @@ mod tests {
             "a.TXT",
             "in panel order"
         );
+    }
+
+    #[test]
+    fn claude_map_panel_links_into_the_tree() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = tempfile::tempdir().unwrap();
+        let tools = tempfile::tempdir().unwrap();
+        std::fs::create_dir(tmp.path().join("src")).unwrap();
+        std::fs::write(tmp.path().join("src/main.rs"), "// hi\nfn main() {}\n").unwrap();
+        let answer = r#"{"is_error":false,"total_cost_usd":0.03,"structured_output":{"summary":"A tiny Rust program that does nothing yet.","sections":[{"heading":"Entry points","items":[{"text":"starts here","path":"src/main.rs","line":2},{"text":"invented","path":"src/gone.rs","line":1}]},{"heading":"Layout","items":[{"text":"sources","path":"src","line":null}]}]}}"#;
+        let fake = tools.path().join("claude");
+        std::fs::write(&fake, format!("#!/bin/sh\ncat <<'EOF'\n{answer}\nEOF\n")).unwrap();
+        std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let loc = rc_core::Location::local(tmp.path().to_string_lossy());
+        let mut app = App::new(Arc::new(rc_vfs::Vfs::new()), loc.clone(), loc);
+        app.settings.claude_command = fake.to_string_lossy().into();
+        let press = |app: &mut App, code: KeyCode| {
+            app.handle_key(KeyEvent::new(code, KeyModifiers::NONE));
+        };
+
+        // On "..": the map of the folder itself.
+        app.panels[0].cursor_home();
+        press(&mut app, KeyCode::Char('I'));
+        let start = std::time::Instant::now();
+        while matches!(app.map.as_ref().map(|m| &m.state), Some(MapState::Loading { .. })) {
+            app.tick();
+            assert!(start.elapsed().as_secs() < 10);
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        let s = screen(&mut app);
+        assert!(
+            s.contains("Claude map") && s.contains("tiny Rust program") && s.contains("Entry points"),
+            "{s}"
+        );
+        assert!(
+            s.contains("src/main.rs:2") && s.contains("· invented"),
+            "made-up links are plain text: {s}"
+        );
+
+        // Tab into the map, follow the second link (the folder).
+        press(&mut app, KeyCode::Tab);
+        assert!(app.map.as_ref().unwrap().focused);
+        press(&mut app, KeyCode::Down);
+        press(&mut app, KeyCode::Enter);
+        assert_eq!(app.panels[0].current().unwrap().name, "src");
+        // F3 on the first link: the viewer at line 2.
+        press(&mut app, KeyCode::Up);
+        press(&mut app, KeyCode::F(3));
+        let Mode::Viewer(v) = &app.mode else {
+            panic!("no viewer")
+        };
+        assert_eq!(v.mark, Some(1));
+        press(&mut app, KeyCode::Esc);
+        press(&mut app, KeyCode::Esc);
+        assert!(!app.map.as_ref().unwrap().focused, "Esc gives the keyboard back");
+        press(&mut app, KeyCode::Char('i'));
+        assert!(app.map.is_none(), "i closes the map");
+    }
+
+    #[test]
+    fn map_links_are_relative_only_inside_the_base() {
+        assert_eq!(relative("/a/src/main.rs", "/a/src", "src"), "main.rs");
+        assert_eq!(relative("/a/src-tauri/x", "/a/src", "src"), "/a/src-tauri/x");
+        assert_eq!(relative("/a/src", "/a/src", "src"), "src");
+        assert_eq!(relative("/etc/x", "/", "/"), "etc/x");
     }
 
     #[test]
