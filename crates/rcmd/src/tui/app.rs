@@ -62,8 +62,9 @@ pub const HIDDEN_ROW: usize = Column::ALL.len();
 pub const EDITOR_ROW: usize = Column::ALL.len() + 1;
 pub const MODEL_ROW: usize = Column::ALL.len() + 2;
 pub const CLAUDE_ROW: usize = Column::ALL.len() + 3;
+pub const DEPTH_ROW: usize = Column::ALL.len() + 4;
 /// Rows edited as text (Space/Enter edits, Enter keeps).
-const TEXT_ROWS: [usize; 3] = [EDITOR_ROW, MODEL_ROW, CLAUDE_ROW];
+const TEXT_ROWS: [usize; 4] = [EDITOR_ROW, MODEL_ROW, CLAUDE_ROW, DEPTH_ROW];
 
 pub struct Prompt {
     pub title: String,
@@ -1023,6 +1024,15 @@ impl App {
                     let value = text.trim().to_string();
                     match o.cursor {
                         MODEL_ROW => self.settings.claude_model = value,
+                        DEPTH_ROW => match value.parse::<usize>() {
+                            Ok(n) if (1..=20).contains(&n) => self.settings.claude_depth = n,
+                            _ if value.is_empty() => self.settings.claude_depth = 0,
+                            _ => {
+                                self.error("Depth: a number from 1 to 20 (empty: 4)");
+                                self.mode = Mode::Options(o);
+                                return;
+                            }
+                        },
                         CLAUDE_ROW => match value.split_whitespace().next().map(rc_vfs::check_program) {
                             Some(Err(e)) => {
                                 self.error(format!("{e:#}"));
@@ -1053,11 +1063,15 @@ impl App {
                 return;
             }
             KeyCode::Up => o.cursor = o.cursor.saturating_sub(1),
-            KeyCode::Down => o.cursor = (o.cursor + 1).min(CLAUDE_ROW),
+            KeyCode::Down => o.cursor = (o.cursor + 1).min(DEPTH_ROW),
             KeyCode::Char(' ') | KeyCode::Enter => match o.cursor {
                 EDITOR_ROW => o.editing = Some(self.settings.editor.clone()),
                 MODEL_ROW => o.editing = Some(self.settings.claude_model.clone()),
                 CLAUDE_ROW => o.editing = Some(self.settings.claude_command.clone()),
+                DEPTH_ROW => {
+                    let d = self.settings.claude_depth;
+                    o.editing = Some(if d == 0 { String::new() } else { d.to_string() });
+                }
                 HIDDEN_ROW => {
                     self.settings.show_hidden = !self.settings.show_hidden;
                     // Apply right away so the effect is visible.
@@ -1205,8 +1219,26 @@ impl App {
     /// Keys while the map has the keyboard (Tab).
     fn map_key(&mut self, key: KeyEvent) -> Effect {
         let page = self.page.max(1) as isize;
+        let mapper = crate::control::mapper(&self.settings);
         let Some(map) = &mut self.map else { return Effect::None };
+        // Typing a question: every key goes into it.
+        if let Some(text) = &mut map.asking {
+            match key.code {
+                KeyCode::Enter => map.send_question(mapper),
+                KeyCode::Esc => map.asking = None,
+                KeyCode::Backspace => drop(text.pop()),
+                KeyCode::Char(c) if !has_command_modifier(key) && text.chars().count() < rc_vfs::map::MAX_QUESTION => {
+                    text.push(c)
+                }
+                _ => {}
+            }
+            return Effect::None;
+        }
+        let ready = matches!(map.state, super::map::MapState::Ready(_));
         match key.code {
+            // Ask Claude about the map.
+            KeyCode::Char('a') if ready && map.pending.is_none() => map.asking = Some(String::new()),
+            KeyCode::Esc if map.pending.is_some() => map.cancel_question(),
             KeyCode::Up => map.move_cursor(-1),
             KeyCode::Down => map.move_cursor(1),
             KeyCode::PageUp => map.move_cursor(-page),

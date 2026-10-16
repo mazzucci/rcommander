@@ -3,8 +3,8 @@
 use gloo_net::http::Request;
 use rc_core::api::{
     ApiError, Conflicts, DiffRequest, DiffResponse, FileContent, FileMap, FileOp, FindRequest, FindResult,
-    ForgetRequest, InitResponse, JobRequest, JobStatus, ListRequest, MapRequest, OpResult, OpenRequest, Preview,
-    ReadRequest,
+    ForgetRequest, InitResponse, JobRequest, JobStatus, ListRequest, MapAnswer, MapQuestion, MapRequest, OpResult,
+    OpenRequest, Preview, ReadRequest,
 };
 use rc_core::{Listing, Location, Settings};
 use serde::Serialize;
@@ -143,6 +143,11 @@ pub async fn find(req: FindRequest, job: String) -> Result<FindResult, String> {
 /// Claude's map of a file or folder; `job` lets [`job`] follow it and [`cancel`] stop it.
 pub async fn map(location: Location, refresh: bool, job: String) -> Result<FileMap, String> {
     call(&format!("map?job={job}"), &MapRequest { location, refresh }).await
+}
+
+/// A question to Claude about a map; `job` lets [`job`] follow it and [`cancel`] stop it.
+pub async fn map_ask(question: MapQuestion, job: String) -> Result<MapAnswer, String> {
+    call(&format!("map/ask?job={job}"), &question).await
 }
 
 /// Progress of a running operation.

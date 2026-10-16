@@ -21,7 +21,7 @@ use axum::routing::post;
 use axum::{Json, Router};
 use rc_core::api::{ApiError, DiffRequest, FileOp, InitResponse, ListRequest, OpenRequest, ReadRequest};
 use rc_core::api::{
-    BrowserEvent, ChangesDirs, FindRequest, ForgetRequest, JobRequest, JobStatus, MapRequest, Progress,
+    BrowserEvent, ChangesDirs, FindRequest, ForgetRequest, JobRequest, JobStatus, MapQuestion, MapRequest, Progress,
 };
 use rc_core::control::{Command, Reply};
 use rc_core::{Location, Settings};
@@ -359,6 +359,7 @@ fn router(state: AppState, port: u16) -> Router {
         .route("/op", post(op))
         .route("/find", post(find))
         .route("/map", post(map))
+        .route("/map/ask", post(map_ask))
         .route("/job", post(job_status))
         .route("/cancel", post(cancel_job))
         .route("/conflicts", post(conflicts))
@@ -593,6 +594,24 @@ async fn map(
     blocking(move || {
         let mapper = crate::control::mapper(&s.settings.read().expect("settings lock"));
         mapper.map(&s.vfs.normalize(req.location, None), req.refresh, &mut reporter(&entry))
+    })
+    .await
+}
+
+/// A question to Claude about a map; with `?job=ID` it can be followed and cancelled.
+async fn map_ask(
+    State(s): State<AppState>,
+    q: Result<Query<OpQuery>, QueryRejection>,
+    Json(mut req): Json<MapQuestion>,
+) -> Response {
+    let entry = match job_from_query(&s, q) {
+        Ok(entry) => entry,
+        Err((status, msg)) => return api_error(status, msg),
+    };
+    blocking(move || {
+        req.map.location = s.vfs.normalize(req.map.location, None);
+        let mapper = crate::control::mapper(&s.settings.read().expect("settings lock"));
+        mapper.ask(&req.map, &req.thread, &req.question, &mut reporter(&entry))
     })
     .await
 }
