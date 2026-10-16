@@ -25,6 +25,7 @@ pub struct MapPanel {
     /// First visible line, kept up to date by the renderer.
     pub scroll: usize,
     rx: Option<Receiver<Result<FileMap, String>>>,
+    worker: Option<std::thread::JoinHandle<()>>,
     /// Seconds shown by the loading timer.
     shown_secs: u64,
     cancel: Arc<AtomicBool>,
@@ -43,7 +44,7 @@ impl MapPanel {
         let cancel = Arc::new(AtomicBool::new(false));
         let stop = Arc::clone(&cancel);
         let loc = target.clone();
-        std::thread::spawn(move || {
+        let worker = std::thread::spawn(move || {
             let result = mapper.map(&loc, refresh, &mut |_| {
                 if stop.load(Ordering::Relaxed) {
                     ControlFlow::Break(())
@@ -62,6 +63,7 @@ impl MapPanel {
             cursor: 0,
             scroll: 0,
             rx: Some(rx),
+            worker: Some(worker),
             shown_secs: 0,
             cancel,
         }
@@ -95,6 +97,14 @@ impl MapPanel {
         }
     }
 
+    /// Stop Claude and wait until it is gone (quitting must not leave it running).
+    pub fn stop(&mut self) {
+        self.cancel.store(true, Ordering::Relaxed);
+        if let Some(worker) = self.worker.take() {
+            let _ = worker.join();
+        }
+    }
+
     /// The items that link somewhere, in reading order.
     pub fn links(&self) -> Vec<&MapItem> {
         match &self.state {
@@ -124,6 +134,37 @@ impl MapPanel {
 mod tests {
     use super::*;
     use std::os::unix::fs::PermissionsExt;
+
+    #[test]
+    fn stop_ends_claude_before_returning() {
+        let tmp = tempfile::tempdir().unwrap();
+        let fake = tmp.path().join("claude");
+        let pid_file = tmp.path().join("pid");
+        std::fs::write(
+            &fake,
+            format!("#!/bin/sh\necho $$ > {}\nexec sleep 30\n", pid_file.display()),
+        )
+        .unwrap();
+        std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let mapper = rc_vfs::map::Mapper {
+            command: fake.to_string_lossy().into(),
+            model: String::new(),
+            cache: None,
+        };
+        let mut panel = MapPanel::start(Location::local(tmp.path().to_string_lossy()), mapper, true);
+        let start = Instant::now();
+        while !pid_file.exists() {
+            assert!(start.elapsed().as_secs() < 10);
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        let pid: i32 = std::fs::read_to_string(&pid_file).unwrap().trim().parse().unwrap();
+        let start = Instant::now();
+        panel.stop();
+        assert!(start.elapsed().as_secs() < 3, "stop waited {:?}", start.elapsed());
+        // SAFETY: signal 0 only checks whether the process exists.
+        assert_ne!(unsafe { libc::kill(pid, 0) }, 0, "claude is still running");
+    }
 
     #[test]
     fn loads_in_the_background_and_lists_links() {

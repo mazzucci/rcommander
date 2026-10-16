@@ -52,7 +52,13 @@ fn event_loop(terminal: &mut DefaultTerminal, app: &mut App) -> Result<()> {
         match event::read()? {
             Event::Key(key) if key.kind == KeyEventKind::Press => match app.handle_key(key) {
                 Effect::None => {}
-                Effect::Quit => return Ok(()),
+                Effect::Quit => {
+                    // A map being made stops with us, not after.
+                    if let Some(mut map) = app.map.take() {
+                        map.stop();
+                    }
+                    return Ok(());
+                }
                 Effect::Edit { path, editor } => {
                     ratatui::restore();
                     let editor = editor_command(&editor);

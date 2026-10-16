@@ -110,6 +110,13 @@ impl Drop for JobEntry {
 }
 
 impl Jobs {
+    /// Ask every running job to stop (the server is shutting down: a map must not keep
+    /// Claude running, a copy stops cleanly).
+    fn cancel_all(&self) {
+        for job in self.0.lock().unwrap_or_else(PoisonError::into_inner).values() {
+            job.cancel.store(true, Ordering::Relaxed);
+        }
+    }
     fn start(&self, id: String) -> Result<JobEntry, (StatusCode, String)> {
         let valid = !id.is_empty() && id.len() <= 64 && id.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-');
         if !valid {
@@ -258,6 +265,7 @@ async fn serve(vfs: Arc<Vfs>, config: Config) -> Result<()> {
             None
         }
     };
+    let jobs = Jobs::default();
     let app = router(
         AppState {
             vfs,
@@ -267,7 +275,7 @@ async fn serve(vfs: Arc<Vfs>, config: Config) -> Result<()> {
             settings_path: config.settings_path.map(Arc::new),
             events,
             live,
-            jobs: Jobs::default(),
+            jobs: jobs.clone(),
         },
         addr.port(),
     );
@@ -294,7 +302,11 @@ async fn serve(vfs: Arc<Vfs>, config: Config) -> Result<()> {
         }
     }
     let served = axum::serve(listener, app)
-        .with_graceful_shutdown(shutdown_signal())
+        .with_graceful_shutdown(async move {
+            shutdown_signal().await;
+            // Graceful shutdown waits for requests in flight: end them.
+            jobs.cancel_all();
+        })
         .await;
     if let Some(page) = launcher {
         let _ = std::fs::remove_file(page);

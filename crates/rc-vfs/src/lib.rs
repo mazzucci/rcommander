@@ -367,7 +367,7 @@ pub fn check_program(program: &str) -> Result<()> {
     if found {
         Ok(())
     } else {
-        bail!("editor `{program}` not found")
+        bail!("`{program}` not found (not an executable file, nor on PATH)")
     }
 }
 

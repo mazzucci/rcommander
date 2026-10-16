@@ -232,6 +232,16 @@ fn wrap(text: &str, width: usize) -> Vec<String> {
     lines
 }
 
+/// A map link as shown: relative to `base` when inside it (the base itself by `name`),
+/// else absolute.
+fn relative(path: &str, base: &str, name: &str) -> String {
+    if path == base {
+        return name.to_string();
+    }
+    let prefix = format!("{}/", base.trim_end_matches('/'));
+    path.strip_prefix(&prefix).unwrap_or(path).to_string()
+}
+
 fn draw_map(f: &mut Frame, area: Rect, app: &mut App) {
     let Some(map) = &mut app.map else { return };
     let name = map.target.file_name().unwrap_or("/").to_string();
@@ -313,11 +323,7 @@ fn draw_map(f: &mut Frame, area: Rect, app: &mut App) {
                         }
                         continue;
                     };
-                    let rel = path
-                        .strip_prefix(&base)
-                        .map(|p| p.trim_start_matches('/'))
-                        .unwrap_or(path);
-                    let rel = if rel.is_empty() { name.clone() } else { rel.to_string() };
+                    let rel = relative(path, &base, &name);
                     let mut target = sanitize(&rel);
                     if item.is_dir {
                         target.push('/');
@@ -1449,6 +1455,14 @@ mod tests {
         assert!(!app.map.as_ref().unwrap().focused, "Esc gives the keyboard back");
         press(&mut app, KeyCode::Char('i'));
         assert!(app.map.is_none(), "i closes the map");
+    }
+
+    #[test]
+    fn map_links_are_relative_only_inside_the_base() {
+        assert_eq!(relative("/a/src/main.rs", "/a/src", "src"), "main.rs");
+        assert_eq!(relative("/a/src-tauri/x", "/a/src", "src"), "/a/src-tauri/x");
+        assert_eq!(relative("/a/src", "/a/src", "src"), "src");
+        assert_eq!(relative("/etc/x", "/", "/"), "etc/x");
     }
 
     #[test]

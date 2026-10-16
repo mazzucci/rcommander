@@ -123,6 +123,8 @@ pub fn MapView(app: App, side: usize, target: MapTarget) -> impl IntoView {
         match ev.key().as_str() {
             "ArrowDown" => cursor.update(|c| *c = (*c + 1).min(n.saturating_sub(1))),
             "ArrowUp" => cursor.update(|c| *c = c.saturating_sub(1)),
+            "PageDown" => cursor.update(|c| *c = (*c + 10).min(n.saturating_sub(1))),
+            "PageUp" => cursor.update(|c| *c = c.saturating_sub(10)),
             "Home" => cursor.set(0),
             "End" => cursor.set(n.saturating_sub(1)),
             "Enter" => {
@@ -185,8 +187,7 @@ pub fn MapView(app: App, side: usize, target: MapTarget) -> impl IntoView {
                                 };
                                 let i = k;
                                 k += 1;
-                                let rel = path.strip_prefix(&base).map(|p| p.trim_start_matches('/')).unwrap_or(&path);
-                                let mut shown = if rel.is_empty() { path.clone() } else { rel.to_string() };
+                                let mut shown = relative(&path, &base, &name);
                                 if item.is_dir {
                                     shown.push('/');
                                 }
@@ -281,4 +282,14 @@ fn inline_code(text: &str) -> impl IntoView + use<> {
             }
         })
         .collect_view()
+}
+
+/// A map link as shown: relative to `base` when inside it (the base itself by `name`),
+/// else absolute.
+fn relative(path: &str, base: &str, name: &str) -> String {
+    if path == base {
+        return name.to_string();
+    }
+    let prefix = format!("{}/", base.trim_end_matches('/'));
+    path.strip_prefix(&prefix).unwrap_or(path).to_string()
 }

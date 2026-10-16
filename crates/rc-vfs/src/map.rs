@@ -29,8 +29,9 @@ const MAX_SUMMARY: usize = 2000;
 
 const SYSTEM_PROMPT: &str = "You write short, accurate maps of files and folders for the side panel of a \
 file manager. Look with the tools you have and read only what you need: never read large generated, \
-binary or vendored files. Be concrete and brief; no marketing words. Your answer must follow the JSON \
-schema you were given.";
+binary or vendored files. Be concrete and brief; no marketing words. Never quote passwords, keys, tokens \
+or other credentials you come across, not even partly. Your answer must follow the JSON schema you were \
+given.";
 
 /// What Claude must answer.
 const SCHEMA: &str = r#"{"type":"object","additionalProperties":false,"required":["summary","sections"],"properties":{"summary":{"type":"string","description":"2-4 plain sentences: what this is and what it is for."},"sections":{"type":"array","maxItems":8,"items":{"type":"object","additionalProperties":false,"required":["heading","items"],"properties":{"heading":{"type":"string"},"items":{"type":"array","maxItems":12,"items":{"type":"object","additionalProperties":false,"required":["text","path","line"],"properties":{"text":{"type":"string","description":"One short line about the target."},"path":{"type":"string","description":"Path relative to the base folder, or empty."},"line":{"type":["integer","null"],"description":"1-based line where it starts, for files."}}}}}}}}}"#;
@@ -100,7 +101,14 @@ impl Mapper {
         let Location::Local { path } = loc;
         let target = Path::new(path);
         let meta = fs::metadata(target).with_context(|| format!("cannot read {path}"))?;
-        let key = version_key(path, &meta, self.model());
+        if !meta.is_file() && !meta.is_dir() {
+            bail!("{path} is not a regular file or folder");
+        }
+        let model = self.model();
+        if model.starts_with('-') || !model.chars().all(|c| c.is_ascii_alphanumeric() || "._:-[]".contains(c)) {
+            bail!("invalid model name {model:?} (see Options)");
+        }
+        let key = version_key(path, &meta, model);
         let cache_file = self
             .cache
             .as_ref()
@@ -157,7 +165,10 @@ impl Mapper {
             .args(["--model", self.model()])
             .args(["--tools", "Read,Glob,Grep"])
             .args(["--setting-sources", ""])
+            // Restricted: no code-running tools or settings files (so no hooks from the
+            // folder), file tools confined to the working folder; no MCP servers either.
             .args([
+                "--restricted",
                 "--strict-mcp-config",
                 "--disable-slash-commands",
                 "--no-session-persistence",
@@ -171,6 +182,15 @@ impl Mapper {
             .stderr(Stdio::piped());
         #[cfg(unix)]
         std::os::unix::process::CommandExt::process_group(&mut cmd, 0);
+        // Linux: if rcommander dies (even killed), Claude is stopped too.
+        #[cfg(target_os = "linux")]
+        // SAFETY: prctl is async-signal-safe and touches only this (new) process.
+        unsafe {
+            std::os::unix::process::CommandExt::pre_exec(&mut cmd, || {
+                libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGTERM);
+                Ok(())
+            });
+        }
         let mut child = cmd
             .spawn()
             .with_context(|| format!("cannot run {}", program.display()))?;
@@ -281,9 +301,10 @@ fn resolve(base: &Path, item: AnswerItem) -> MapItem {
         text: clip(&item.text, MAX_TEXT),
         is_dir: meta.as_ref().is_some_and(fs::Metadata::is_dir),
         line: line.filter(|_| meta.as_ref().is_some_and(fs::Metadata::is_file)),
+        // Only paths that exist and survive as text (locations are UTF-8) are links.
         path: target
             .filter(|_| meta.is_some())
-            .map(|t| t.to_string_lossy().into_owned()),
+            .and_then(|t| t.to_str().map(str::to_string)),
     }
 }
 
@@ -331,12 +352,25 @@ fn kill(child: &mut std::process::Child) {
 }
 
 /// Identifies a version of the target: path, modification time, size and model.
+/// For a folder, the newest modification among its direct entries counts too, so
+/// editing a file in it makes a new map (deeper changes do not; `I` regenerates).
 fn version_key(path: &str, meta: &fs::Metadata, model: &str) -> String {
-    let mtime = meta
-        .modified()
-        .ok()
-        .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
-        .map_or(0, |d| d.as_nanos());
+    let nanos = |m: &fs::Metadata| {
+        m.modified()
+            .ok()
+            .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
+            .map_or(0, |d| d.as_nanos())
+    };
+    let mut mtime = nanos(meta);
+    if meta.is_dir()
+        && let Ok(entries) = fs::read_dir(path)
+    {
+        for entry in entries.flatten().take(20_000) {
+            if let Ok(m) = entry.metadata() {
+                mtime = mtime.max(nanos(&m));
+            }
+        }
+    }
     format!("{path}\0{mtime}\0{}\0{model}", meta.len())
 }
 
@@ -350,7 +384,9 @@ fn fnv1a(bytes: &[u8]) -> u64 {
 fn write_private(file: &Path, bytes: &[u8]) -> Result<()> {
     use std::io::Write;
     use std::os::unix::fs::OpenOptionsExt;
-    let tmp = file.with_extension(format!("tmp{}", std::process::id()));
+    static WRITES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let n = WRITES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let tmp = file.with_extension(format!("tmp{}-{n}", std::process::id()));
     let mut f = fs::OpenOptions::new()
         .write(true)
         .create(true)
@@ -440,6 +476,7 @@ mod tests {
         let args = fs::read_to_string(tools.path().join("args")).unwrap();
         for expected in [
             "Read,Glob,Grep",
+            "--restricted",
             "--strict-mcp-config",
             "--disable-slash-commands",
             "--json-schema",
@@ -473,6 +510,13 @@ mod tests {
         // A new version of the file is not served from the cache.
         fs::write(&file, "# Notes, longer now\n").unwrap();
         assert!(!mapper.map(&loc, false, &mut go).unwrap().cached);
+        // A folder's map is new once a file directly in it changes.
+        let dir = Location::local(tmp.path().to_string_lossy());
+        assert!(!mapper.map(&dir, false, &mut go).unwrap().cached);
+        assert!(mapper.map(&dir, false, &mut go).unwrap().cached);
+        std::thread::sleep(Duration::from_millis(20));
+        fs::write(&file, "# Notes, edited again\n").unwrap();
+        assert!(!mapper.map(&dir, false, &mut go).unwrap().cached);
     }
 
     #[test]
@@ -521,6 +565,26 @@ mod tests {
             })
             .unwrap_err();
         assert!(err.to_string().contains("stopped") && start.elapsed() < Duration::from_secs(5));
+
+        // Special files and odd model names are refused before anything runs.
+        let fifo = tmp.path().join("pipe");
+        let c = std::ffi::CString::new(fifo.to_string_lossy().as_bytes()).unwrap();
+        assert_eq!(unsafe { libc::mkfifo(c.as_ptr(), 0o600) }, 0);
+        let err = mapper
+            .map(&Location::local(fifo.to_string_lossy()), false, &mut go)
+            .unwrap_err();
+        assert!(err.to_string().contains("not a regular file"), "{err}");
+        let odd = Mapper {
+            command: mapper.command.clone(),
+            model: "--dangerously".into(),
+            cache: None,
+        };
+        assert!(
+            odd.map(&loc, false, &mut go)
+                .unwrap_err()
+                .to_string()
+                .contains("invalid model")
+        );
 
         let mapper = Mapper {
             command: "/no/such/claude".into(),
