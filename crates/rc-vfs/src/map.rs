@@ -19,7 +19,7 @@ pub const DEFAULT_MODEL: &str = "opus";
 /// Folders below the mapped one Claude may read when none is configured.
 pub const DEFAULT_DEPTH: usize = 4;
 /// Tool steps for a first map (a rough overview) and for a question (details).
-const MAP_TURNS: u32 = 12;
+const MAP_TURNS: u32 = 16;
 const ASK_TURNS: u32 = 30;
 /// Folders never read: dependencies, build output, caches, version control.
 const SKIPPED: [&str; 12] = [
@@ -36,10 +36,24 @@ const SKIPPED: [&str; 12] = [
     ".cache",
     ".gradle",
 ];
+/// Files and folders never read because they usually hold credentials.
+const SECRETS: [&str; 9] = [
+    ".env",
+    ".env.*",
+    ".ssh/**",
+    ".gnupg/**",
+    ".aws/**",
+    "*.pem",
+    "*.key",
+    "id_rsa*",
+    "id_ed25519*",
+];
 /// Lines of the listing given to Claude at most.
 const LISTING_LINES: usize = 250;
 /// Spending cap per map, passed to `claude --max-budget-usd`.
 const BUDGET_USD: &str = "0.50";
+/// Spending cap per question (they may read more than a first map).
+const ASK_BUDGET_USD: &str = "1.00";
 /// A map that takes longer than this is abandoned.
 const TIMEOUT: Duration = Duration::from_secs(300);
 /// How often a running map reports progress (and can be cancelled).
@@ -104,6 +118,11 @@ struct CliOutput {
     structured_output: Option<serde_json::Value>,
     #[serde(default)]
     total_cost_usd: Option<f64>,
+    /// `success`, `error_max_turns`, `error_max_budget_usd`…
+    #[serde(default)]
+    subtype: Option<String>,
+    #[serde(default)]
+    errors: Vec<String>,
 }
 
 /// Makes maps with the configured CLI, and keeps them in `cache` (if any).
@@ -213,8 +232,9 @@ impl Mapper {
                 listing(&base, 1)
             )
         };
-        let (value, cost) = self.run(&prompt, &base, SCHEMA, path, MAP_TURNS, progress)?;
+        let (value, cost) = self.run(&prompt, &base, SCHEMA, path, (MAP_TURNS, BUDGET_USD), progress)?;
         let answer: Answer = serde_json::from_value(value).context("Claude's answer was not a map")?;
+        let mut lines = LineCounts::default();
         Ok(FileMap {
             location: loc.clone(),
             is_dir,
@@ -225,7 +245,12 @@ impl Mapper {
                 .take(MAX_SECTIONS)
                 .map(|s| MapSection {
                     heading: clip(&s.heading, 80),
-                    items: s.items.into_iter().take(MAX_ITEMS).map(|i| resolve(&base, i)).collect(),
+                    items: s
+                        .items
+                        .into_iter()
+                        .take(MAX_ITEMS)
+                        .map(|i| resolve(&base, i, &mut lines))
+                        .collect(),
                 })
                 .filter(|s| !s.items.is_empty())
                 .collect(),
@@ -310,12 +335,17 @@ impl Mapper {
             self.depth(),
             base.display()
         );
-        let (value, cost) = self.run(&prompt, &base, ASK_SCHEMA, path, ASK_TURNS, progress)?;
+        let (value, cost) = self.run(&prompt, &base, ASK_SCHEMA, path, (ASK_TURNS, ASK_BUDGET_USD), progress)?;
         let answer: AskAnswer =
             serde_json::from_value(value).context("Claude's answer was not in the expected form")?;
         Ok(MapAnswer {
             text: clip(&answer.answer, 6000),
-            links: answer.links.into_iter().take(20).map(|i| resolve(&base, i)).collect(),
+            links: answer
+                .links
+                .into_iter()
+                .take(20)
+                .map(|i| resolve(&base, i, &mut LineCounts::default()))
+                .collect(),
             cost_usd: cost,
         })
     }
@@ -329,7 +359,7 @@ impl Mapper {
         base: &Path,
         schema: &str,
         path: &str,
-        max_turns: u32,
+        (max_turns, budget): (u32, &str),
         progress: &mut ProgressFn,
     ) -> Result<(serde_json::Value, Option<f64>)> {
         let path = path.to_string();
@@ -337,10 +367,14 @@ impl Mapper {
         // deeper than `depth` folders below `base`, nothing in dependency or build folders.
         let mut deny = vec![format!("Read(./{}**)", "*/".repeat(self.depth() + 2))];
         deny.extend(SKIPPED.iter().map(|d| format!("Read(./**/{d}/**)")));
+        // Obvious credentials stay out of the prompt whatever Claude decides.
+        deny.extend(SECRETS.iter().map(|p| format!("Read(./**/{p})")));
         let (program, args) = self.program()?;
         let mut cmd = Command::new(&program);
         cmd.args(args)
-            .args(["-p", prompt])
+            // The prompt goes in on stdin: as an argument it could pass the system's
+            // limit for one argument (128 KiB on Linux).
+            .arg("-p")
             .args(["--system-prompt", SYSTEM_PROMPT])
             .args(["--model", self.model()])
             .args(["--tools", "Read,Glob,Grep"])
@@ -353,13 +387,13 @@ impl Mapper {
                 "--disable-slash-commands",
                 "--no-session-persistence",
             ])
-            .args(["--max-budget-usd", BUDGET_USD])
+            .args(["--max-budget-usd", budget])
             .args(["--max-turns", &max_turns.to_string()])
             .args(["--disallowedTools", &deny.join(",")])
             .args(["--output-format", "json"])
             .args(["--json-schema", schema])
             .current_dir(base)
-            .stdin(Stdio::null())
+            .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
         #[cfg(unix)]
@@ -376,7 +410,13 @@ impl Mapper {
         let mut child = cmd
             .spawn()
             .with_context(|| format!("cannot run {}", program.display()))?;
-        // Read both pipes on threads so a chatty child never blocks on a full pipe.
+        // Write the prompt and read both pipes on threads, so neither side can block.
+        let mut input = child.stdin.take().expect("piped stdin");
+        let prompt_bytes = prompt.as_bytes().to_vec();
+        std::thread::spawn(move || {
+            use std::io::Write;
+            let _ = input.write_all(&prompt_bytes);
+        });
         let mut out = child.stdout.take().expect("piped stdout");
         let mut err = child.stderr.take().expect("piped stderr");
         let out = std::thread::spawn(move || {
@@ -415,7 +455,18 @@ impl Mapper {
             bail!("{} failed ({status}): {}", program.display(), first_line(detail));
         };
         if cli.is_error {
-            bail!("Claude: {}", first_line(cli.result.as_deref().unwrap_or("error")));
+            match cli.subtype.as_deref() {
+                Some("error_max_turns") => bail!(
+                    "Claude ran out of steps ({max_turns}) before answering: try again, or ask something narrower"
+                ),
+                Some("error_max_budget_usd") => bail!("Claude reached the ${budget} spending cap before answering"),
+                _ => {}
+            }
+            let why = cli
+                .result
+                .filter(|r| !r.trim().is_empty())
+                .or_else(|| (!cli.errors.is_empty()).then(|| cli.errors.join("; ")));
+            bail!("Claude: {}", first_line(why.as_deref().unwrap_or("error")));
         }
         let value = match cli.structured_output {
             Some(v) => v,
@@ -450,7 +501,7 @@ impl Mapper {
 
 /// A link of Claude's answer, made absolute and checked: paths that do not exist are
 /// dropped (the text stays), so a made-up link is never clickable.
-fn resolve(base: &Path, item: AnswerItem) -> MapItem {
+fn resolve(base: &Path, item: AnswerItem, lines: &mut LineCounts) -> MapItem {
     let raw = item.path.trim();
     let target = (!raw.is_empty()).then(|| {
         let p = Path::new(raw);
@@ -462,14 +513,29 @@ fn resolve(base: &Path, item: AnswerItem) -> MapItem {
         text: clip(&item.text, MAX_TEXT),
         is_dir: meta.as_ref().is_some_and(fs::Metadata::is_dir),
         // A line past the end of the file is a guess: drop it.
-        line: line.filter(|&l| {
-            meta.as_ref().is_some_and(fs::Metadata::is_file)
-                && target.as_deref().and_then(line_count).is_some_and(|n| l <= n.max(1))
+        line: line.filter(|&l| match (&meta, &target) {
+            (Some(m), Some(t)) if m.is_file() => lines.fits(t, m.len(), l),
+            _ => false,
         }),
         // Only paths that exist and survive as text (locations are UTF-8) are links.
         path: target
             .filter(|_| meta.is_some())
             .and_then(|t| t.to_str().map(str::to_string)),
+    }
+}
+
+/// Line counts of the files links point at, each file read once per answer.
+#[derive(Default)]
+struct LineCounts(std::collections::HashMap<PathBuf, Option<usize>>);
+
+impl LineCounts {
+    /// Whether `line` can be in the file. Files over 8 MB are not read: their lines stay.
+    fn fits(&mut self, path: &Path, size: u64, line: usize) -> bool {
+        if size > 8 << 20 {
+            return true;
+        }
+        let n = *self.0.entry(path.to_path_buf()).or_insert_with(|| line_count(path));
+        n.is_some_and(|n| line <= n.max(1))
     }
 }
 
@@ -485,48 +551,69 @@ fn line_count(path: &Path) -> Option<usize> {
     })
 }
 
-/// A listing of `dir` for the prompt: `levels` deep, folders marked with `/`, deeper
-/// folders as a count, dependency and build folders noted but not entered, at most
-/// [`LISTING_LINES`] lines.
+/// A listing of `dir` for the prompt, `levels` (1 or 2) deep: every entry of the folder
+/// first (folders marked with `/`, dependency and build folders noted but not entered),
+/// then, while [`LISTING_LINES`] allows, what each folder holds; folders left over show
+/// how many entries they hold.
 pub fn listing(dir: &Path, levels: usize) -> String {
-    fn walk(dir: &Path, prefix: &str, level: usize, levels: usize, out: &mut Vec<String>) {
-        let Ok(read) = fs::read_dir(dir) else { return };
-        let mut entries: Vec<(String, bool)> = read
+    let entries = |dir: &Path| -> Vec<(String, bool)> {
+        let Ok(read) = fs::read_dir(dir) else { return Vec::new() };
+        let mut v: Vec<(String, bool)> = read
             .flatten()
             .map(|e| {
                 (
                     e.file_name().to_string_lossy().into_owned(),
+                    // Does not follow links: no loops.
                     e.file_type().is_ok_and(|t| t.is_dir()),
                 )
             })
             .collect();
-        entries.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| rc_core::panel::natural_cmp(&a.0, &b.0)));
-        for (name, is_dir) in entries {
-            if out.len() >= LISTING_LINES {
-                out.push(format!("{prefix}… (listing cut)"));
-                return;
-            }
-            let path = dir.join(&name);
-            if !is_dir {
-                out.push(format!("{prefix}{name}"));
-            } else if SKIPPED.contains(&name.as_str()) {
-                out.push(format!("{prefix}{name}/ (not read)"));
-            } else if level + 1 < levels {
-                out.push(format!("{prefix}{name}/"));
-                walk(&path, &format!("{prefix}  "), level + 1, levels, out);
+        v.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| rc_core::panel::natural_cmp(&a.0, &b.0)));
+        v
+    };
+    let count = |dir: &Path| {
+        let n = fs::read_dir(dir).map_or(0, |r| r.take(10_000).count());
+        if n == 10_000 {
+            "10000+".to_string()
+        } else {
+            n.to_string()
+        }
+    };
+    let top = entries(dir);
+    if top.is_empty() {
+        return "(empty)".into();
+    }
+    let shown = top.len().min(LISTING_LINES);
+    let mut budget = LISTING_LINES.saturating_sub(shown);
+    let mut out = Vec::new();
+    for (name, is_dir) in &top[..shown] {
+        let path = dir.join(name);
+        if !is_dir {
+            out.push(name.clone());
+        } else if SKIPPED.contains(&name.as_str()) {
+            out.push(format!("{name}/ (not read)"));
+        } else {
+            let inner = if levels > 1 { entries(&path) } else { Vec::new() };
+            if levels > 1 && !inner.is_empty() && inner.len() <= budget {
+                budget -= inner.len();
+                out.push(format!("{name}/"));
+                for (child, child_dir) in inner {
+                    let note = match (child_dir, SKIPPED.contains(&child.as_str())) {
+                        (true, true) => " (not read)".to_string(),
+                        (true, false) => format!(" ({} entries)", count(&path.join(&child))),
+                        _ => String::new(),
+                    };
+                    out.push(format!("  {child}{}{note}", if child_dir { "/" } else { "" }));
+                }
             } else {
-                let n = fs::read_dir(&path).map_or(0, |r| r.count());
-                out.push(format!("{prefix}{name}/ ({n} entries)"));
+                out.push(format!("{name}/ ({} entries)", count(&path)));
             }
         }
     }
-    let mut out = Vec::new();
-    walk(dir, "", 0, levels, &mut out);
-    if out.is_empty() {
-        "(empty)".into()
-    } else {
-        out.join("\n")
+    if shown < top.len() {
+        out.push(format!("… and {} more", top.len() - shown));
     }
+    out.join("\n")
 }
 
 /// `a/./b/../c` → `a/c`, without touching the disk.
@@ -633,7 +720,7 @@ mod tests {
         fs::write(
             &script,
             format!(
-                "#!/bin/sh\nprintf '%s\\n' \"$@\" > {}\nsleep {delay}\ncat {}\n",
+                "#!/bin/sh\n{{ printf '%s\\n' \"$@\"; cat; }} > {}\nsleep {delay}\ncat {}\n",
                 dir.join("args").display(),
                 out.display()
             ),
@@ -815,10 +902,59 @@ mod tests {
         fs::write(p.join("src/deep/a.rs"), "").unwrap();
         let text = listing(p, 2);
         assert_eq!(
-            text, "docs/\nnode_modules/ (not read)\nsrc/\n  deep/ (2 entries)\n  main.rs\nREADME.md",
+            text, "docs/ (0 entries)\nnode_modules/ (not read)\nsrc/\n  deep/ (2 entries)\n  main.rs\nREADME.md",
             "{text}"
         );
         assert_eq!(listing(p, 1).lines().count(), 4);
+    }
+
+    #[test]
+    fn listing_shows_every_top_level_entry_before_going_deeper() {
+        let tmp = tempfile::tempdir().unwrap();
+        for i in 0..40 {
+            let d = tmp.path().join(format!("dir{i:02}"));
+            fs::create_dir(&d).unwrap();
+            for j in 0..20 {
+                fs::write(d.join(format!("f{j}")), "").unwrap();
+            }
+        }
+        fs::write(tmp.path().join("README.md"), "").unwrap();
+        let text = listing(tmp.path(), 2);
+        assert!(text.lines().count() <= LISTING_LINES + 1);
+        assert!(
+            text.contains("\nREADME.md") && text.contains("dir39/ (20 entries)"),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn running_out_of_steps_or_budget_says_so() {
+        let tmp = tempfile::tempdir().unwrap();
+        let tools = tempfile::tempdir().unwrap();
+        let loc = Location::local(tmp.path().to_string_lossy());
+        for (out, expected) in [
+            (
+                r#"{"subtype":"error_max_turns","is_error":true,"result":null,"errors":["Reached maximum number of turns (16)"]}"#,
+                "ran out of steps",
+            ),
+            (
+                r#"{"subtype":"error_max_budget_usd","is_error":true,"result":null}"#,
+                "spending cap",
+            ),
+            (
+                r#"{"subtype":"error_during_execution","is_error":true,"result":null,"errors":["boom"]}"#,
+                "Claude: boom",
+            ),
+        ] {
+            let mapper = Mapper {
+                command: fake_claude(tools.path(), out, 0).to_string_lossy().into(),
+                model: String::new(),
+                depth: 0,
+                cache: None,
+            };
+            let err = mapper.map(&loc, true, &mut go).unwrap_err().to_string();
+            assert!(err.contains(expected), "{err}");
+        }
     }
 
     #[test]
@@ -856,9 +992,14 @@ mod tests {
             "depth 2 allows files in a/b/: {deny}"
         );
         assert!(deny.contains("Read(./**/node_modules/**)") && deny.contains("Read(./**/.git/**)"));
+        assert!(
+            deny.contains("Read(./**/.env)") && deny.contains("Read(./**/.ssh/**)"),
+            "{deny}"
+        );
+        assert_eq!(after("-p"), "--system-prompt", "the prompt is not an argument");
         // The prompt spans lines in the log: look at all of it.
         let all = args.join("\n");
-        assert!(all.contains("rough first map") && all.contains("only name files") && all.contains("\none.txt\n"));
+        assert!(all.contains("rough first map") && all.contains("only name files") && all.contains("\none.txt"));
     }
 
     #[test]

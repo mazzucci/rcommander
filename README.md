@@ -117,9 +117,10 @@ Guardrails, enforced by Claude Code itself:
 - **Read-only, restricted**: Read, Glob and Grep only (no shell, no writes, no web), confined to the folder being mapped, without your MCP servers, skills, settings or hooks (also none from the folder).
 - **Depth**: nothing deeper than *Claude map depth* folders below the mapped one (Options, default 4); Claude decides what to open within that.
 - **No noise**: `node_modules`, `.git`, `target`, `dist`, `build`, `vendor`, virtualenvs and caches are never read.
-- **Bounded**: a few tool steps for a map (more for a question), $0.50 at most per request, 5 minutes at most.
+- **Bounded**: a few tool steps for a map (more for a question), at most $0.50 per map and $1 per question, 5 minutes at most; if a limit is reached, the panel says which.
+- **No secrets**: `.env` files, `.ssh`, `.gnupg`, `.aws`, `*.pem`, `*.key` and SSH keys are never read.
 
-Maps are made by your own [Claude Code](https://claude.com/claude-code) (`claude -p`), so no API key is stored in rcommander; a map takes about 15 s and around $0.10 with Opus, a question about the same. The contents Claude reads are sent to Anthropic, so nothing runs until you ask. Maps are cached in your cache folder (`~/.cache/rcommander/maps` on Linux, private to you): opening the same map again is instant and free until the file, or something directly inside the folder, changes; `I` asks again. Closing a map (or rcommander) stops Claude. The model, the command and the depth are in the options (`o`).
+Maps are made by your own [Claude Code](https://claude.com/claude-code) (`claude -p`), so no API key is stored in rcommander; a map takes about 15 s and around $0.10 with Opus; a question usually about the same, more if Claude has to read a lot. The contents Claude reads are sent to Anthropic, so nothing runs until you ask. Maps are cached in your cache folder (`~/.cache/rcommander/maps` on Linux, private to you): opening the same map again is instant and free until the file, or something directly inside the folder, changes; `I` asks again. Closing a map (or rcommander) stops Claude. The model, the command and the depth are in the options (`o`).
 
 ## Remote control and Claude Code
 

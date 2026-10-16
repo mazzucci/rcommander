@@ -403,7 +403,7 @@ fn draw_map(f: &mut Frame, area: Rect, app: &mut App) {
     // Keep the selected link (and the line after it) in view; a new question or an
     // answer without links shows the end.
     let height = inner.height as usize;
-    if std::mem::take(&mut map.scroll_to_end) || map.pending.is_some() || map.asking.is_some() {
+    if std::mem::take(&mut map.scroll_to_end) {
         map.scroll = usize::MAX;
     } else if let Some(c) = cursor_line {
         if c < map.scroll {
@@ -1571,7 +1571,7 @@ mod tests {
         std::fs::write(
             &fake,
             format!(
-                "#!/bin/sh\necho \"$2\" >> {}\ncase \"$2\" in\n  *'The user asks'*) cat <<'EOF'\n{answer}\nEOF\n;;\n  *) cat <<'EOF'\n{map}\nEOF\n;;\nesac\n",
+                "#!/bin/sh\nprompt=$(cat)\necho \"$prompt\" >> {}\ncase \"$prompt\" in\n  *'The user asks'*) cat <<'EOF'\n{answer}\nEOF\n;;\n  *) cat <<'EOF'\n{map}\nEOF\n;;\nesac\n",
                 log.display()
             ),
         )
@@ -1598,9 +1598,9 @@ mod tests {
         });
         press(&mut app, KeyCode::Tab);
         press(&mut app, KeyCode::Char('a'));
-        for c in "where is b?".chars() {
-            press(&mut app, KeyCode::Char(c));
-        }
+        // Pasted text (bracketed paste) goes into the question; line breaks become spaces.
+        app.paste("where is");
+        app.paste("\nb?");
         assert!(screen(&mut app).contains("Ask: where is b?"), "{}", screen(&mut app));
         press(&mut app, KeyCode::Enter);
         wait(&mut app, &|a| a.map.as_ref().is_some_and(|m| m.pending.is_none()));
@@ -1615,6 +1615,21 @@ mod tests {
             panic!("no viewer")
         };
         assert_eq!(v.mark, Some(1));
+        // Typing and pending states draw at any size.
+        press(&mut app, KeyCode::Esc);
+        app.map.as_mut().unwrap().focused = true;
+        press(&mut app, KeyCode::Char('a'));
+        app.paste("a long question that will not fit anywhere");
+        for (w, h) in [(100, 20), (40, 6), (10, 3), (2, 2), (1, 1)] {
+            let mut term = Terminal::new(TestBackend::new(w, h)).unwrap();
+            term.draw(|f| draw(f, &mut app)).unwrap();
+        }
+        press(&mut app, KeyCode::Enter);
+        for (w, h) in [(40, 6), (1, 1)] {
+            let mut term = Terminal::new(TestBackend::new(w, h)).unwrap();
+            term.draw(|f| draw(f, &mut app)).unwrap();
+        }
+        wait(&mut app, &|a| a.map.as_ref().is_some_and(|m| m.pending.is_none()));
         let prompts = std::fs::read_to_string(&log).unwrap();
         assert!(
             prompts.contains("Settings.") && prompts.contains("The user asks: where is b?"),

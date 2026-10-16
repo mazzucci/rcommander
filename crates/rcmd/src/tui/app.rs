@@ -1216,15 +1216,26 @@ impl App {
         self.map = Some(MapPanel::start(target, crate::control::mapper(&self.settings), refresh));
     }
 
+    /// Text pasted into the terminal (bracketed paste): into the question being typed
+    /// or the open prompt; line breaks become spaces.
+    pub fn paste(&mut self, text: &str) {
+        let text: String = text.chars().map(|c| if c.is_control() { ' ' } else { c }).collect();
+        if let Some(asking) = self.map.as_mut().and_then(|m| m.asking.as_mut()) {
+            let room = rc_vfs::map::MAX_QUESTION.saturating_sub(asking.chars().count());
+            asking.extend(text.chars().take(room));
+        } else if let Mode::Prompt(p) = &mut self.mode {
+            p.input.push_str(&text);
+        }
+    }
+
     /// Keys while the map has the keyboard (Tab).
     fn map_key(&mut self, key: KeyEvent) -> Effect {
         let page = self.page.max(1) as isize;
-        let mapper = crate::control::mapper(&self.settings);
         let Some(map) = &mut self.map else { return Effect::None };
         // Typing a question: every key goes into it.
         if let Some(text) = &mut map.asking {
             match key.code {
-                KeyCode::Enter => map.send_question(mapper),
+                KeyCode::Enter => map.send_question(crate::control::mapper(&self.settings)),
                 KeyCode::Esc => map.asking = None,
                 KeyCode::Backspace => drop(text.pop()),
                 KeyCode::Char(c) if !has_command_modifier(key) && text.chars().count() < rc_vfs::map::MAX_QUESTION => {
@@ -1237,7 +1248,10 @@ impl App {
         let ready = matches!(map.state, super::map::MapState::Ready(_));
         match key.code {
             // Ask Claude about the map.
-            KeyCode::Char('a') if ready && map.pending.is_none() => map.asking = Some(String::new()),
+            KeyCode::Char('a') if ready && map.pending.is_none() => {
+                map.asking = Some(String::new());
+                map.scroll_to_end = true;
+            }
             KeyCode::Esc if map.pending.is_some() => map.cancel_question(),
             KeyCode::Up => map.move_cursor(-1),
             KeyCode::Down => map.move_cursor(1),
