@@ -73,6 +73,7 @@ pub fn mapper(settings: &rc_core::Settings) -> rc_vfs::map::Mapper {
     rc_vfs::map::Mapper {
         command: settings.claude_command.clone(),
         model: settings.claude_model.clone(),
+        depth: settings.claude_depth,
         cache: maps_cache(),
     }
 }

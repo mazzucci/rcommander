@@ -264,6 +264,30 @@ pub struct MapRequest {
     pub refresh: bool,
 }
 
+/// `POST /api/map/ask[?job=ID]` → [`MapAnswer`]: a question to Claude about a map, with
+/// the earlier questions and answers of the same map so it can follow up.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct MapQuestion {
+    pub map: FileMap,
+    #[serde(default)]
+    pub thread: Vec<MapExchange>,
+    pub question: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct MapExchange {
+    pub question: String,
+    pub answer: MapAnswer,
+}
+
+/// Claude's answer: text (short paragraphs, `- ` lists, `code`) and the links it refers to.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct MapAnswer {
+    pub text: String,
+    pub links: Vec<MapItem>,
+    pub cost_usd: Option<f64>,
+}
+
 /// A summary of a file or folder written by Claude, with links into it: the "map"
 /// shown in a side panel.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]

@@ -32,7 +32,10 @@ pub fn run(mut app: App) -> Result<()> {
         app.message = Some((format!("live refresh unavailable: {e:#}"), true));
     }
     let mut terminal = ratatui::init();
+    // Pasted text arrives as one event (for questions and prompts), not as keys.
+    let _ = ratatui::crossterm::execute!(std::io::stdout(), ratatui::crossterm::event::EnableBracketedPaste);
     let result = event_loop(&mut terminal, &mut app);
+    let _ = ratatui::crossterm::execute!(std::io::stdout(), ratatui::crossterm::event::DisableBracketedPaste);
     ratatui::restore();
     result
 }
@@ -60,11 +63,19 @@ fn event_loop(terminal: &mut DefaultTerminal, app: &mut App) -> Result<()> {
                     return Ok(());
                 }
                 Effect::Edit { path, editor } => {
+                    let _ = ratatui::crossterm::execute!(
+                        std::io::stdout(),
+                        ratatui::crossterm::event::DisableBracketedPaste
+                    );
                     ratatui::restore();
                     let editor = editor_command(&editor);
                     let status = run_editor(&editor, &path);
                     // A fresh alternate screen is blank and the next draw repaints everything.
                     *terminal = ratatui::init();
+                    let _ = ratatui::crossterm::execute!(
+                        std::io::stdout(),
+                        ratatui::crossterm::event::EnableBracketedPaste
+                    );
                     if let Err(e) = status {
                         app.message = Some((format!("cannot run `{editor}`: {e}"), true));
                     }
@@ -72,6 +83,7 @@ fn event_loop(terminal: &mut DefaultTerminal, app: &mut App) -> Result<()> {
                     app.refresh(1);
                 }
             },
+            Event::Paste(text) => app.paste(&text),
             _ => {}
         }
     }

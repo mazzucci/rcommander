@@ -1,6 +1,6 @@
 //! Rendering. Colors use the 256-color palette because macOS Terminal.app has no truecolor.
 
-use super::app::{App, CLAUDE_ROW, EDITOR_ROW, HIDDEN_ROW, LEFT, MODEL_ROW, Mode, Options, RIGHT};
+use super::app::{App, CLAUDE_ROW, DEPTH_ROW, EDITOR_ROW, HIDDEN_ROW, LEFT, MODEL_ROW, Mode, Options, RIGHT};
 use super::find::{Field, Find};
 use super::map::MapState;
 use super::rename::{self, MultiRename};
@@ -297,8 +297,8 @@ fn draw_map(f: &mut Frame, area: Rect, app: &mut App) {
                 .map(|c| format!(" · ${c:.2}"))
                 .unwrap_or_default();
             let cached = if m.cached { " · cached" } else { "" };
-            block =
-                block.title_bottom(Line::raw(format!(" {} · {age}{cost}{cached} · I regenerate ", m.model)).fg(DIM));
+            block = block
+                .title_bottom(Line::raw(format!(" {} · {age}{cost}{cached} · a ask · I regenerate ", m.model)).fg(DIM));
             let mut lines: Vec<Line> = wrap(&sanitize(&m.summary.replace('`', "")), inner_width.saturating_sub(2))
                 .into_iter()
                 .map(|l| Line::raw(format!(" {l}")).fg(TEXT))
@@ -312,43 +312,63 @@ fn draw_map(f: &mut Frame, area: Rect, app: &mut App) {
             let base = base.unwrap_or_else(|| map.target.clone()).to_string();
             let mut link = 0;
             let mut cursor_line = None;
+            let mut item_lines = |lines: &mut Vec<Line<'static>>, item: &rc_core::api::MapItem| {
+                let at = push_item(lines, item, &base, &name, inner_width, link, map.cursor, map.focused);
+                if let Some(at) = at {
+                    if link == map.cursor {
+                        cursor_line = Some(at);
+                    }
+                    link += 1;
+                }
+            };
             for section in &m.sections {
                 lines.push(Line::raw(""));
                 lines.push(Line::raw(format!(" {}", sanitize(&section.heading))).fg(ACCENT).bold());
                 for item in &section.items {
-                    let text = sanitize(&item.text.replace('`', ""));
-                    let Some(path) = &item.path else {
-                        for (k, l) in wrap(&text, inner_width.saturating_sub(4)).into_iter().enumerate() {
-                            lines.push(Line::raw(format!("{}{l}", if k == 0 { " · " } else { "   " })).fg(META));
-                        }
-                        continue;
-                    };
-                    let rel = relative(path, &base, &name);
-                    let mut target = sanitize(&rel);
-                    if item.is_dir {
-                        target.push('/');
-                    }
-                    if let Some(n) = item.line {
-                        target += &format!(":{n}");
-                    }
-                    let selected = link == map.cursor;
-                    if selected {
-                        cursor_line = Some(lines.len());
-                    }
-                    let mut first = Line::from(vec![
-                        Span::raw(" ▸ ").fg(if selected { ACCENT } else { DIM }),
-                        Span::raw(target).fg(if item.is_dir { DIR } else { TEXT }).bold(),
-                    ]);
-                    if selected && map.focused {
-                        first = first.bg(CURSOR_ACTIVE);
-                    } else if selected {
-                        first = first.bg(CURSOR_INACTIVE);
-                    }
-                    lines.push(first);
-                    for l in wrap(&text, inner_width.saturating_sub(5)) {
-                        lines.push(Line::raw(format!("     {l}")).fg(META));
-                    }
-                    link += 1;
+                    item_lines(&mut lines, item);
+                }
+            }
+            // Questions and answers.
+            for x in &map.thread {
+                lines.push(Line::raw(""));
+                for (k, l) in wrap(&sanitize(&x.question), inner_width.saturating_sub(4))
+                    .into_iter()
+                    .enumerate()
+                {
+                    lines.push(
+                        Line::raw(format!("{}{l}", if k == 0 { " ? " } else { "   " }))
+                            .fg(SELECTED)
+                            .bold(),
+                    );
+                }
+                for l in wrap(
+                    &sanitize(&x.answer.text.replace('`', "")),
+                    inner_width.saturating_sub(2),
+                ) {
+                    lines.push(Line::raw(format!(" {l}")).fg(TEXT));
+                }
+                for item in &x.answer.links {
+                    item_lines(&mut lines, item);
+                }
+                if let Some(c) = x.answer.cost_usd {
+                    lines.push(Line::raw(format!(" ${c:.2}")).fg(DIM));
+                }
+            }
+            if let Some(p) = &map.pending {
+                lines.push(Line::raw(""));
+                lines.push(Line::raw(format!(" ? {}", sanitize(&p.question))).fg(SELECTED).bold());
+                lines.push(
+                    Line::raw(format!(
+                        " Claude is looking… {} s · Esc stops",
+                        p.started.elapsed().as_secs()
+                    ))
+                    .fg(DIM),
+                );
+            }
+            if let Some(e) = &map.ask_error {
+                lines.push(Line::raw(""));
+                for l in wrap(e, inner_width.saturating_sub(2)) {
+                    lines.push(Line::raw(format!(" {l}")).fg(ERR));
                 }
             }
             (lines, cursor_line, false)
@@ -363,9 +383,29 @@ fn draw_map(f: &mut Frame, area: Rect, app: &mut App) {
         f.render_widget(Paragraph::new(lines).alignment(Alignment::Center), middle);
         return;
     }
-    // Keep the selected link (and the line after it) in view.
+    // The question being typed takes the last line.
+    let inner = match &map.asking {
+        Some(text) => {
+            let [list, input] = Layout::vertical([Constraint::Min(0), Constraint::Length(1)]).areas(inner);
+            let shown = elide_start(&sanitize(text), input.width.saturating_sub(8) as usize);
+            f.render_widget(
+                Paragraph::new(Line::from(vec![
+                    Span::raw(" Ask: ").fg(ACCENT).bold(),
+                    Span::raw(format!("{shown}█")).fg(TEXT),
+                ]))
+                .bg(CURSOR_INACTIVE),
+                input,
+            );
+            list
+        }
+        None => inner,
+    };
+    // Keep the selected link (and the line after it) in view; a new question or an
+    // answer without links shows the end.
     let height = inner.height as usize;
-    if let Some(c) = cursor_line {
+    if std::mem::take(&mut map.scroll_to_end) {
+        map.scroll = usize::MAX;
+    } else if let Some(c) = cursor_line {
         if c < map.scroll {
             map.scroll = c.saturating_sub(1);
         } else if c + 2 > map.scroll + height {
@@ -375,6 +415,49 @@ fn draw_map(f: &mut Frame, area: Rect, app: &mut App) {
     map.scroll = map.scroll.min(lines.len().saturating_sub(height));
     let visible: Vec<Line> = lines.into_iter().skip(map.scroll).take(height).collect();
     f.render_widget(Paragraph::new(visible), inner);
+}
+
+/// One map link as lines: "▸ path:line" (highlighted at the cursor) and its text. Items
+/// without a path are plain text. Returns the line of the link, if it is one.
+#[allow(clippy::too_many_arguments)]
+fn push_item(
+    lines: &mut Vec<Line<'static>>,
+    item: &rc_core::api::MapItem,
+    base: &str,
+    name: &str,
+    width: usize,
+    link: usize,
+    cursor: usize,
+    focused: bool,
+) -> Option<usize> {
+    let text = sanitize(&item.text.replace('`', ""));
+    let Some(path) = &item.path else {
+        for (k, l) in wrap(&text, width.saturating_sub(4)).into_iter().enumerate() {
+            lines.push(Line::raw(format!("{}{l}", if k == 0 { " · " } else { "   " })).fg(META));
+        }
+        return None;
+    };
+    let mut target = sanitize(&relative(path, base, name));
+    if item.is_dir {
+        target.push('/');
+    }
+    if let Some(n) = item.line {
+        target += &format!(":{n}");
+    }
+    let selected = link == cursor;
+    let mut first = Line::from(vec![
+        Span::raw(" ▸ ").fg(if selected { ACCENT } else { DIM }),
+        Span::raw(target).fg(if item.is_dir { DIR } else { TEXT }).bold(),
+    ]);
+    if selected {
+        first = first.bg(if focused { CURSOR_ACTIVE } else { CURSOR_INACTIVE });
+    }
+    let at = lines.len();
+    lines.push(first);
+    for l in wrap(&text, width.saturating_sub(5)) {
+        lines.push(Line::raw(format!("     {l}")).fg(META));
+    }
+    Some(at)
 }
 
 fn draw_preview(f: &mut Frame, area: Rect, app: &App) {
@@ -622,6 +705,7 @@ fn draw_keys(f: &mut Frame, area: Rect, mode: &Mode, map_focused: bool) {
             ("Enter", "Go to"),
             ("F3", "View"),
             ("Tab/Esc", "Panels"),
+            ("a", "Ask Claude"),
             ("I", "Regenerate"),
             ("i", "Close"),
         ],
@@ -864,7 +948,7 @@ fn draw_options(f: &mut Frame, area: Rect, o: &Options, settings: &Settings) {
         MODEL_ROW,
         format!(
             "Claude map model (i): {}",
-            field(MODEL_ROW, &settings.claude_model, "(sonnet)")
+            field(MODEL_ROW, &settings.claude_model, "(opus)")
         ),
     );
     row(
@@ -873,6 +957,15 @@ fn draw_options(f: &mut Frame, area: Rect, o: &Options, settings: &Settings) {
             "Claude command: {}",
             field(CLAUDE_ROW, &settings.claude_command, "(claude)")
         ),
+    );
+    let depth = if settings.claude_depth > 0 {
+        settings.claude_depth.to_string()
+    } else {
+        String::new()
+    };
+    row(
+        DEPTH_ROW,
+        format!("Claude map depth (folders): {}", field(DEPTH_ROW, &depth, "(4)")),
     );
     lines.push(Line::raw(""));
     lines.push(
@@ -1463,6 +1556,85 @@ mod tests {
         assert_eq!(relative("/a/src-tauri/x", "/a/src", "src"), "/a/src-tauri/x");
         assert_eq!(relative("/a/src", "/a/src", "src"), "src");
         assert_eq!(relative("/etc/x", "/", "/"), "etc/x");
+    }
+
+    #[test]
+    fn ask_claude_about_the_map() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = tempfile::tempdir().unwrap();
+        let tools = tempfile::tempdir().unwrap();
+        std::fs::write(tmp.path().join("config.toml"), "a = 1\nb = 2\n").unwrap();
+        let map = r#"{"is_error":false,"structured_output":{"summary":"Settings.","sections":[{"heading":"Files","items":[{"text":"settings","path":"config.toml","line":null}]}]}}"#;
+        let answer = r#"{"is_error":false,"structured_output":{"answer":"b is set on line 2.","links":[{"text":"b","path":"config.toml","line":2}]}}"#;
+        let fake = tools.path().join("claude");
+        let log = tools.path().join("prompts");
+        std::fs::write(
+            &fake,
+            format!(
+                "#!/bin/sh\nprompt=$(cat)\necho \"$prompt\" >> {}\ncase \"$prompt\" in\n  *'The user asks'*) cat <<'EOF'\n{answer}\nEOF\n;;\n  *) cat <<'EOF'\n{map}\nEOF\n;;\nesac\n",
+                log.display()
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let loc = rc_core::Location::local(tmp.path().to_string_lossy());
+        let mut app = App::new(Arc::new(rc_vfs::Vfs::new()), loc.clone(), loc);
+        app.settings.claude_command = fake.to_string_lossy().into();
+        let press = |app: &mut App, code: KeyCode| {
+            app.handle_key(KeyEvent::new(code, KeyModifiers::NONE));
+        };
+        let wait = |app: &mut App, done: &dyn Fn(&App) -> bool| {
+            let start = std::time::Instant::now();
+            while !done(app) {
+                app.tick();
+                assert!(start.elapsed().as_secs() < 10, "timed out");
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+        };
+        app.panels[0].cursor_home();
+        press(&mut app, KeyCode::Char('I'));
+        wait(&mut app, &|a| {
+            matches!(a.map.as_ref().map(|m| &m.state), Some(MapState::Ready(_)))
+        });
+        press(&mut app, KeyCode::Tab);
+        press(&mut app, KeyCode::Char('a'));
+        // Pasted text (bracketed paste) goes into the question; line breaks become spaces.
+        app.paste("where is");
+        app.paste("\nb?");
+        assert!(screen(&mut app).contains("Ask: where is b?"), "{}", screen(&mut app));
+        press(&mut app, KeyCode::Enter);
+        wait(&mut app, &|a| a.map.as_ref().is_some_and(|m| m.pending.is_none()));
+        let s = screen(&mut app);
+        assert!(
+            s.contains("? where is b?") && s.contains("b is set on line 2.") && s.contains("config.toml:2"),
+            "{s}"
+        );
+        // The cursor is on the answer's link: F3 views line 2.
+        press(&mut app, KeyCode::F(3));
+        let Mode::Viewer(v) = &app.mode else {
+            panic!("no viewer")
+        };
+        assert_eq!(v.mark, Some(1));
+        // Typing and pending states draw at any size.
+        press(&mut app, KeyCode::Esc);
+        app.map.as_mut().unwrap().focused = true;
+        press(&mut app, KeyCode::Char('a'));
+        app.paste("a long question that will not fit anywhere");
+        for (w, h) in [(100, 20), (40, 6), (10, 3), (2, 2), (1, 1)] {
+            let mut term = Terminal::new(TestBackend::new(w, h)).unwrap();
+            term.draw(|f| draw(f, &mut app)).unwrap();
+        }
+        press(&mut app, KeyCode::Enter);
+        for (w, h) in [(40, 6), (1, 1)] {
+            let mut term = Terminal::new(TestBackend::new(w, h)).unwrap();
+            term.draw(|f| draw(f, &mut app)).unwrap();
+        }
+        wait(&mut app, &|a| a.map.as_ref().is_some_and(|m| m.pending.is_none()));
+        let prompts = std::fs::read_to_string(&log).unwrap();
+        assert!(
+            prompts.contains("Settings.") && prompts.contains("The user asks: where is b?"),
+            "{prompts}"
+        );
     }
 
     #[test]

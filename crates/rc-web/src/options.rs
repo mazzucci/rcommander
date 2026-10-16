@@ -124,7 +124,7 @@ pub fn OptionsView(app: App) -> impl IntoView {
                             type="text"
                             class="modal-input"
                             spellcheck="false"
-                            placeholder="sonnet"
+                            placeholder="opus"
                             prop:value=move || draft.with(|s| s.claude_model.clone())
                             on:input=move |ev| draft.update(|s| s.claude_model = event_target_value(&ev))
                         />
@@ -141,9 +141,24 @@ pub fn OptionsView(app: App) -> impl IntoView {
                         />
                     </label>
                 </div>
+                <label class="opt-field">
+                    "Claude map depth: folders below the mapped one Claude may read"
+                    <input
+                        type="number"
+                        class="modal-input num"
+                        min="1"
+                        max="20"
+                        placeholder="4"
+                        prop:value=move || draft.with(|s| if s.claude_depth == 0 { String::new() } else { s.claude_depth.to_string() })
+                        on:input=move |ev| {
+                            let v = event_target_value(&ev);
+                            draft.update(|s| s.claude_depth = v.trim().parse::<usize>().map_or(0, |n| n.min(20)));
+                        }
+                    />
+                </label>
                 <div class="opt-note">
                     "Maps run your Claude Code with read-only tools; the file contents they read go to Claude. "
-                    "Model: " <code>"haiku"</code> ", " <code>"sonnet"</code> " or " <code>"opus"</code> "."
+                    "Model: " <code>"opus"</code> " (default), " <code>"sonnet"</code> " or " <code>"haiku"</code> ". Dependency and build folders are never read."
                 </div>
                 {move || error.get().map(|e| view! { <div class="modal-error" role="alert">{e}</div> })}
                 <div class="modal-buttons">

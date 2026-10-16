@@ -151,8 +151,10 @@ pub struct Settings {
     /// its usual install folders).
     pub claude_command: String,
     /// Model for maps, as `claude --model` takes it (`sonnet`, `haiku`, `opus`, or a
-    /// full model name). Empty means `sonnet`.
+    /// full model name). Empty means `opus`.
     pub claude_model: String,
+    /// How many folders below the mapped one Claude may read (a hard limit); 0 means 4.
+    pub claude_depth: usize,
 }
 
 /// Longest editor command accepted.
@@ -178,6 +180,7 @@ impl Default for Settings {
             bookmarks: Vec::new(),
             claude_command: String::new(),
             claude_model: String::new(),
+            claude_depth: 0,
         }
     }
 }
@@ -224,6 +227,7 @@ impl Settings {
     /// Canonical form for saving: columns deduplicated in display order, editor commands
     /// trimmed and bounded.
     pub fn normalized(mut self) -> Self {
+        self.claude_depth = self.claude_depth.min(20);
         self.columns = Column::ALL.into_iter().filter(|c| self.columns.contains(c)).collect();
         for e in [
             &mut self.editor,

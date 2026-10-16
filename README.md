@@ -19,7 +19,7 @@ Runs on **Linux and macOS** (both built and tested in CI).
 - **Find files** (Alt+F7 or Shift+F): name masks and text inside files, then jump to a hit or view it at the matching line.
 - **Quick View** (Ctrl+Q or Shift+Q): the other panel previews the file under the cursor (or summarizes a folder) as you move.
 - **Multi-rename** (Shift+F6): rename many files at once with a mask (`[N]` name, `[E]` extension, `[C]` counter, `[P]` folder), search and replace, and case, previewing every new name first; swaps and chains are safe.
-- **Claude map** (`i`): the other panel shows Claude's summary of the file or folder under the cursor, with links to its parts (files, folders, lines) you can follow; made by your own Claude Code with read-only tools and cached per version.
+- **Claude map** (`i`): the other panel shows Claude's overview of the file or folder under the cursor, with links to its parts (files, folders, lines) you can follow, and you can ask follow-up questions; made by your own Claude Code with read-only tools, depth limits and checked links.
 - **Directory compare** (F9), quick filter, selection masks, history (Alt+←/→), hotlist (Ctrl+D), zoxide jumps (terminal).
 - **Configurable columns**: permissions, owner, group, created, extension, git; hidden files; your editor for F4.
 - **Claude's changes**: every file Claude edits is logged with its original; press `c` to list them and F2 to review each one as a diff.
@@ -97,7 +97,7 @@ Both UIs share the key bindings below; the few differences are marked. `F1` or `
 | F5 / F6 | copy / move or rename; asks before overwriting: `o` replace existing, `u` replace older, `s` keep existing (folders are merged); shows byte progress, Esc cancels |
 | F7 / F8, Delete | new directory / delete to Trash (Shift+F8: permanent) |
 | F9 | compare directories (toggle) |
-| `i`, `I` | Claude map of the file or folder under the cursor (of the folder itself on `..`): Tab into it, Enter go to a link, F3 view at its line; `I` regenerates, `i` closes |
+| `i`, `I` | Claude map of the file or folder under the cursor (of the folder itself on `..`): Tab into it, Enter go to a link, F3 view at its line, `a` ask Claude about it; `I` regenerates, `i` closes |
 | Shift+F6, `M` (browser also Ctrl+M) | multi-rename the selection: mask, search/replace, case, counter, with a preview |
 | Ctrl+Q, Shift+Q | quick view: the other panel previews the file (or folder) under the cursor |
 | Alt+F7, Shift+F | find files: name mask (`*.rs;*.toml`, a plain word matches inside names) and text inside (case-sensitive only with capitals); Enter go to, F3 view |
@@ -110,7 +110,17 @@ Panels follow changes on disk: a directory that changes is re-read and the new o
 
 Press `i` on a file or folder and the other panel becomes a map of it written by Claude: a short summary, then sections such as *Entry points*, *Main parts* or *Configuration* whose items link to the files, folders and lines they describe. Click a link (or Tab into the map, then Enter) to show it in the panel; click its line number (or F3) to open the viewer there.
 
-Maps are made by your own [Claude Code](https://claude.com/claude-code) (`claude -p`), so no API key is stored in rcommander. It runs in Claude Code's restricted mode with read-only tools (Read, Glob, Grep: no shell, no writes, no web) confined to the folder being mapped, without your MCP servers, skills, settings or hooks (also none from the folder), with a $0.50 cap per map; a map typically takes 10–20 s and a few cents with Sonnet. The contents Claude reads are sent to Anthropic, so maps are only made when you ask. They are cached in your cache folder (`~/.cache/rcommander/maps` on Linux, private to you): opening the same map again is instant and free until the file, or something directly inside the folder, changes; `I` asks again. Closing a map (or rcommander) while it is being made stops Claude. Links to paths that do not exist are shown as plain text. The model (default `sonnet`) and the command (default `claude`) are in the options (`o`).
+The first map is a rough overview, made with a strong model (Opus by default): Claude gets the real listing of the folder (two levels) and opens only a few key files. It may only name what is in the listing or in files it opened, and only give line numbers it saw; rcommander checks every link and drops paths that do not exist and lines past the end of a file. For details, **ask**: type a question in the box under the map (terminal: Tab into the map, then `a`). Claude answers with the map and the earlier questions as context, looks at the files it needs, and links what it refers to; answers' links work like the map's.
+
+Guardrails, enforced by Claude Code itself:
+
+- **Read-only, restricted**: Read, Glob and Grep only (no shell, no writes, no web), confined to the folder being mapped, without your MCP servers, skills, settings or hooks (also none from the folder).
+- **Depth**: nothing deeper than *Claude map depth* folders below the mapped one (Options, default 4); Claude decides what to open within that.
+- **No noise**: `node_modules`, `.git`, `target`, `dist`, `build`, `vendor`, virtualenvs and caches are never read.
+- **Bounded**: a few tool steps for a map (more for a question), at most $0.50 per map and $1 per question, 5 minutes at most; if a limit is reached, the panel says which.
+- **No secrets**: `.env` files, `.ssh`, `.gnupg`, `.aws`, `*.pem`, `*.key` and SSH keys are never read.
+
+Maps are made by your own [Claude Code](https://claude.com/claude-code) (`claude -p`), so no API key is stored in rcommander; a map takes about 15 s and around $0.10 with Opus; a question usually about the same, more if Claude has to read a lot. The contents Claude reads are sent to Anthropic, so nothing runs until you ask. Maps are cached in your cache folder (`~/.cache/rcommander/maps` on Linux, private to you): opening the same map again is instant and free until the file, or something directly inside the folder, changes; `I` asks again. Closing a map (or rcommander) stops Claude. The model, the command and the depth are in the options (`o`).
 
 ## Remote control and Claude Code
 
