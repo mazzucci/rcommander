@@ -2,6 +2,7 @@
 //! terminal I/O so it can be unit-tested with plain key events.
 
 use super::find::{self, Find};
+use super::map::MapPanel;
 use super::rename::{self, MultiRename};
 use super::views::{DiffView, Viewer};
 use crate::control::Request;
@@ -59,6 +60,10 @@ pub struct Options {
 
 pub const HIDDEN_ROW: usize = Column::ALL.len();
 pub const EDITOR_ROW: usize = Column::ALL.len() + 1;
+pub const MODEL_ROW: usize = Column::ALL.len() + 2;
+pub const CLAUDE_ROW: usize = Column::ALL.len() + 3;
+/// Rows edited as text (Space/Enter edits, Enter keeps).
+const TEXT_ROWS: [usize; 3] = [EDITOR_ROW, MODEL_ROW, CLAUDE_ROW];
 
 pub struct Prompt {
     pub title: String,
@@ -157,6 +162,8 @@ pub struct App {
     git_pending: [Option<Location>; 2],
     /// Quick View (Ctrl+Q): the other panel previews the entry under the cursor.
     pub quick_view: bool,
+    /// Claude map (`i`): the other panel shows Claude's map of a file or folder.
+    pub map: Option<MapPanel>,
     /// What it shows: the entry (location, size, modified) and its preview.
     pub preview: Option<(PreviewKey, Result<Preview, String>)>,
 }
@@ -212,6 +219,7 @@ impl App {
             git_pending: [None, None],
             quick_view: false,
             preview: None,
+            map: None,
         };
         app.load(LEFT, left, None);
         app.load(RIGHT, right, None);
@@ -730,6 +738,9 @@ impl App {
         }
         changed |= self.tick_watch();
         changed |= self.tick_git();
+        if let Some(m) = &mut self.map {
+            changed |= m.poll();
+        }
         // Live refresh may have changed the entry under the cursor.
         changed |= self.sync_preview();
         if let Mode::Find(f) = &mut self.mode {
@@ -837,6 +848,7 @@ impl App {
                 // The panel is hidden behind Quick View: show it.
                 if side != self.active {
                     self.quick_view = false;
+                    self.map = None;
                 }
                 let target = loc(&path);
                 let Location::Local { path: p } = &target;
@@ -879,6 +891,7 @@ impl App {
                 reveal(&mut self.mode);
                 if side.index(self.active) != self.active {
                     self.quick_view = false;
+                    self.map = None;
                 }
                 let n = self.panels[side.index(self.active)].select_mask(&mask, true);
                 self.info(format!("Selected {n} entries matching {mask}"));
@@ -959,6 +972,7 @@ impl App {
         let ctrl_c = key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL);
         match std::mem::replace(&mut self.mode, Mode::Normal) {
             Mode::Normal if ctrl_c => return self.request_quit(),
+            Mode::Normal if self.map.as_ref().is_some_and(|m| m.focused) => return self.map_key(key),
             Mode::Normal => return self.normal_key(key),
             // Ctrl+C backs out of whatever is open.
             Mode::Options(o) if ctrl_c => self.revert_options(o),
@@ -1006,7 +1020,19 @@ impl App {
         if let Some(text) = &mut o.editing {
             match key.code {
                 KeyCode::Enter => {
-                    self.settings.editor = text.trim().to_string();
+                    let value = text.trim().to_string();
+                    match o.cursor {
+                        MODEL_ROW => self.settings.claude_model = value,
+                        CLAUDE_ROW => match value.split_whitespace().next().map(rc_vfs::check_program) {
+                            Some(Err(e)) => {
+                                self.error(format!("{e:#}"));
+                                self.mode = Mode::Options(o);
+                                return;
+                            }
+                            _ => self.settings.claude_command = value,
+                        },
+                        _ => self.settings.editor = value,
+                    }
                     o.editing = None;
                 }
                 KeyCode::Esc => o.editing = None,
@@ -1020,16 +1046,18 @@ impl App {
         // Same model as the browser dialog: changes preview live, Enter saves, Esc reverts.
         match key.code {
             KeyCode::Esc => return self.revert_options(o),
-            KeyCode::Enter if o.cursor != EDITOR_ROW => {
+            KeyCode::Enter if !TEXT_ROWS.contains(&o.cursor) => {
                 if self.settings != o.original {
                     self.save_settings();
                 }
                 return;
             }
             KeyCode::Up => o.cursor = o.cursor.saturating_sub(1),
-            KeyCode::Down => o.cursor = (o.cursor + 1).min(EDITOR_ROW),
+            KeyCode::Down => o.cursor = (o.cursor + 1).min(CLAUDE_ROW),
             KeyCode::Char(' ') | KeyCode::Enter => match o.cursor {
                 EDITOR_ROW => o.editing = Some(self.settings.editor.clone()),
+                MODEL_ROW => o.editing = Some(self.settings.claude_model.clone()),
+                CLAUDE_ROW => o.editing = Some(self.settings.claude_command.clone()),
                 HIDDEN_ROW => {
                     self.settings.show_hidden = !self.settings.show_hidden;
                     // Apply right away so the effect is visible.
@@ -1131,6 +1159,91 @@ impl App {
         self.mode = Mode::Rename(Box::new(MultiRename::new(p.location.clone(), entries, existing)));
     }
 
+    /// Show `path` in the active panel, cursor on it (hidden files switched on and a
+    /// quick filter cleared if they would hide it).
+    fn reveal(&mut self, path: &str) {
+        let loc = Location::local(path);
+        let (Some(parent), Some(name)) = (loc.parent(), loc.file_name()) else {
+            return;
+        };
+        let name = name.to_string();
+        if name.starts_with('.') && !self.active_panel().show_hidden {
+            self.active_mut().toggle_hidden();
+        }
+        self.active_mut().set_filter("");
+        self.load(self.active, parent, Some(&name));
+    }
+
+    fn toggle_quick_view(&mut self) {
+        self.quick_view = !self.quick_view;
+        if self.quick_view {
+            self.map = None;
+        }
+    }
+
+    /// `i`: Claude's map of the entry under the cursor (of the folder itself on ".."), in
+    /// the other panel; `i` again closes it. `I` makes it again instead of using the cache.
+    fn toggle_map(&mut self, refresh: bool) {
+        let p = self.active_panel();
+        let target = match p.current() {
+            Some(e) => p.location.join(&e.name),
+            None => p.location.clone(),
+        };
+        if !refresh && self.map.is_some() {
+            self.map = None;
+            return;
+        }
+        // `I` on an open map makes that map again.
+        let target = match (&self.map, refresh) {
+            (Some(m), true) => m.target.clone(),
+            _ => target,
+        };
+        self.quick_view = false;
+        self.map = Some(MapPanel::start(target, crate::control::mapper(&self.settings), refresh));
+    }
+
+    /// Keys while the map has the keyboard (Tab).
+    fn map_key(&mut self, key: KeyEvent) -> Effect {
+        let page = self.page.max(1) as isize;
+        let Some(map) = &mut self.map else { return Effect::None };
+        match key.code {
+            KeyCode::Up => map.move_cursor(-1),
+            KeyCode::Down => map.move_cursor(1),
+            KeyCode::PageUp => map.move_cursor(-page),
+            KeyCode::PageDown => map.move_cursor(page),
+            KeyCode::Home => map.cursor = 0,
+            KeyCode::End => map.move_cursor(isize::MAX),
+            KeyCode::Tab | KeyCode::BackTab | KeyCode::Esc => map.focused = false,
+            KeyCode::Enter => {
+                if let Some(path) = map.current().and_then(|i| i.path) {
+                    self.reveal(&path);
+                }
+            }
+            KeyCode::F(3) | KeyCode::Char('3') => {
+                let Some(item) = map.current() else { return Effect::None };
+                match item.path.clone().filter(|_| !item.is_dir) {
+                    Some(path) => match self.vfs.read_content(&Location::local(&path)) {
+                        Ok(content) => {
+                            let mut v = Viewer::new(content);
+                            if let Some(line) = item.line {
+                                v.goto_line(line);
+                            }
+                            self.mode = Mode::Viewer(v);
+                        }
+                        Err(e) => self.error(format!("{e:#}")),
+                    },
+                    None => {
+                        if let Some(path) = item.path {
+                            self.reveal(&path);
+                        }
+                    }
+                }
+            }
+            _ => return self.normal_key(key),
+        }
+        Effect::None
+    }
+
     /// Alt+F7: find files under the active panel's folder.
     fn open_find(&mut self) {
         let p = self.active_panel();
@@ -1147,17 +1260,7 @@ impl App {
             }
             // Show the hit in the active panel, cursor on it; the dialog closes.
             find::Action::GoTo(hit) => {
-                let loc = Location::local(&hit.path);
-                let (Some(parent), Some(name)) = (loc.parent(), loc.file_name()) else {
-                    return;
-                };
-                let name = name.to_string();
-                if name.starts_with('.') && !self.active_panel().show_hidden {
-                    self.active_mut().toggle_hidden();
-                }
-                // A quick filter could hide it.
-                self.active_mut().set_filter("");
-                self.load(self.active, parent, Some(&name));
+                self.reveal(&hit.path);
             }
             find::Action::View(hit) => match self.vfs.read_content(&Location::local(&hit.path)) {
                 Ok(content) => {
@@ -1277,7 +1380,15 @@ impl App {
                     self.activate();
                 }
             }
+            // With a map open, Tab moves into it.
+            KeyCode::Tab | KeyCode::BackTab if self.map.is_some() => {
+                if let Some(m) = &mut self.map {
+                    m.focused = true;
+                }
+            }
             KeyCode::Tab | KeyCode::BackTab => self.active = self.other(),
+            KeyCode::Char('i') if !ctrl => self.toggle_map(false),
+            KeyCode::Char('I') => self.toggle_map(true),
             KeyCode::Char(' ') | KeyCode::Insert => self.active_mut().toggle_current(),
             KeyCode::Char('+') => self.prompt(
                 "Select files matching".into(),
@@ -1350,8 +1461,8 @@ impl App {
             KeyCode::Char('M') => self.open_rename(),
             KeyCode::F(6) => self.start_copy_move(true),
             // Shift+Q too, as in the browser (where Ctrl+Q can quit Firefox).
-            KeyCode::Char('q') if ctrl => self.quick_view = !self.quick_view,
-            KeyCode::Char('Q') => self.quick_view = !self.quick_view,
+            KeyCode::Char('q') if ctrl => self.toggle_quick_view(),
+            KeyCode::Char('Q') => self.toggle_quick_view(),
             KeyCode::F(7) if alt => self.open_find(),
             KeyCode::Char('F') => self.open_find(),
             KeyCode::F(7) => self.prompt("New directory".into(), String::new(), PromptAction::Mkdir),
@@ -1876,7 +1987,8 @@ two here
         git(&["-c", "user.name=t", "-c", "user.email=t@e", "commit", "-qm", "x"]).unwrap();
         fs::write(left.join("b.txt"), "changed\n").unwrap();
         app.refresh(LEFT);
-        // Statuses arrive from a worker thread.
+        // Statuses arrive from a worker thread; an older request (run while the test was
+        // still committing, so "added") may land first, the newest one last.
         let deadline = Instant::now() + Duration::from_secs(10);
         while Instant::now() < deadline
             && app.panels[LEFT]
@@ -1884,7 +1996,7 @@ two here
                 .iter()
                 .find(|e| e.name == "b.txt")
                 .and_then(|e| e.git)
-                .is_none()
+                != Some(rc_core::GitStatus::Modified)
         {
             app.tick();
             std::thread::sleep(Duration::from_millis(10));

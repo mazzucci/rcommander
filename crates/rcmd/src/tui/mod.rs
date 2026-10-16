@@ -2,6 +2,7 @@
 
 mod app;
 mod find;
+mod map;
 mod rename;
 mod ui;
 mod views;

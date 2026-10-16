@@ -255,6 +255,54 @@ pub struct FindResult {
     pub unreadable: usize,
 }
 
+/// `POST /api/map[?job=ID]` → [`FileMap`]: Claude's map of a file or folder. A cached
+/// map of the same version is returned unless `refresh` is set.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct MapRequest {
+    pub location: Location,
+    #[serde(default)]
+    pub refresh: bool,
+}
+
+/// A summary of a file or folder written by Claude, with links into it: the "map"
+/// shown in a side panel.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct FileMap {
+    pub location: Location,
+    /// The map is of a folder (links are relative to it), not of a file (links are
+    /// relative to its folder).
+    #[serde(default)]
+    pub is_dir: bool,
+    pub summary: String,
+    pub sections: Vec<MapSection>,
+    /// Model that wrote it, as configured.
+    pub model: String,
+    /// Unix seconds.
+    pub generated: i64,
+    pub cost_usd: Option<f64>,
+    /// Served from the cache (no new request to Claude).
+    #[serde(default)]
+    pub cached: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct MapSection {
+    pub heading: String,
+    pub items: Vec<MapItem>,
+}
+
+/// One entry of a map: a line of text, and where it points. `path` is absolute and
+/// existed when the map was made; links Claude got wrong have none.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct MapItem {
+    pub text: String,
+    pub path: Option<String>,
+    #[serde(default)]
+    pub is_dir: bool,
+    /// 1-based line in `path` the item is about.
+    pub line: Option<usize>,
+}
+
 /// `POST /api/conflicts` with a [`FileOp`] body → [`Conflicts`]: what a copy or move
 /// would find already in place, so the UI can ask before running it.
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]

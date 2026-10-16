@@ -2,8 +2,9 @@
 
 use gloo_net::http::Request;
 use rc_core::api::{
-    ApiError, Conflicts, DiffRequest, DiffResponse, FileContent, FileOp, FindRequest, FindResult, ForgetRequest,
-    InitResponse, JobRequest, JobStatus, ListRequest, OpResult, OpenRequest, Preview, ReadRequest,
+    ApiError, Conflicts, DiffRequest, DiffResponse, FileContent, FileMap, FileOp, FindRequest, FindResult,
+    ForgetRequest, InitResponse, JobRequest, JobStatus, ListRequest, MapRequest, OpResult, OpenRequest, Preview,
+    ReadRequest,
 };
 use rc_core::{Listing, Location, Settings};
 use serde::Serialize;
@@ -137,6 +138,11 @@ pub async fn op(op: FileOp, job: Option<String>) -> Result<OpResult, String> {
 /// Find files; `job` lets [`job`] follow it and [`cancel`] stop it.
 pub async fn find(req: FindRequest, job: String) -> Result<FindResult, String> {
     call(&format!("find?job={job}"), &req).await
+}
+
+/// Claude's map of a file or folder; `job` lets [`job`] follow it and [`cancel`] stop it.
+pub async fn map(location: Location, refresh: bool, job: String) -> Result<FileMap, String> {
+    call(&format!("map?job={job}"), &MapRequest { location, refresh }).await
 }
 
 /// Progress of a running operation.

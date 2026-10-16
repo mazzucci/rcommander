@@ -6,6 +6,7 @@ pub mod changes;
 pub mod find;
 pub mod git;
 pub mod local;
+pub mod map;
 pub mod settings;
 pub mod watch;
 

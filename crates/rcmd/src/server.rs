@@ -20,7 +20,9 @@ use axum::routing::get;
 use axum::routing::post;
 use axum::{Json, Router};
 use rc_core::api::{ApiError, DiffRequest, FileOp, InitResponse, ListRequest, OpenRequest, ReadRequest};
-use rc_core::api::{BrowserEvent, ChangesDirs, FindRequest, ForgetRequest, JobRequest, JobStatus, Progress};
+use rc_core::api::{
+    BrowserEvent, ChangesDirs, FindRequest, ForgetRequest, JobRequest, JobStatus, MapRequest, Progress,
+};
 use rc_core::control::{Command, Reply};
 use rc_core::{Location, Settings};
 use rc_vfs::Vfs;
@@ -344,6 +346,7 @@ fn router(state: AppState, port: u16) -> Router {
         .route("/diff_head", post(diff_head))
         .route("/op", post(op))
         .route("/find", post(find))
+        .route("/map", post(map))
         .route("/job", post(job_status))
         .route("/cancel", post(cancel_job))
         .route("/conflicts", post(conflicts))
@@ -433,8 +436,10 @@ async fn init(State(s): State<AppState>) -> Json<InitResponse> {
 async fn save_settings(State(s): State<AppState>, Json(settings): Json<Settings>) -> Response {
     blocking(move || {
         let settings = settings.normalized();
-        if let Some(program) = settings.gui_editor.split_whitespace().next() {
-            rc_vfs::check_program(program)?;
+        for command in [&settings.gui_editor, &settings.claude_command] {
+            if let Some(program) = command.split_whitespace().next() {
+                rc_vfs::check_program(program)?;
+            }
         }
         if let Some(path) = &s.settings_path {
             rc_vfs::settings::save_to(path, &settings)?;
@@ -558,6 +563,24 @@ async fn find(
     blocking(move || {
         req.root = s.vfs.normalize(req.root, None);
         rc_vfs::find::find(&req, &mut reporter(&entry))
+    })
+    .await
+}
+
+/// Claude's map of a file or folder (cached per version); with `?job=ID` it can be
+/// followed (`done` = seconds spent) and cancelled, which stops Claude.
+async fn map(
+    State(s): State<AppState>,
+    q: Result<Query<OpQuery>, QueryRejection>,
+    Json(req): Json<MapRequest>,
+) -> Response {
+    let entry = match job_from_query(&s, q) {
+        Ok(entry) => entry,
+        Err((status, msg)) => return api_error(status, msg),
+    };
+    blocking(move || {
+        let mapper = crate::control::mapper(&s.settings.read().expect("settings lock"));
+        mapper.map(&s.vfs.normalize(req.location, None), req.refresh, &mut reporter(&entry))
     })
     .await
 }
@@ -932,6 +955,45 @@ mod tests {
         );
         let (status, _) = call(app(tmp.path()), post("/api/preview", req(dir), None, &host)).await;
         assert_eq!(status, StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn map_runs_the_configured_claude() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = tempfile::tempdir().unwrap();
+        let tools = tempfile::tempdir().unwrap();
+        std::fs::write(tmp.path().join("a.txt"), "hello\n").unwrap();
+        let fake = tools.path().join("claude");
+        let answer = r#"{"is_error":false,"total_cost_usd":0.02,"structured_output":{"summary":"Greets.","sections":[{"heading":"Files","items":[{"text":"the greeting","path":"a.txt","line":1}]}]}}"#;
+        std::fs::write(&fake, format!("#!/bin/sh\ncat <<'EOF'\n{answer}\nEOF\n")).unwrap();
+        std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let dir = tmp.path().to_string_lossy().to_string();
+        let host = format!("localhost:{PORT}");
+        let router = app(tmp.path());
+
+        let settings = serde_json::json!({ "claude_command": fake.to_string_lossy(), "claude_model": "haiku" });
+        let (status, body) = call(router.clone(), post("/api/settings", settings, Some("secret"), &host)).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let req = serde_json::json!({ "location": { "kind": "local", "path": dir.clone() }, "refresh": true });
+        let (status, body) = call(
+            router.clone(),
+            post("/api/map?job=m1", req.clone(), Some("secret"), &host),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["summary"], "Greets.");
+        assert_eq!(body["model"], "haiku");
+        assert_eq!(body["sections"][0]["items"][0]["path"], format!("{dir}/a.txt"));
+        let (status, _) = call(router.clone(), post("/api/map", req, None, &host)).await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+
+        let settings = serde_json::json!({ "claude_command": "/no/such/claude" });
+        let (status, body) = call(router, post("/api/settings", settings, Some("secret"), &host)).await;
+        assert_eq!(
+            status,
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "unknown commands are refused: {body}"
+        );
     }
 
     #[tokio::test]

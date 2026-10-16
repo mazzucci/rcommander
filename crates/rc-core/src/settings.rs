@@ -147,6 +147,12 @@ pub struct Settings {
     pub gui_editor: String,
     /// Hotlist directories (Ctrl+D), in the order shown.
     pub bookmarks: Vec<String>,
+    /// Claude Code command used for maps (`i`). Empty means `claude` on `PATH` (or in
+    /// its usual install folders).
+    pub claude_command: String,
+    /// Model for maps, as `claude --model` takes it (`sonnet`, `haiku`, `opus`, or a
+    /// full model name). Empty means `sonnet`.
+    pub claude_model: String,
 }
 
 /// Longest editor command accepted.
@@ -170,6 +176,8 @@ impl Default for Settings {
             editor: String::new(),
             gui_editor: String::new(),
             bookmarks: Vec::new(),
+            claude_command: String::new(),
+            claude_model: String::new(),
         }
     }
 }
@@ -217,7 +225,12 @@ impl Settings {
     /// trimmed and bounded.
     pub fn normalized(mut self) -> Self {
         self.columns = Column::ALL.into_iter().filter(|c| self.columns.contains(c)).collect();
-        for e in [&mut self.editor, &mut self.gui_editor] {
+        for e in [
+            &mut self.editor,
+            &mut self.gui_editor,
+            &mut self.claude_command,
+            &mut self.claude_model,
+        ] {
             *e = e
                 .trim()
                 .chars()
